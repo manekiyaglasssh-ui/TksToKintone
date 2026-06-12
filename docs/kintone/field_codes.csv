@@ -1,0 +1,79 @@
+﻿フィールド名,フィールドコード,フィールド種別,制約
+TKS連携部分,TKS連携部分,GROUP,ラベル非表示
+受注No,受注No,SINGLE_LINE_TEXT,なし
+受注行No,受注行No,DECIMAL,なし
+硝/加工,硝_加工,DECIMAL,なし
+追加区分,追加区分,DECIMAL,なし
+納品日,納品日,DATE,初期値式: NOW
+売上日,売上日,DATE,初期値式: NOW
+出荷区分,出荷区分,SINGLE_SELECT,選択肢: AM / PM
+入庫日,入庫日,DATE,なし
+発注日,発注日,DATE,なし
+作業開始日,作業開始日,DATE,なし
+仕上日,仕上日,DATE,なし
+得意先コード,得意先コード,SINGLE_LINE_TEXT,なし
+得意先名称,得意先名称,SINGLE_LINE_TEXT,なし
+商品コード,商品コード,SINGLE_LINE_TEXT,なし
+加工完成品商品コード,加工完成品商品コード,SINGLE_LINE_TEXT,なし
+商品名称,商品名称,SINGLE_LINE_TEXT,なし
+W寸法,W寸法,DECIMAL,なし
+H寸法,H寸法,DECIMAL,なし
+掛率集計コード,掛率集計コード,DECIMAL,なし
+掛率集計名称,掛率集計名称,SINGLE_LINE_TEXT,なし
+掛率集計コード_1,掛率集計コード_1,SINGLE_LINE_TEXT,なし
+掛率集計名称_2,掛率集計名称_2,SINGLE_LINE_TEXT,なし
+受注数量,受注数量,SINGLE_LINE_TEXT,なし
+発注数量,発注数量,DECIMAL,なし
+㎡,平方メートル,DECIMAL,なし
+総㎡,総平方メートル,DECIMAL,なし
+仕入金額,仕入金額,DECIMAL,なし
+仕入単価,仕入単価,DECIMAL,なし
+加工完成品仕入単価,加工完成品仕入単価,SINGLE_LINE_TEXT,なし
+硝子厚み,硝子厚み,DECIMAL,なし
+総重量,総重量,DECIMAL,なし
+品種区分,品種区分,SINGLE_CHECK,必須、初期値: -、選択肢: - / 4 / 5
+発注先コード,発注先コード,DECIMAL,なし
+加工完成品仕入先コード,加工完成品仕入先コード,SINGLE_LINE_TEXT,なし
+検索キー,検索キー,SINGLE_LINE_TEXT,重複禁止、最大: 64
+発注コード_照合,発注コード_照合,DECIMAL,なし
+発注コード_本社判定,発注コード_本社判定,SINGLE_CHECK,必須、初期値: 〇、選択肢: 〇 / ×
+加工判定,加工判定,SINGLE_CHECK,必須、初期値: ×、選択肢: × / 〇
+洗浄区分,洗浄区分,SINGLE_CHECK,必須、初期値: 0:不要、選択肢: 0:不要 / 1:洗浄
+判定,判定,SINGLE_CHECK,必須、初期値: 〇(本社発注コード)、選択肢: 〇(本社発注コード) / 〇(加工あり) / 〇(セット品)
+作業開始日時,作業開始日時,DATETIME,なし
+作業終了日時,作業終了日時,DATETIME,なし
+作業時間,作業時間,CALC,"計算式/式: IF(AND(作業開始日時!="""",作業終了日時!=""""),(作業終了日時-作業開始日時)/60,"""")、形式: NUMBER、単位: 分（後）"
+作業,作業,SINGLE_SELECT,選択肢: 済
+加工担当者,担当者,SINGLE_LINE_TEXT,なし
+加工機械,機械,SINGLE_LINE_TEXT,なし
+洗浄開始日時,洗浄開始日時,DATETIME,なし
+洗浄終了日時,洗浄終了日時,DATETIME,なし
+洗浄,洗浄,SINGLE_SELECT,選択肢: 済
+洗浄担当者,洗浄担当者,SINGLE_LINE_TEXT,なし
+洗浄機械,洗浄機械,SINGLE_LINE_TEXT,なし
+アワ,アワ,DECIMAL,なし
+ハマカケ,ハマカケ,DECIMAL,なし
+キズ,キズ,DECIMAL,なし
+寸法不良,寸法不良,DECIMAL,なし
+ワレ,ワレ,DECIMAL,なし
+加工不良,加工不良,DECIMAL,なし
+穴空ミス,穴空ミス,DECIMAL,なし
+裏ハゲ,裏ハゲ,DECIMAL,なし
+その他,その他,DECIMAL,なし
+不良合計,不良合計,CALC,計算式/式: アワ+ハマカケ+キズ+寸法不良+ワレ+穴空ミス+加工不良+裏ハゲ+その他、形式: NUMBER
+その他備考,その他備考,SINGLE_LINE_TEXT,なし
+システム管理,システム管理,GROUP,なし
+小割,小割,SINGLE_SELECT,選択肢: レ
+不良フラグ,不良フラグ,SINGLE_SELECT,選択肢: レ
+不良伝票　未作成フラグ,不良伝票_未作成フラグ,SINGLE_SELECT,選択肢: レ
+小割元フラグ,小割元フラグ,SINGLE_SELECT,選択肢: レ
+分割元フラグ,分割元フラグ,SINGLE_SELECT,選択肢: レ
+分割フラグ,分割フラグ,SINGLE_SELECT,選択肢: レ
+レコード番号,レコード番号,RECORD_ID,必須
+更新者,更新者,MODIFIER,必須
+作成者,作成者,CREATOR,必須
+更新日時,更新日時,MODIFIED_AT,必須
+作成日時,作成日時,CREATED_AT,必須
+ステータス,ステータス,STATUS,なし
+作業者,作業者,STATUS_ASSIGNEE,なし
+カテゴリー,カテゴリー,CATEGORY,なし

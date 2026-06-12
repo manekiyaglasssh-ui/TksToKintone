@@ -1,0 +1,15 @@
+HTTP/2 200 OK
+Date: Fri, 05 Jun 2026 07:09:55 GMT
+Content-Type: application/json; charset=utf-8
+Content-Length: 444
+Cache-Control: no-cache
+Pragma: no-cache
+Expires: -1
+Server: Microsoft-IIS/10.0
+Set-Cookie: ASP.NET_SessionId=4j3osiudpoj1sqlfwgvblw1i; path=/; HttpOnly; SameSite=Lax
+X-Aspnet-Version: 4.0.30319
+Set-Cookie: ASP.NET_SessionId=4j3osiudpoj1sqlfwgvblw1i; path=/
+Set-Cookie: .ASPXAUTH=CF585BC981BB0EF0E7071520F476E19323083C9B2DBA66B108CB8205BEA0260561A55FA1CC82319D14B30F957B6CE7233F1447F737187147ECBEA0B9D40E73D4C5A17E0DA66D0CC3080F2895E916FB0178EBA3C7FB37E1AFBBE0F6E354CA6653B23903F9F0CE9BB85CFD35D8C2125D4D8B6059C94F30AF6E3F7E3DC14B64B5CE; path=/; HttpOnly; SameSite=Lax
+X-Powered-By: ASP.NET
+
+{"PropertyStatuses":[],"ResultStatus":{"OutputLog":{"LogType":0,"MessageFirst":{"Items":[]},"MessageMiddle":{"Items":[]},"MessageLast":{"Items":[]}},"DesignGroup":null,"Index":0,"RData":null,"PropertyName":"","MessageName":0,"MessageParams":null},"ResponseData":{"R1List":[],"Ｘ0":"00","Ｘ1":999,"Ｘ2":"{CEC0285A-6796-4DFF-8D8A-70D896824E2E}","Ｘ3":"まねきや硝子株式会社","Ｘ4":80,"Ｘ5":"K042","Ｘ6":"1","Ｘ7":"1","Ｘ8":"1"}}

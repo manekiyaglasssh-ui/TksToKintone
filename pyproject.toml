@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tks-to-kintone"
+version = "0.1.0"
+description = "TKS OLAP CSV extraction and kintone import CSV generation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7",
+    "PyMuPDF>=1.24",
+    "qrcode[pil]>=7.4",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+tks-to-kintone = "tks_to_kintone.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

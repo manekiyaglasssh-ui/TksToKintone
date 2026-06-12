@@ -1,0 +1,9 @@
+POST /c/%E3%83%AD%E3%82%B0%E3%82%A4%E3%83%B3%E8%AA%8D%E8%A8%BC HTTP/2
+Host: www.ap.tkscloud8.aga-sys.com
+Accept: application/json
+Content-Type: application/json; charset=utf-8
+Content-Length: 293
+Expect: 100-continue
+Connection: Keep-Alive
+
+{"契約会社コード":"G29V-T8GL-9LYD","ログインID":"y-yonishi","パスワード":"manekiya","ログイン認証区分":"2","端末識別ID":"{CEC0285A-6796-4DFF-8D8A-70D896824E2E}","コンピュータ名":"DESKTOP-FG06QMO","IPアドレス":"fe80::1f5d:5027:5efe:42e1%5","ScreenName":0}

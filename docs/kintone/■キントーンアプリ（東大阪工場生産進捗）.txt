@@ -1,0 +1,4 @@
+■キントーンアプリ（東大阪工場生産進捗）
+・エンドポイント：https://manekiya.cybozu.com
+・アプリID：255
+・APIトークン：bahbbohyf2BqilmTveZep2Um6Ti1WCThCMW4SkbW

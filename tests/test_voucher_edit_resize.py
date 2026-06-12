@@ -1,0 +1,369 @@
+"""指図書編集画面のリサイズハンドル操作と Ctrl+V 経路のテスト（不具合1・2）。"""
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from unittest import mock
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+try:
+    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtGui import QImage, QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    PYSIDE_AVAILABLE = True
+except Exception:  # pragma: no cover - PySide6 未導入環境
+    PYSIDE_AVAILABLE = False
+
+
+def _png_bytes(width: int = 12, height: int = 8, color: int = 0xFF3366CC) -> bytes:
+    from app.voucher_edit_window import qimage_to_png_bytes
+
+    image = QImage(width, height, QImage.Format.Format_ARGB32)
+    image.fill(color)
+    return qimage_to_png_bytes(image)
+
+
+def _set_clipboard_image(color: int = 0xFF00AA55) -> None:
+    image = QImage(10, 10, QImage.Format.Format_ARGB32)
+    image.fill(color)
+    QApplication.clipboard().setImage(image)
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")
+class TestResizeHandles(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._prev_home = os.environ.get("TKS_TO_KINTONE_HOME")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = self._tmp.name
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("TKS_TO_KINTONE_HOME", None)
+        else:
+            os.environ["TKS_TO_KINTONE_HOME"] = self._prev_home
+        self._tmp.cleanup()
+
+    def _make_window(self):
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="resize-1", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        return win
+
+    def _select_resize_handle(self, win, item):
+        """item を選択して付与された右下リサイズハンドルを返す。"""
+        from app.voucher_edit_window import _ResizeHandle
+
+        win._scene.clearSelection()
+        item.setSelected(True)
+        win._on_selection_changed()
+        handles = [h for h in win._handles if isinstance(h, _ResizeHandle)]
+        self.assertEqual(len(handles), 1)
+        return handles[0]
+
+    # ── 各オブジェクトがハンドルでリサイズできる ────────────────────────────
+    def test_image_resized_by_dragging_handle(self) -> None:
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        handle = self._select_resize_handle(win, item)
+        # 右下ハンドルをドラッグ（setPos が itemChange→_resize_target を発火）。
+        handle.setPos(QPointF(220.0, 180.0))
+        obj = win.serialize_objects()[0]
+        self.assertGreater(obj["width"], 50.0)
+        self.assertGreater(obj["height"], 40.0)
+
+    def test_text_resized_by_dragging_handle(self) -> None:
+        win = self._make_window()
+        item = win.add_text_rect(QRectF(20.0, 20.0, 80.0, 24.0),
+                                 text="T", auto_edit=False)
+        handle = self._select_resize_handle(win, item)
+        handle.setPos(QPointF(260.0, 200.0))
+        obj = win.serialize_objects()[0]
+        self.assertGreater(obj["width"], 80.0)
+        self.assertGreater(obj["height"], 24.0)
+
+    def test_rect_resized_by_dragging_handle(self) -> None:
+        win = self._make_window()
+        item = win.add_rect(QRectF(20.0, 20.0, 60.0, 40.0), text="r")
+        handle = self._select_resize_handle(win, item)
+        handle.setPos(QPointF(260.0, 220.0))
+        obj = win.serialize_objects()[0]
+        self.assertGreater(obj["width"], 60.0)
+        self.assertGreater(obj["height"], 40.0)
+
+    def test_ellipse_resized_by_dragging_handle(self) -> None:
+        win = self._make_window()
+        item = win.add_ellipse(QRectF(20.0, 20.0, 60.0, 40.0), text="e")
+        handle = self._select_resize_handle(win, item)
+        handle.setPos(QPointF(260.0, 220.0))
+        obj = win.serialize_objects()[0]
+        self.assertGreater(obj["width"], 60.0)
+        self.assertGreater(obj["height"], 40.0)
+
+    def test_line_endpoint_changed_by_dragging_handle(self) -> None:
+        from app.voucher_edit_window import _LineEndHandle
+
+        win = self._make_window()
+        line = win.add_line(QPointF(30.0, 30.0), QPointF(90.0, 30.0))
+        win._scene.clearSelection()
+        line.setSelected(True)
+        win._on_selection_changed()
+        handles = [h for h in win._handles if isinstance(h, _LineEndHandle)]
+        self.assertEqual(len(handles), 2)
+        # p2 端点ハンドルを移動して終点を変える。
+        p2_handle = [h for h in handles if h._which == "p2"][0]
+        p2_handle.setPos(QPointF(150.0, 120.0))
+        obj = win.serialize_objects()[0]
+        self.assertAlmostEqual(obj["x2"], 150.0, delta=1.0)
+        self.assertAlmostEqual(obj["y2"], 120.0, delta=1.0)
+
+    # ── リサイズ完了で dirty/commit_history/refresh_handles ──────────────────
+    def test_resize_marks_dirty(self) -> None:
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        win.commit_history()
+        win.mark_saved()
+        self.assertFalse(win.is_dirty())
+        handle = self._select_resize_handle(win, item)
+        handle.setPos(QPointF(220.0, 180.0))
+        self._release(handle)
+        self.assertTrue(win.is_dirty())
+
+    def test_resize_commits_history(self) -> None:
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        win.commit_history()
+        handle = self._select_resize_handle(win, item)
+        handle.setPos(QPointF(220.0, 180.0))
+        with mock.patch.object(win, "commit_history",
+                               wraps=win.commit_history) as spy:
+            self._release(handle)
+        self.assertTrue(spy.called)
+
+    def test_resize_is_undoable(self) -> None:
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        win.commit_history()
+        small_w = win.serialize_objects()[0]["width"]
+        handle = self._select_resize_handle(win, item)
+        handle.setPos(QPointF(240.0, 200.0))
+        self._release(handle)
+        big_w = win.serialize_objects()[0]["width"]
+        self.assertGreater(big_w, small_w)
+        win.undo()
+        self.assertAlmostEqual(win.serialize_objects()[0]["width"], small_w,
+                               delta=1.0)
+
+    def _release(self, handle) -> None:
+        from PySide6.QtWidgets import QGraphicsSceneMouseEvent
+
+        ev = QGraphicsSceneMouseEvent(
+            QGraphicsSceneMouseEvent.Type.GraphicsSceneMouseRelease)
+        ev.setButton(Qt.MouseButton.LeftButton)
+        handle.mouseReleaseEvent(ev)
+
+    # ── 背景はリサイズ対象外 ─────────────────────────────────────────────────
+    def test_background_gets_no_resize_handle(self) -> None:
+        win = self._make_window()
+        # 背景アイテムを選択しようとしても serialize_edit_object を持たないため
+        # ハンドルは付与されない。
+        for bg in win.background_items():
+            win._scene.clearSelection()
+            bg.setSelected(True)
+            win._on_selection_changed()
+            self.assertEqual(win._handles, [])
+
+    # ── ハンドルのクリック判定が画像本体より優先される（不具合1）──────────────
+    def test_handle_shape_larger_than_visual(self) -> None:
+        from app.voucher_edit_window import HANDLE_HIT_SIZE, HANDLE_SIZE
+
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        handle = self._select_resize_handle(win, item)
+        shape_rect = handle.shape().boundingRect()
+        # クリック判定（shape）は見た目（rect）より広い。
+        self.assertAlmostEqual(shape_rect.width(), HANDLE_HIT_SIZE, delta=0.01)
+        self.assertGreater(HANDLE_HIT_SIZE, HANDLE_SIZE)
+
+    def test_handle_hit_area_prioritized_over_image(self) -> None:
+        """画像本体と重なる点・拡大判定領域とも、最前面のハンドルが拾われる。"""
+        from PySide6.QtGui import QTransform
+
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        handle = self._select_resize_handle(win, item)
+        scene = win._scene
+        # 画像本体（〜70,60）と重なる点でもハンドルが最前面で拾われる。
+        on_body = QPointF(68.0, 58.0)
+        self.assertIs(scene.itemAt(on_body, QTransform()), handle)
+        # 見た目の矩形外（拡大判定領域内）でもハンドルが拾われる。
+        enlarged = QPointF(78.0, 60.0)
+        self.assertIs(scene.itemAt(enlarged, QTransform()), handle)
+        # scene 側のハンドル判定も拡大判定領域を拾う。
+        self.assertTrue(scene._press_on_handle(enlarged))
+
+    def test_handle_press_accepts_and_stops_target_move(self) -> None:
+        """ハンドル押下で event.accept() され、対象の移動が止まる。"""
+        from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
+
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        handle = self._select_resize_handle(win, item)
+        movable = QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+        self.assertTrue(bool(item.flags() & movable))
+        ev = QGraphicsSceneMouseEvent(
+            QGraphicsSceneMouseEvent.Type.GraphicsSceneMousePress)
+        ev.setScenePos(handle.sceneBoundingRect().center())
+        ev.setButton(Qt.MouseButton.LeftButton)
+        handle.mousePressEvent(ev)
+        self.assertTrue(ev.isAccepted())
+        # リサイズ中は対象の移動が止まる（本体が動かない）。
+        self.assertFalse(bool(item.flags() & movable))
+
+    def test_handle_drag_does_not_move_target(self) -> None:
+        """ハンドルドラッグ中は対象の位置が変わらず、サイズだけ変わる。"""
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        before_pos = (item.pos().x(), item.pos().y())
+        before_w = win.serialize_objects()[0]["width"]
+        handle = self._select_resize_handle(win, item)
+        handle.setPos(QPointF(240.0, 200.0))
+        after_pos = (item.pos().x(), item.pos().y())
+        after_w = win.serialize_objects()[0]["width"]
+        self.assertAlmostEqual(after_pos[0], before_pos[0], delta=0.01)
+        self.assertAlmostEqual(after_pos[1], before_pos[1], delta=0.01)
+        self.assertGreater(after_w, before_w)
+
+    def test_clicking_handle_keeps_selection(self) -> None:
+        """ハンドル押下で対象の選択が外れない（リサイズが途中で壊れない）。"""
+        from PySide6.QtWidgets import QGraphicsSceneMouseEvent
+
+        win = self._make_window()
+        item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
+        handle = self._select_resize_handle(win, item)
+        scene = win._scene
+        handle_pos = handle.sceneBoundingRect().center()
+        ev = QGraphicsSceneMouseEvent(
+            QGraphicsSceneMouseEvent.Type.GraphicsSceneMousePress)
+        ev.setScenePos(handle_pos)
+        ev.setButton(Qt.MouseButton.LeftButton)
+        scene.mousePressEvent(ev)
+        # ハンドル押下後も対象は選択されたまま＝ハンドルが撤去されない。
+        self.assertTrue(item.isSelected())
+        self.assertTrue(scene._press_handle)
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")
+class TestPasteShortcutRouting(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._prev_home = os.environ.get("TKS_TO_KINTONE_HOME")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = self._tmp.name
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("TKS_TO_KINTONE_HOME", None)
+        else:
+            os.environ["TKS_TO_KINTONE_HOME"] = self._prev_home
+        self._tmp.cleanup()
+
+    def _make_window(self):
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="paste-1", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        return win
+
+    def _paste_key_event(self) -> "QKeyEvent":
+        return QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_V,
+                         Qt.KeyboardModifier.ControlModifier)
+
+    def test_handle_paste_shortcut_calls_paste_image(self) -> None:
+        win = self._make_window()
+        _set_clipboard_image()
+        with mock.patch.object(win, "paste_image_from_clipboard",
+                               wraps=win.paste_image_from_clipboard) as spy:
+            handled = win.handle_paste_shortcut()
+        self.assertTrue(handled)
+        self.assertTrue(spy.called)
+
+    def test_ctrl_v_on_view_pastes_image(self) -> None:
+        """QGraphicsView にフォーカスがある状態でも Ctrl+V で貼り付けできる。"""
+        win = self._make_window()
+        _set_clipboard_image(0xFF123456)
+        win._view.keyPressEvent(self._paste_key_event())
+        objects = win.serialize_objects()
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0]["type"], "image")
+
+    def test_ctrl_v_on_view_selects_pasted_image(self) -> None:
+        win = self._make_window()
+        _set_clipboard_image(0xFF654321)
+        win._view.keyPressEvent(self._paste_key_event())
+        selected = [it for it in win._scene.selectedItems()
+                    if hasattr(it, "serialize_edit_object")]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].serialize_edit_object()["type"], "image")
+
+    def test_ctrl_v_on_view_during_text_edit_prefers_text(self) -> None:
+        """テキスト編集中の Ctrl+V は画像貼り付けしない（テキスト優先）。"""
+        from PySide6.QtCore import QRectF
+
+        win = self._make_window()
+        _set_clipboard_image()
+        text_item = win.add_text_rect(QRectF(50.0, 50.0, 120.0, 30.0), text="")
+        text_item.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
+        text_item.setFocus(Qt.FocusReason.OtherFocusReason)
+        with mock.patch.object(win, "paste_image_from_clipboard") as spy:
+            win._view.keyPressEvent(self._paste_key_event())
+        spy.assert_not_called()
+        images = [o for o in win.serialize_objects() if o["type"] == "image"]
+        self.assertEqual(images, [])
+
+    def test_handle_paste_without_image_returns_false(self) -> None:
+        win = self._make_window()
+        QApplication.clipboard().clear()
+        QApplication.clipboard().setText("ただのテキスト")
+        self.assertFalse(win.handle_paste_shortcut())
+
+    def test_ctrl_v_pastes_image_in_any_tool(self) -> None:
+        """選択以外のツール選択中でも Ctrl+V で画像貼り付けできる（不具合2）。"""
+        from app.voucher_edit_window import (
+            TOOL_ELLIPSE, TOOL_LINE, TOOL_RECT, TOOL_SELECT, TOOL_TEXT,
+        )
+
+        for tool in (TOOL_TEXT, TOOL_LINE, TOOL_RECT, TOOL_ELLIPSE):
+            with self.subTest(tool=tool):
+                win = self._make_window()
+                win.set_tool(tool)
+                _set_clipboard_image(0xFF223344)
+                win._view.keyPressEvent(self._paste_key_event())
+                images = [o for o in win.serialize_objects()
+                          if o["type"] == "image"]
+                self.assertEqual(len(images), 1)
+                # 貼り付け後は選択ツールへ戻る。
+                self.assertEqual(win.current_tool, TOOL_SELECT)
+
+    def test_ctrl_v_returns_to_select_tool(self) -> None:
+        from app.voucher_edit_window import TOOL_RECT, TOOL_SELECT
+
+        win = self._make_window()
+        win.set_tool(TOOL_RECT)
+        _set_clipboard_image(0xFF445566)
+        self.assertTrue(win.handle_paste_shortcut())
+        self.assertEqual(win.current_tool, TOOL_SELECT)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
