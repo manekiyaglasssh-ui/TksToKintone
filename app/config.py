@@ -7,7 +7,6 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from app.kakou_master import ensure_master_file
 from app.cleanup_service import normalize_retention_days
 from app.models import AppConfig, AppPaths
 from app.path_utils import VOUCHER_OUTPUT_DIR_ENV_KEY, get_app_data_dir
@@ -44,6 +43,13 @@ _INTERNAL_TO_ENV_KEY: dict[str, str] = {
     "得意先4": "CUSTOMER_LABEL_4",
 }
 _ENV_TO_INTERNAL_KEY: dict[str, str] = {v: k for k, v in _INTERNAL_TO_ENV_KEY.items()}
+_INTERNAL_TO_MATCH_ENV_KEY: dict[str, str] = {
+    "得意先1": "CUSTOMER_MATCH_1",
+    "得意先2": "CUSTOMER_MATCH_2",
+    "得意先3": "CUSTOMER_MATCH_3",
+    "得意先4": "CUSTOMER_MATCH_4",
+}
+_MATCH_ENV_TO_INTERNAL_KEY: dict[str, str] = {v: k for k, v in _INTERNAL_TO_MATCH_ENV_KEY.items()}
 
 KINTONE_LOGIN_ID_ENV_KEY = "KINTONE_LOGIN_ID"
 KINTONE_PASSWORD_ENV_KEY = "KINTONE_PASSWORD"
@@ -56,7 +62,11 @@ def validate_customer_label(value: str) -> str | None:
     return None
 
 
-def update_customer_labels_in_config(config_path: Path, labels: dict[str, str]) -> None:
+def update_customer_labels_in_config(
+    config_path: Path,
+    labels: dict[str, str],
+    match_patterns: dict[str, str] | None = None,
+) -> None:
     """config.env の CUSTOMER_LABEL_1〜4 を更新または末尾に追記する。
 
     - 既存の他のキーはそのまま保持する
@@ -81,9 +91,13 @@ def update_customer_labels_in_config(config_path: Path, labels: dict[str, str]) 
             continue
         if "=" in stripped:
             env_key = stripped.split("=", 1)[0].strip()
-            if env_key in _ENV_TO_INTERNAL_KEY:
-                internal_key = _ENV_TO_INTERNAL_KEY[env_key]
-                value = labels.get(internal_key) or CUSTOMER_LABEL_DEFAULTS[internal_key]
+            if env_key in _ENV_TO_INTERNAL_KEY or env_key in _MATCH_ENV_TO_INTERNAL_KEY:
+                if env_key in _ENV_TO_INTERNAL_KEY:
+                    internal_key = _ENV_TO_INTERNAL_KEY[env_key]
+                    value = labels.get(internal_key) or CUSTOMER_LABEL_DEFAULTS[internal_key]
+                else:
+                    internal_key = _MATCH_ENV_TO_INTERNAL_KEY[env_key]
+                    value = (match_patterns or {}).get(internal_key, "")
                 new_lines.append(f"{env_key}={value}\n")
                 updated_env_keys.add(env_key)
                 continue
@@ -92,6 +106,10 @@ def update_customer_labels_in_config(config_path: Path, labels: dict[str, str]) 
     for internal_key, env_key in _INTERNAL_TO_ENV_KEY.items():
         if env_key not in updated_env_keys:
             value = labels.get(internal_key) or CUSTOMER_LABEL_DEFAULTS[internal_key]
+            new_lines.append(f"{env_key}={value}\n")
+    for internal_key, env_key in _INTERNAL_TO_MATCH_ENV_KEY.items():
+        if env_key not in updated_env_keys:
+            value = (match_patterns or {}).get(internal_key, "")
             new_lines.append(f"{env_key}={value}\n")
 
     config_path.write_text("".join(new_lines), encoding="utf-8")
@@ -167,9 +185,93 @@ def default_base_dir() -> Path:
     return get_app_data_dir()
 
 
+# ProgramData 側に配置する OLAPリクエストテンプレート。
+OLAP_TEMPLATE_NAMES: tuple[str, ...] = (
+    "kakou_request_template.json",
+    "soba_request_template.json",
+)
+
+
+def olap_template_source_dirs() -> list[Path]:
+    """アプリ同梱側 docs/olap の候補ディレクトリ（探索順）。
+
+    PyInstaller実行時（_MEIPASS / _internal 配下）と開発環境の両方で
+    参照できるようにする。
+    """
+    return [
+        resource_path("docs/olap"),
+        resource_path("_internal/docs/olap"),
+        Path(__file__).resolve().parents[1] / "docs" / "olap",
+    ]
+
+
+def find_bundled_olap_template(name: str) -> Path | None:
+    """同梱側 docs/olap から指定テンプレートを探す。見つからなければ None。"""
+    for source_dir in olap_template_source_dirs():
+        candidate = source_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _should_copy_template(source: Path, target: Path) -> bool:
+    """ProgramData側へコピーすべきか判定する。
+
+    - 配置先が無ければコピーする
+    - 同名でも同梱側の方が新しければ上書きする
+    """
+    if not target.exists():
+        return True
+    try:
+        return source.stat().st_mtime > target.stat().st_mtime
+    except OSError:
+        return True
+
+
+def olap_template_dir(base_dir: Path | None = None) -> Path:
+    """ProgramData 側の docs/olap ディレクトリパスを返す。"""
+    base = base_dir or default_base_dir()
+    return base / "docs" / "olap"
+
+
+def ensure_olap_templates_installed(base_dir: Path | None = None) -> Path:
+    """ProgramData 側の docs/olap に最新の OLAPテンプレートを配置する。
+
+    - docs/olap フォルダが無ければ作成する
+    - 同梱テンプレートが ProgramData 側に無ければコピーする
+    - 同名でも同梱側の方が新しければ上書きする
+    - コピー元が見つからない場合は候補パスをすべてログに出す
+
+    起動時・更新時の古いテンプレート削除後・OLAP取得直前に呼ぶことを想定。
+    戻り値は ProgramData 側の docs/olap ディレクトリ。
+    """
+    target_dir = olap_template_dir(base_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in OLAP_TEMPLATE_NAMES:
+        target = target_dir / name
+        source = find_bundled_olap_template(name)
+        if source is None:
+            searched = [str(directory / name) for directory in olap_template_source_dirs()]
+            _LOGGER.warning(
+                "OLAPテンプレートのコピー元が見つかりません: %s\n探索したパス:\n  %s",
+                name,
+                "\n  ".join(searched),
+            )
+            continue
+        if _should_copy_template(source, target):
+            shutil.copyfile(source, target)
+            _LOGGER.info("OLAPテンプレートを配置しました: %s -> %s", source, target)
+    return target_dir
+
+
 def load_app_config() -> AppConfig:
     base_dir = default_base_dir()
     base_dir.mkdir(parents=True, exist_ok=True)
+
+    # 起動時に必ず ProgramData 側の OLAPテンプレートを最新状態へ復旧する。
+    # 更新時に古いテンプレートを削除しても、ここで同梱側から再配置される。
+    ensure_olap_templates_installed(base_dir)
 
     config_path = base_dir / "config.env"
     mapping_path = base_dir / "field_mapping.json"
@@ -200,7 +302,11 @@ def load_app_config() -> AppConfig:
     )
     for directory in (paths.work_dir, paths.log_dir, paths.error_dir, paths.kakou_master_backup_dir):
         directory.mkdir(parents=True, exist_ok=True)
-    ensure_master_file(paths.kakou_master_csv)
+
+    from app.settings_service import ensure_default_initial_data
+
+    ensure_default_initial_data(paths.kakou_master_csv, config_path)
+    values = dotenv_values(config_path)
 
     tks_client_mode = str(values.get("TKS_CLIENT_MODE") or "mock").strip().lower()
     if tks_client_mode not in {"mock", "http"}:
@@ -220,6 +326,12 @@ def load_app_config() -> AppConfig:
         "得意先2": str(values.get("CUSTOMER_LABEL_2") or "得意先2"),
         "得意先3": str(values.get("CUSTOMER_LABEL_3") or "得意先3"),
         "得意先4": str(values.get("CUSTOMER_LABEL_4") or "得意先4"),
+    }
+    customer_match_patterns = {
+        "得意先1": str(values.get("CUSTOMER_MATCH_1") or ""),
+        "得意先2": str(values.get("CUSTOMER_MATCH_2") or ""),
+        "得意先3": str(values.get("CUSTOMER_MATCH_3") or ""),
+        "得意先4": str(values.get("CUSTOMER_MATCH_4") or ""),
     }
 
     raw_preview_theme = str(values.get("PREVIEW_COLOR_THEME") or "light").strip().lower()
@@ -252,6 +364,7 @@ def load_app_config() -> AppConfig:
         tks_voucher_olap_disable_op_fields=_to_bool(str(values.get("TKS_VOUCHER_OLAP_DISABLE_OP_FIELDS") or "1")),
         tks_voucher_olap_enabled_op_fields=_split_options(str(values.get("TKS_VOUCHER_OLAP_ENABLED_OP_FIELDS") or "")),
         customer_labels=customer_labels,
+        customer_match_patterns=customer_match_patterns,
         preview_color_theme=preview_color_theme,
         voucher_output_dir=Path(voucher_output_dir) if voucher_output_dir else None,
     )

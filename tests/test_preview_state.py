@@ -6,7 +6,16 @@ from __future__ import annotations
 
 import unittest
 
-from app.preview_state import DEFAULT_CUSTOMER_KEY, PROCESSING_TYPE, PreviewState
+from app.preview_state import (
+    DEFAULT_CUSTOMER_KEY,
+    DEFAULT_KAKOU_TYPE,
+    KAKOU_TYPE_NAMES,
+    PROCESSING_TYPE,
+    PreviewState,
+    compute_kakou_mm,
+    kakou_type_from_product_name,
+    kakou_type_label,
+)
 
 # ── テスト用マスタ ────────────────────────────────────────
 
@@ -583,6 +592,278 @@ class PreviewStateRegistrationRowsCompletenessTest(unittest.TestCase):
         result = state.build_registration_rows(_MASTER)
         self.assertEqual(result[0]["加工名"], "エッチング")
         self.assertEqual(result[1]["加工名"], "広幅")
+
+
+class KakouTypeLabelTest(unittest.TestCase):
+    """加工種類コード→表示名の変換を検証する（要件5）。"""
+
+    def test_all_codes_have_labels(self) -> None:
+        expected = {
+            "1": "1：四方", "2": "2：長2", "3": "3：短2", "4": "4：長2短1",
+            "5": "5：長1短2", "6": "6：長1短1", "7": "7：長1", "8": "8：短1",
+            "9": "9：1方", "10": "10：2方", "11": "11：3方",
+        }
+        for code, label in expected.items():
+            self.assertEqual(kakou_type_label(code), label)
+
+    def test_invalid_code_returns_empty(self) -> None:
+        self.assertEqual(kakou_type_label("12"), "")
+        self.assertEqual(kakou_type_label("0"), "")
+        self.assertEqual(kakou_type_label(""), "")
+
+    def test_extended_codes_present(self) -> None:
+        """9〜11 が KAKOU_TYPE_NAMES に存在する（要件1）。"""
+        self.assertEqual(KAKOU_TYPE_NAMES["9"], "1方")
+        self.assertEqual(KAKOU_TYPE_NAMES["10"], "2方")
+        self.assertEqual(KAKOU_TYPE_NAMES["11"], "3方")
+
+
+class KakouTypeFromProductNameTest(unittest.TestCase):
+    """商品名称から加工種類を判定するロジックを検証する（要件4）。"""
+
+    def test_basic_matches(self) -> None:
+        cases = {
+            "四方": "1",
+            "長2": "2",
+            "短2": "3",
+            "長1": "7",
+            "短1": "8",
+            "１方": "9",
+            "２方": "10",
+            "３方": "11",
+        }
+        for text, code in cases.items():
+            self.assertEqual(kakou_type_from_product_name(f"ガラス {text} 仕上"), code, text)
+
+    def test_combination_matches_before_single_matches(self) -> None:
+        """組み合わせ判定が単独判定より先に実行される（誤判定防止）。"""
+        cases = {
+            "特注 長2 短2 品": "1",
+            "特注 長２ 短２ 品": "1",
+            "特注 長2短1 品": "4",
+            "特注 長２短１ 品": "4",
+            "特注 長1短2 品": "5",
+            "特注 長１短２ 品": "5",
+            "特注 長1短1 品": "6",
+        }
+        for text, code in cases.items():
+            self.assertEqual(kakou_type_from_product_name(text), code, text)
+
+    def test_no_match_returns_none(self) -> None:
+        self.assertIsNone(kakou_type_from_product_name("無地ガラス"))
+        self.assertIsNone(kakou_type_from_product_name(""))
+
+    def test_halfwidth_houkou(self) -> None:
+        """半角 1方/2方/3方 も判定できる。"""
+        self.assertEqual(kakou_type_from_product_name("加工 1方"), "9")
+        self.assertEqual(kakou_type_from_product_name("加工 2方"), "10")
+        self.assertEqual(kakou_type_from_product_name("加工 3方"), "11")
+
+    def test_chouhen_tanpen_priority_over_houkou(self) -> None:
+        """長/短付きは 1方/2方/3方 より優先する（要件6）。全角・半角数字とも。"""
+        cases = {
+            "長2方": "2", "長２方": "2",
+            "短2方": "3", "短２方": "3",
+            "長1方": "7", "長１方": "7",
+            "短1方": "8", "短１方": "8",
+        }
+        for text, code in cases.items():
+            self.assertEqual(kakou_type_from_product_name(f"強化 {text} 磨き"), code, text)
+
+    def test_houkou_alone_still_matches(self) -> None:
+        """長/短が付かない ２方 ３方 単独は従来どおり 10/11。"""
+        self.assertEqual(kakou_type_from_product_name("加工 ２方"), "10")
+        self.assertEqual(kakou_type_from_product_name("加工 ３方"), "11")
+
+    def test_chouhen_tanpen_not_misjudged_as_houkou(self) -> None:
+        """長2方 / 短2方 が 10：2方 にならないこと（要件6）。"""
+        self.assertNotEqual(kakou_type_from_product_name("長2方"), "10")
+        self.assertNotEqual(kakou_type_from_product_name("短2方"), "10")
+
+
+class ComputeKakouMmFormulaTest(unittest.TestCase):
+    """加工mm計算式を検証する（要件7・10）。W=1303, H=1061。"""
+
+    EXPECTED = {
+        "1": "4728",
+        "2": "2606",
+        "3": "2122",
+        "4": "3667",
+        "5": "3425",
+        "6": "2364",
+        "7": "1303",
+        "8": "1061",
+    }
+
+    def test_each_code(self) -> None:
+        for code, expected in self.EXPECTED.items():
+            self.assertEqual(compute_kakou_mm(code, "1303", "1061"), expected, code)
+
+    def test_w_h_swapped_same_result(self) -> None:
+        """W/H が逆でも長辺・短辺判定が正しい。"""
+        for code, expected in self.EXPECTED.items():
+            self.assertEqual(compute_kakou_mm(code, "1061", "1303"), expected, code)
+
+    def test_blank_dimension_returns_empty(self) -> None:
+        self.assertEqual(compute_kakou_mm("1", "", "1061"), "")
+        self.assertEqual(compute_kakou_mm("1", "1303", ""), "")
+
+    def test_zero_or_invalid_dimension_returns_empty(self) -> None:
+        self.assertEqual(compute_kakou_mm("1", "0", "1061"), "")
+        self.assertEqual(compute_kakou_mm("1", "abc", "1061"), "")
+
+    def test_invalid_code_returns_empty(self) -> None:
+        self.assertEqual(compute_kakou_mm("12", "1303", "1061"), "")
+        self.assertEqual(compute_kakou_mm("0", "1303", "1061"), "")
+
+    def test_width_based_codes_use_w(self) -> None:
+        """9〜11 は長辺・短辺ではなく W をそのまま使う（要件2）。"""
+        self.assertEqual(compute_kakou_mm("9", "1303", "1061"), "1303")
+        self.assertEqual(compute_kakou_mm("10", "1303", "1061"), "2606")
+        self.assertEqual(compute_kakou_mm("11", "1303", "1061"), "3909")
+
+    def test_width_based_codes_ignore_h_order(self) -> None:
+        """W/H が逆でも 9〜11 は W 基準で計算される（長辺・短辺判定なし）。"""
+        # W=1061, H=1303 でも W=1061 をそのまま使う。
+        self.assertEqual(compute_kakou_mm("9", "1061", "1303"), "1061")
+        self.assertEqual(compute_kakou_mm("10", "1061", "1303"), "2122")
+        self.assertEqual(compute_kakou_mm("11", "1061", "1303"), "3183")
+
+    def test_width_based_codes_blank_w_returns_empty(self) -> None:
+        """9〜11 でも W が空欄・0・不正なら加工mmは空欄（要件8）。"""
+        self.assertEqual(compute_kakou_mm("9", "", "1061"), "")
+        self.assertEqual(compute_kakou_mm("10", "0", "1061"), "")
+        self.assertEqual(compute_kakou_mm("11", "abc", "1061"), "")
+
+    def test_decimal_dimension(self) -> None:
+        """小数寸法も扱える。"""
+        self.assertEqual(compute_kakou_mm("7", "1303.5", "1061"), "1303.5")
+
+    def test_comma_dimension(self) -> None:
+        """カンマ付き寸法も数値として扱う。"""
+        self.assertEqual(compute_kakou_mm("7", "1,303", "1,061"), "1303")
+
+
+def _row_wh(order_no: str, row_type: str, width: str = "1303", height: str = "1061",
+            code: str = "0300", name: str = "エッチング") -> dict[str, str]:
+    return {
+        "受注No": order_no,
+        "硝/加工": row_type,
+        "掛率集計コード": code,
+        "掛率集計名称": name,
+        "W寸法": width,
+        "H寸法": height,
+    }
+
+
+class PreviewStateKakouTypeTest(unittest.TestCase):
+    """加工種類の状態管理と加工mm反映を検証する（要件4・6・9）。"""
+
+    def test_default_kakou_type_is_one(self) -> None:
+        rows = [_row_wh("1000", "2")]
+        state = PreviewState(rows=rows)
+        self.assertEqual(state.kakou_type_by_row[0], DEFAULT_KAKOU_TYPE)
+        self.assertEqual(DEFAULT_KAKOU_TYPE, "1")
+
+    def test_set_kakou_type_is_per_row(self) -> None:
+        """加工種類は行ごとに独立して設定される（受注Noで伝播しない）。"""
+        rows = [_row_wh("1000", "2"), _row_wh("1000", "2")]
+        state = PreviewState(rows=rows)
+        state.set_kakou_type(0, "2")
+        self.assertEqual(state.kakou_type_by_row[0], "2")
+        self.assertEqual(state.kakou_type_by_row[1], DEFAULT_KAKOU_TYPE)
+
+    def test_compute_kakou_mm_default_type(self) -> None:
+        rows = [_row_wh("1000", "2")]
+        state = PreviewState(rows=rows)
+        # 既定 1：四方 → 4728
+        self.assertEqual(state.compute_kakou_mm(0), "4728")
+
+    def test_compute_kakou_mm_reflects_type_change(self) -> None:
+        """加工種類変更が加工mmに即時反映される（要件9）。"""
+        rows = [_row_wh("1000", "2")]
+        state = PreviewState(rows=rows)
+        state.set_kakou_type(0, "7")
+        self.assertEqual(state.compute_kakou_mm(0), "1303")
+
+    def test_glass_row_no_kakou_mm(self) -> None:
+        """硝/加工 ≠ 2 の行は加工mmを計算しない（要件6）。"""
+        rows = [_row_wh("1000", "1")]
+        state = PreviewState(rows=rows)
+        self.assertEqual(state.compute_kakou_mm(0), "")
+
+    def test_blank_wh_no_kakou_mm(self) -> None:
+        """W/H が空欄の場合は加工mmが不正登録されない（要件8）。"""
+        rows = [_row_wh("1000", "2", width="", height="")]
+        state = PreviewState(rows=rows)
+        self.assertEqual(state.compute_kakou_mm(0), "")
+
+    def test_build_registration_rows_sets_kakou_mm(self) -> None:
+        rows = [
+            _row_wh("1000", "1"),  # 素板 → 加工mmなし
+            _row_wh("1000", "2"),  # 加工 → 既定1：四方 → 4728
+        ]
+        state = PreviewState(rows=rows)
+        state.set_kakou_type(1, "2")  # 長2 → 2606
+        result = state.build_registration_rows(_MASTER)
+        self.assertEqual(result[0]["加工mm"], "")      # 硝/加工=1
+        self.assertEqual(result[1]["加工mm"], "2606")  # 硝/加工=2
+
+    def test_build_registration_rows_glass_row_blank_kakou_mm(self) -> None:
+        """硝/加工 ≠ 2 の行に不要な加工mmが入らない。"""
+        rows = [_row_wh("1000", "1")]
+        state = PreviewState(rows=rows)
+        result = state.build_registration_rows(_MASTER)
+        self.assertEqual(result[0]["加工mm"], "")
+
+
+class PreviewStateProductNameDefaultTest(unittest.TestCase):
+    """商品名称からの加工種類自動入力を検証する（要件4・5）。"""
+
+    @staticmethod
+    def _row(row_type: str, product_name: str) -> dict[str, str]:
+        return {
+            "受注No": "1000",
+            "硝/加工": row_type,
+            "商品名称": product_name,
+            "掛率集計コード": "0300",
+            "掛率集計名称": "エッチング",
+            "W寸法": "1303",
+            "H寸法": "1061",
+        }
+
+    def test_processing_row_auto_detects(self) -> None:
+        """硝/加工=2 かつ商品名称に対象文字列があれば加工種類を自動入力する。"""
+        cases = {
+            "強化 四方 磨き": "1",
+            "ジャロジー加工 長2荒・短2糸": "1",
+            "ジャロジー加工 長２荒・短２糸": "1",
+            "強化 長2短1 磨き": "4",
+            "強化 長２短１ 磨き": "4",
+            "強化 長1短2 磨き": "5",
+            "強化 長１短２ 磨き": "5",
+            "強化 長1短1 磨き": "6",
+            "強化 長2 磨き": "2",
+            "強化 短2 磨き": "3",
+            "強化 長1 磨き": "7",
+            "強化 短1 磨き": "8",
+            "強化 １方 磨き": "9",
+            "強化 ３方 磨き": "11",
+        }
+        for name, code in cases.items():
+            state = PreviewState(rows=[self._row("2", name)])
+            self.assertEqual(state.kakou_type_by_row[0], code, name)
+
+    def test_processing_row_no_match_defaults_to_one(self) -> None:
+        """硝/加工=2 かつ対象文字列なしは 1：四方 を初期値にする。"""
+        state = PreviewState(rows=[self._row("2", "無地ガラス")])
+        self.assertEqual(state.kakou_type_by_row[0], DEFAULT_KAKOU_TYPE)
+
+    def test_non_processing_row_default(self) -> None:
+        """硝/加工 ≠ 2 では商品名称に依存せず既定値（表示・計算では無視される）。"""
+        state = PreviewState(rows=[self._row("1", "強化 長2 磨き")])
+        # 硝/加工 ≠ 2 の行は加工mm計算対象外（要件5）。
+        self.assertEqual(state.compute_kakou_mm(0), "")
 
 
 if __name__ == "__main__":

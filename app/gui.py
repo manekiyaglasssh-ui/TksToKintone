@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
+import os
 import re
 import sys
+import unicodedata
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QEvent, QSettings, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPalette
+from PySide6.QtCore import QDate, QEvent, QSettings, QStandardPaths, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPalette, QTextCursor
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -53,8 +56,17 @@ from app.config import (
     update_customer_labels_in_config,
     validate_customer_label,
 )
+from app.build_features import updates_enabled
 from app.cleanup_service import cleanup_old_files
-from app.csv_processor import create_output_csv, read_output_rows, write_failed_csv, write_input_history, write_output_csv
+from app.csv_processor import (
+    create_output_csv,
+    export_registration_records_to_csv,
+    read_output_rows,
+    unique_timestamp_csv_path,
+    write_failed_csv,
+    write_input_history,
+    write_output_csv,
+)
 from app.kakou_master import (
     KAKOU_MASTER_HEADERS,
     CUSTOMER_KEYS,
@@ -65,6 +77,7 @@ from app.kakou_master import (
     compute_kakou_name_for_order,
     find_unregistered,
     get_kakou_name,
+    load_default_master,
     load_master,
     lookup,
     read_csv_with_auto_encoding,
@@ -72,23 +85,37 @@ from app.kakou_master import (
     save_master,
 )
 from app.kintone_client import KintoneClient
+from app.kintone_existing import (
+    merge_existing_kintone_records_into_preview_rows,
+    summarize_existing_reflection,
+)
 from app.logger import setup_logger
 from app.models import AppConfig, PendingRegistration, ProcessResult, RunInput, TksDebugResult
-from app.preview_state import DEFAULT_CUSTOMER_KEY, PreviewState
+from app.teams_notifier import default_teams_webhook_url_prod, default_teams_webhook_url_test
+from app.preview_state import (
+    DEFAULT_CUSTOMER_KEY,
+    DEFAULT_KAKOU_TYPE,
+    KAKOU_TYPE_CODES,
+    KAKOU_TYPE_NAMES,
+    PreviewState,
+    kakou_type_label,
+)
 from app.tks_client import create_tks_client
-from app.update_client import UpdateClient, UpdateInfo, default_update_dir, launch_external_update
 from app.version import VERSION_CODE, VERSION_NAME
 
 
 SETTINGS_ORG = "Manekiya"
 SETTINGS_APP = "TksToKintone"
-SETTINGS_LOGIN_ID = "olap/login_id"
-SETTINGS_PASSWORD = "olap/password"
 SETTINGS_THEME = "ui/theme"
 SETTINGS_DEBUG_VISIBLE = "ui/debug_visible"
 SETTINGS_KINTONE_TARGET = "kintone/target"
+SETTINGS_TEAMS_ENABLED = "teams/enabled"
+SETTINGS_TEAMS_WEBHOOK_URL_TEST = "teams/webhook_url_test"
+SETTINGS_TEAMS_WEBHOOK_URL_PROD = "teams/webhook_url_prod"
 SETTINGS_R2_OVERRIDES_KAKOU = "olap/kakou_r2_overrides"
 SETTINGS_R2_OVERRIDES_SOBA = "olap/soba_r2_overrides"
+# 登録前確認画面「CSV作成」の出力先フォルダ（要件3）。
+SETTINGS_CSV_OUTPUT_DIR = "registration_preview/csv_output_dir"
 THEME_SYSTEM = "system"
 THEME_LIGHT = "light"
 THEME_DARK = "dark"
@@ -113,22 +140,140 @@ THEME_LABELS = {
 KAKOU_SETTING_DEFAULT = "selected"
 _PROCESSING_TYPE = "2"
 
+# Kintone登録処理画面の出荷区分（AM・PM）で「なし」を表す選択肢ラベル。
+# 「なし」選択時は登録値・登録前確認とも空欄扱いにする（要件3）。
+SHUKKA_NONE_LABEL = "なし"
+
+# 登録前確認の仕上日「なし」（空欄）を表す番兵日付。
+# QDateEdit の minimumDate に設定し setSpecialValueText で「なし」と表示する（要件3・5）。
+_SHIAGE_NONE_DATE = QDate(1900, 1, 1)
+
+# 受注No入力欄の区切り文字（改行・カンマ・全角カンマ・空白・全角空白）。
+# \s は全角空白(U+3000)も含むが、明示しておく（要件4）。
+_ORDER_NO_SEPARATORS = re.compile(r"[,，　\s]+")
+
+
+def parse_order_numbers(text: str) -> list[str]:
+    """受注No入力欄のテキストを各受注Noへ分解する（要件4）。
+
+    改行・カンマ・全角カンマ・空白・全角空白で区切り、前後空白を除去する。
+    受注Noは文字列として扱い、先頭ゼロは保持する（数値変換しない）。
+    """
+    if not text:
+        return []
+    return [token for token in _ORDER_NO_SEPARATORS.split(text) if token]
+
+
+def normalize_order_no(value: object) -> str:
+    """受注Noを重複比較用に正規化する（前後空白除去・全角→半角）。
+
+    空欄は空文字を返す。全角数字が入っても半角と同一視できるよう NFKC で正規化する。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return unicodedata.normalize("NFKC", text)
+
+
+def find_duplicate_order_numbers(order_numbers: list[str]) -> list[str]:
+    """受注Noリストの中で2回以上現れる受注Noを出現順で返す（正規化後で判定）。"""
+    counts: dict[str, int] = {}
+    first_form: dict[str, str] = {}
+    order: list[str] = []
+    for value in order_numbers:
+        key = normalize_order_no(value)
+        if not key:
+            continue
+        if key not in counts:
+            counts[key] = 0
+            first_form[key] = str(value).strip()
+            order.append(key)
+        counts[key] += 1
+    return [first_form[key] for key in order if counts[key] > 1]
+
+
+def dedupe_order_numbers(order_numbers: list[str]) -> list[str]:
+    """受注Noリストから重複を除去し、初出の順序・表記を保持して返す（正規化後で判定）。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in order_numbers:
+        key = normalize_order_no(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(str(value).strip())
+    return result
+
+
+def _override_shiage_text(finish_date: object) -> str:
+    """override の仕上日（date | None）を登録前確認用の文字列へ変換する。
+
+    None（＝「なし」）は空欄にする。
+    """
+    if finish_date is None:
+        return ""
+    strftime = getattr(finish_date, "strftime", None)
+    if callable(strftime):
+        return strftime("%Y-%m-%d")
+    return str(finish_date)
+
+
+def _override_shukka_text(am_pm: object) -> str:
+    """override の AM・PM を登録前確認の出荷区分用の文字列へ変換する。
+
+    None や "none"（＝「なし」）は空欄にする。
+    """
+    if am_pm is None:
+        return ""
+    text = str(am_pm).strip()
+    if not text or text == "none":
+        return ""
+    return text
+
+
+def apply_order_overrides(
+    rows: list[dict[str, str]],
+    overrides: dict[str, dict[str, object]],
+) -> list[dict[str, str]]:
+    """受注Noごとの override（仕上日／AM・PM）を行データへ適用した新リストを返す（要件5）。
+
+    伝票作成・印刷画面から渡された値を、同一受注Noの全行（非表示行を含む）へ反映する。
+    override が無い受注Noは元の値（Kintone登録処理画面の既定値）を維持する。
+    """
+    result: list[dict[str, str]] = []
+    for row in rows:
+        new_row = dict(row)
+        order_no = new_row.get("受注No", "")
+        override = overrides.get(order_no)
+        if override is not None:
+            new_row["仕上日"] = _override_shiage_text(override.get("finish_date"))
+            new_row["出荷区分"] = _override_shukka_text(override.get("am_pm"))
+        result.append(new_row)
+    return result
+
 PREVIEW_ROW_HEADERS = (
-    "No", "受注No", "掛率集計コード", "掛率集計名称", "硝/加工",
-    "仕上日", "出荷区分", "得意先選択", "判定加工名", "未登録警告",
+    "No", "受注No", "商品名称", "掛率集計コード", "掛率集計名称", "硝/加工",
+    "加工種類", "仕上日", "出荷区分", "得意先選択", "判定加工名", "未登録警告",
 )
 _COL_NO = 0
 _COL_ORDER_NO = 1
-_COL_KAKURITSU_CODE = 2
-_COL_KAKURITSU_NAME = 3
-_COL_TYPE = 4
-_COL_SHIAGE = 5
-_COL_SHUKKA = 6
-_COL_CUSTOMER = 7
-_COL_KAKOU = 8
-_COL_WARNING = 9
+_COL_PRODUCT = 2
+_COL_KAKURITSU_CODE = 3
+_COL_KAKURITSU_NAME = 4
+_COL_TYPE = 5
+_COL_KAKOU_TYPE = 6
+_COL_SHIAGE = 7
+_COL_SHUKKA = 8
+_COL_CUSTOMER = 9
+_COL_KAKOU = 10
+_COL_WARNING = 11
 
-CONDITION_HEADERS = ("フィールド論理名", "OLAP値", "OLAP範囲Val_From", "OLAP範囲Val_To", "OLAP空白", "OLAP条件グループ")
+# 加工種類番号の凡例文（要件2）。KAKOU_TYPE_NAMES から動的生成して同期を保つ。
+KAKOU_TYPE_LEGEND_TEXT = "加工種類：" + "、".join(
+    f"{code}={name}" for code, name in KAKOU_TYPE_NAMES.items()
+)
+
+CONDITION_HEADERS =("フィールド論理名", "OLAP値", "OLAP範囲Val_From", "OLAP範囲Val_To", "OLAP空白", "OLAP条件グループ")
 CONDITION_EDITABLE_HEADERS = set(CONDITION_HEADERS[1:])
 
 
@@ -174,6 +319,66 @@ class PopupDateEdit(QDateEdit):
         menu.close()
 
 
+class KakouTypeEdit(QLineEdit):
+    """加工種類のテキスト入力欄（要件1〜4）。
+
+    通常表示は「1：四方」形式。フォーカスが入ると数値部分（"1"）のみを表示して
+    上書き入力しやすくし、フォーカスアウト時に 1〜11 を判定して正式名称へ変換する。
+    範囲外・不正・空欄の入力は静かに元の値へ戻す（警告ダイアログなし）。
+    内部的にはコード値（"1".."11"）のみを保持する。
+    """
+
+    committed = Signal(str)  # 確定したコード値（"1".."11"）
+    move_to_next_requested = Signal()  # Tab/Enter 押下時に次セルへ移動を要求（要件1〜3）
+
+    def __init__(self, code: str) -> None:
+        super().__init__()
+        self._code = str(code).strip() or DEFAULT_KAKOU_TYPE
+        self._show_label()
+
+    def code(self) -> str:
+        """現在保持しているコード値（"1".."11"）を返す。"""
+        return self._code
+
+    def _show_label(self) -> None:
+        self.setText(kakou_type_label(self._code))
+
+    def focusInEvent(self, event: object) -> None:
+        # 数値部分のみ表示し、そのまま上書きできるよう全選択する。
+        super().focusInEvent(event)  # type: ignore[arg-type]
+        self.setText(self._code)
+        self.selectAll()
+        # クリック位置により selectAll() が解除される場合があるため遅延でも全選択する。
+        QTimer.singleShot(0, self.selectAll)
+
+    def mousePressEvent(self, event: object) -> None:
+        # 初回クリックでも全選択を維持する。
+        super().mousePressEvent(event)  # type: ignore[arg-type]
+        QTimer.singleShot(0, self.selectAll)
+
+    def focusOutEvent(self, event: object) -> None:
+        self._commit()
+        super().focusOutEvent(event)  # type: ignore[arg-type]
+
+    def keyPressEvent(self, event: object) -> None:
+        # Tab / Enter は入力を確定したうえで「加工種類の次のセル」へ移動する（要件1〜3）。
+        # 通常のテーブル移動に任せず、移動先を呼び出し側で固定する。
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
+            self._commit()
+            self.move_to_next_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)  # type: ignore[arg-type]
+
+    def _commit(self) -> None:
+        text = self.text().strip()
+        if text in KAKOU_TYPE_CODES:
+            self._code = text
+        # 範囲外・不正・空欄は元の値を維持（静かに戻す）。
+        self._show_label()
+        self.committed.emit(self._code)
+
+
 class WorkerThread(QThread):
     log_line = Signal(str)
     credentials_validated = Signal(str, str)
@@ -194,7 +399,7 @@ class WorkerThread(QThread):
             work_dir.mkdir(parents=True, exist_ok=True)
 
             logger.info("起動日時: %s", datetime.now().isoformat(timespec="seconds"))
-            logger.info("対象伝票番号: %s", ",".join(self.run_input.denpyo_numbers))
+            logger.info("対象受注No: %s", ",".join(self.run_input.denpyo_numbers))
             logger.info("仕上日: %s", self.run_input.shiage_date)
             logger.info("出荷区分: %s", self.run_input.shukka_kbn)
 
@@ -224,6 +429,20 @@ class WorkerThread(QThread):
             master = load_master(self.config.paths.kakou_master_csv)
             apply_kakou_names_per_row(output_rows, master)
             logger.info("加工名マスタ適用件数: %s", len(master))
+
+            # Kintoneに同一受注Noの既存レコードがあるか確認する（登録前確認画面に反映するため）。
+            # 検索に失敗しても処理を止めず、画面を開く前に警告で続行/中止を選べるようにする（要件11）。
+            existing_records: list[dict[str, str]] = []
+            existing_fetch_error: str | None = None
+            try:
+                existing_records = KintoneClient(self.config, logger).fetch_existing_records_by_order_numbers(
+                    self.run_input.denpyo_numbers
+                )
+                logger.info("Kintone既存レコード取得件数: %s", len(existing_records))
+            except Exception as fetch_exc:  # noqa: BLE001 - 通信失敗でも落とさず警告に回す
+                existing_fetch_error = str(fetch_exc) or fetch_exc.__class__.__name__
+                logger.warning("Kintone既存データの検索に失敗しました: %s", existing_fetch_error)
+
             logger.info("登録前確認画面を表示します。登録ボタン押下までkintoneへ送信しません。")
             self.pending_registration.emit(
                 PendingRegistration(
@@ -232,6 +451,8 @@ class WorkerThread(QThread):
                     output_count=len(rows),
                     log_file=log_file,
                     timestamp=timestamp,
+                    existing_kintone_records=existing_records,
+                    existing_fetch_error=existing_fetch_error,
                 )
             )
         except Exception as exc:
@@ -245,6 +466,7 @@ class WorkerThread(QThread):
 class KintoneRegisterWorkerThread(QThread):
     log_line = Signal(str)
     succeeded = Signal(object)
+    registration_completed = Signal(list)
     failed = Signal(str)
 
     def __init__(self, config: AppConfig, rows: list[dict[str, str]], output_csv: Path, timestamp: str) -> None:
@@ -269,6 +491,10 @@ class KintoneRegisterWorkerThread(QThread):
 
             logger.info("kintone登録成功件数: %s", kintone_result.success_count)
             logger.info("kintone登録失敗件数: %s", kintone_result.failure_count)
+            successful_order_numbers = _unique_order_numbers(kintone_result.successful_records)
+            if successful_order_numbers:
+                logger.info("kintone登録成功受注No: %s", "、".join(successful_order_numbers))
+                self.registration_completed.emit(successful_order_numbers)
             self.succeeded.emit(
                 ProcessResult(
                     output_csv=self.output_csv,
@@ -312,7 +538,7 @@ class TksDebugWorkerThread(QThread):
 
             if self.mode == "olap":
                 logger.info("OLAP取得テスト開始")
-                logger.info("対象伝票番号件数: %s", len(self.run_input.denpyo_numbers))
+                logger.info("対象受注No件数: %s", len(self.run_input.denpyo_numbers))
                 client.login(self.run_input)
                 self.credentials_validated.emit(self.run_input.olap_login_id, self.run_input.olap_password)
                 soba_csv, kakou_csv = client.fetch_csvs(self.run_input, self.config.paths.work_dir, self.config.csv_encoding)
@@ -343,9 +569,14 @@ class UpdateCheckWorkerThread(QThread):
 
     def run(self) -> None:
         try:
-            self.succeeded.emit(UpdateClient().check_for_update(VERSION_CODE))
+            update_client = _update_client_module()
+            self.succeeded.emit(update_client.UpdateClient().check_for_update(VERSION_CODE))
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+def _update_client_module():
+    return importlib.import_module("app." + "update_client")
 
 
 class AddRowDialog(QDialog):
@@ -407,18 +638,27 @@ class AddRowDialog(QDialog):
 class CustomerLabelDialog(QDialog):
     """得意先ヘッダー表示名設定ダイアログ。"""
 
-    def __init__(self, customer_labels: dict[str, str], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        customer_labels: dict[str, str],
+        customer_match_patterns: dict[str, str] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("得意先ヘッダー設定")
-        self.resize(380, 220)
+        self.resize(520, 340)
 
         self._edits: dict[str, QLineEdit] = {}
+        self._match_edits: dict[str, QLineEdit] = {}
         form = QFormLayout()
         for key in ("得意先1", "得意先2", "得意先3", "得意先4"):
             edit = QLineEdit(customer_labels.get(key, CUSTOMER_LABEL_DEFAULTS[key]))
             edit.setMaxLength(CUSTOMER_LABEL_MAX_LEN)
             self._edits[key] = edit
             form.addRow(f"{key} 表示名:", edit)
+            match_edit = QLineEdit((customer_match_patterns or {}).get(key, ""))
+            self._match_edits[key] = match_edit
+            form.addRow(f"{key} 判定文字列:", match_edit)
 
         buttons = QDialogButtonBox()
         save_btn = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
@@ -437,6 +677,7 @@ class CustomerLabelDialog(QDialog):
     def _reset(self) -> None:
         for key, default in CUSTOMER_LABEL_DEFAULTS.items():
             self._edits[key].setText(default)
+            self._match_edits[key].setText("")
 
     def _on_save(self) -> None:
         for key, edit in self._edits.items():
@@ -453,6 +694,10 @@ class CustomerLabelDialog(QDialog):
             for key, edit in self._edits.items()
         }
 
+    def result_match_patterns(self) -> dict[str, str]:
+        """保存後の得意先名称判定文字列を返す。"""
+        return {key: edit.text().strip() for key, edit in self._match_edits.items()}
+
 
 class KakouMasterDialog(QDialog):
     """加工名マスタの管理ダイアログ。"""
@@ -466,7 +711,9 @@ class KakouMasterDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("加工名マスタ管理")
-        self.resize(1200, 600)
+        self.resize(1520, 720)
+        self.setMinimumSize(1320, 620)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         self.master_path = master_path
         self.backup_dir = backup_dir
         self._dirty = False
@@ -477,11 +724,12 @@ class KakouMasterDialog(QDialog):
         self.table = QTableWidget()
         self.table.setColumnCount(len(KAKOU_MASTER_HEADERS))
         self.table.setHorizontalHeaderLabels(display_headers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(False)
         self.table.itemChanged.connect(self._on_item_changed)
 
         self._load_from_file()
+        self._apply_initial_column_widths()
 
         add_btn = QPushButton("行追加")
         del_btn = QPushButton("行削除")
@@ -489,6 +737,7 @@ class KakouMasterDialog(QDialog):
         export_btn = QPushButton("CSVエクスポート")
         backup_btn = QPushButton("バックアップ作成")
         restore_btn = QPushButton("バックアップから復元")
+        reset_default_btn = QPushButton("初期値に戻す")
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(add_btn)
@@ -498,6 +747,7 @@ class KakouMasterDialog(QDialog):
         btn_row.addWidget(export_btn)
         btn_row.addWidget(backup_btn)
         btn_row.addWidget(restore_btn)
+        btn_row.addWidget(reset_default_btn)
 
         buttons = QDialogButtonBox()
         save_btn = buttons.addButton("保存して閉じる", QDialogButtonBox.ButtonRole.AcceptRole)
@@ -515,8 +765,25 @@ class KakouMasterDialog(QDialog):
         export_btn.clicked.connect(self._export_csv)
         backup_btn.clicked.connect(self._create_backup)
         restore_btn.clicked.connect(self._restore_backup)
+        reset_default_btn.clicked.connect(self._reset_to_default)
         save_btn.clicked.connect(self._save_and_close)
         close_btn.clicked.connect(self._close_with_confirm)
+
+    def _apply_initial_column_widths(self) -> None:
+        widths = {
+            "メーカー識別掛率集計コード": 190,
+            "メーカー識別コード": 130,
+            "掛率集計コード": 120,
+            "掛率集計名称": 210,
+            "掛率集計略称": 160,
+            "加工名": 170,
+            "得意先1": 130,
+            "得意先2": 130,
+            "得意先3": 130,
+            "得意先4": 130,
+        }
+        for col, header in enumerate(KAKOU_MASTER_HEADERS):
+            self.table.setColumnWidth(col, widths.get(header, 120))
 
     def _load_from_file(self) -> None:
         rows = load_master(self.master_path)
@@ -662,6 +929,43 @@ class KakouMasterDialog(QDialog):
         self._load_from_file()
         QMessageBox.information(self, "復元", "復元が完了しました。")
 
+    def _reset_to_default(self) -> None:
+        from app.settings_service import find_default_kakou_master_csv
+
+        reply = QMessageBox.question(
+            self,
+            "初期値に戻す",
+            "加工名マスタを初期値に戻します。\n"
+            "現在の内容は初期CSVの内容で上書きされます。\n"
+            "よろしいですか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 起動時自動投入と同じ共通探索関数を使う（候補が無ければログに候補パスを出す）。
+        default_csv = find_default_kakou_master_csv()
+        default_rows = load_default_master(default_csv) if default_csv else []
+        if not default_rows:
+            QMessageBox.critical(
+                self, "初期値に戻す", "初期CSVが見つからない、または空のため初期化できません。"
+            )
+            return
+
+        # 上書き前に現在の内容を必ずバックアップする。
+        if self._dirty:
+            save_master(self.master_path, self._table_to_rows())
+            self._dirty = False
+        backup = backup_master(self.master_path, self.backup_dir)
+
+        save_master(self.master_path, default_rows)
+        self._load_from_file()
+
+        message = f"初期CSVの内容（{len(default_rows)}件）に戻しました。"
+        if backup:
+            message += f"\n現在の内容は以下にバックアップしました:\n{backup}"
+        QMessageBox.information(self, "初期値に戻す", message)
+
     def _import_csv(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(self, "CSVインポート", "", "CSVファイル (*.csv)")
         if not path_str:
@@ -779,17 +1083,28 @@ class RegistrationPreviewDialog(QDialog):
         shukka_options: list[str],
         master: list[dict[str, str]],
         customer_labels: dict[str, str],
+        customer_match_patterns: dict[str, str] | None = None,
         parent: QWidget | None = None,
         preview_color_theme: str = "light",
+        debug_visible: bool = False,
+        kintone_existing_by_row: list[dict[str, str]] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("登録前確認")
-        self.resize(1300, 700)
+        # 商品名称列の拡張に伴い横幅をさらに広げ、右端の未登録警告まで見切れないようにする（要件7・8）。
+        self.resize(1650, 700)
+        self.setMinimumWidth(1500)
         self._master = master
         self._shukka_options = shukka_options
+        self._customer_match_patterns = customer_match_patterns or {}
         self._preview_color_theme = preview_color_theme
         # PreviewState が唯一の内部データモデル
-        self._state = PreviewState(rows=[dict(row) for row in rows])
+        # Kintone既存データの行単位反映値を渡し、加工名・加工mm・㎡ などをKintone値で優先表示する。
+        existing_by_row = [dict(item) for item in (kintone_existing_by_row or [])]
+        self._state = PreviewState(
+            rows=[dict(row) for row in rows],
+            kintone_existing_by_row=existing_by_row,
+        )
 
         self._kakou_options: list[tuple[str, str]] = [("selected", "選択なし")]
         for key in CUSTOMER_KEYS:
@@ -800,6 +1115,7 @@ class RegistrationPreviewDialog(QDialog):
         self._shiage_widgets: list[PopupDateEdit | None] = []
         self._shukka_widgets: list[QComboBox | None] = []
         self._customer_widgets: list[QComboBox | None] = []
+        self._kakou_type_widgets: list[KakouTypeEdit | None] = []
         self._kakou_labels: list[QLabel] = []
 
         # フィルタバー
@@ -831,14 +1147,17 @@ class RegistrationPreviewDialog(QDialog):
         hdr.setSectionResizeMode(_COL_KAKOU, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(_COL_NO, 40)
         self.table.setColumnWidth(_COL_ORDER_NO, 110)
+        self.table.setColumnWidth(_COL_PRODUCT, 270)
         self.table.setColumnWidth(_COL_KAKURITSU_CODE, 100)
         self.table.setColumnWidth(_COL_KAKURITSU_NAME, 145)
         self.table.setColumnWidth(_COL_TYPE, 55)
+        self.table.setColumnWidth(_COL_KAKOU_TYPE, 95)
         self.table.setColumnWidth(_COL_SHIAGE, 130)
         self.table.setColumnWidth(_COL_SHUKKA, 85)
         self.table.setColumnWidth(_COL_CUSTOMER, 155)
         self.table.setColumnWidth(_COL_WARNING, 185)
         self._populate_table()
+        self._apply_initial_customer_matches()
 
         # 未登録警告バナー
         all_warnings: list[str] = []
@@ -851,12 +1170,37 @@ class RegistrationPreviewDialog(QDialog):
         self.register_button = buttons.addButton("登録", QDialogButtonBox.ButtonRole.AcceptRole)
         self.cancel_button = buttons.addButton("登録キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
 
+        # CSV出力先の入力欄・参照ボタン・CSV作成ボタン（要件2・3・4）。
+        # CSV作成は kintone へ送信せず、登録ボタン押下時と同じ登録用データを確認用に書き出す。
+        self.csv_output_dir_edit = QLineEdit()
+        self.csv_output_dir_edit.setPlaceholderText("CSV出力先フォルダ")
+        self.csv_output_dir_edit.setToolTip(
+            "CSV作成ボタンで保存するフォルダを指定してください。kintoneへは送信しません。"
+        )
+        self.csv_browse_button = QPushButton("参照")
+        self.csv_browse_button.clicked.connect(self._browse_csv_output_dir)
+        self.csv_create_button = QPushButton("CSV作成")
+        self.csv_create_button.setToolTip("登録ボタン押下時と同じ登録用データをCSVへ出力します（kintone登録はしません）。")
+        self.csv_create_button.clicked.connect(self._on_create_csv)
+        self._load_csv_output_dir()
+
+        csv_row = QHBoxLayout()
+        csv_row.addWidget(QLabel("CSV出力先:"))
+        csv_row.addWidget(self.csv_output_dir_edit, 1)
+        csv_row.addWidget(self.csv_browse_button)
+
         bottom = QHBoxLayout()
-        self.print_button = QPushButton("印刷")
-        self.print_button.clicked.connect(self._print_slips)
-        bottom.addWidget(self.print_button)
+        self.print_button: QPushButton | None = None
+        if debug_visible:
+            self.print_button = QPushButton("印刷")
+            self.print_button.clicked.connect(self._print_slips)
+            bottom.addWidget(self.print_button)
         bottom.addStretch(1)
+        bottom.addWidget(self.csv_create_button)
         bottom.addWidget(buttons)
+
+        # 登録対象データが無い場合は CSV作成ボタンを無効化する（要件12）。
+        self.csv_create_button.setEnabled(bool(self._state.rows))
 
         root = QVBoxLayout()
         root.addLayout(filter_row)
@@ -865,12 +1209,17 @@ class RegistrationPreviewDialog(QDialog):
             "変更は同じ受注Noの全行（非表示行を含む）に反映されます。"
             "加工名は行ごとに判定されます。"
         ))
+        # 加工種類番号の凡例（要件2・4）。上部の他の説明文と同じ QLabel スタイル
+        # （専用の小さいフォント指定を外し、既定サイズ・既定色に合わせる）。
+        kakou_type_legend = QLabel(KAKOU_TYPE_LEGEND_TEXT)
+        root.addWidget(kakou_type_legend)
         if all_warnings:
             unique_warnings = list(dict.fromkeys(all_warnings))
             warn_label = QLabel("未登録の掛率集計コードがあります:\n" + "\n".join(unique_warnings))
             warn_label.setStyleSheet("color: #cc7700;")
             root.addWidget(warn_label)
         root.addWidget(self.table, 1)
+        root.addLayout(csv_row)
         root.addLayout(bottom)
         self.setLayout(root)
 
@@ -916,38 +1265,50 @@ class RegistrationPreviewDialog(QDialog):
           widget_ss     : str        DateEdit / ComboBox 用スタイルシート
         """
         if is_dark:
-            sel_bg = "#3A5A78"
+            sel_bg = "#2F5F8F"
+            # 編集ウィジェット（QLineEdit=KakouTypeEdit / QComboBox / QDateEdit）の配色。
+            # ダークでも入力文字が背景と同化しないよう明示する（要件2・3）。
             widget_ss = (
-                "QComboBox, QDateEdit {"
-                " background-color: #2D3540;"
-                " color: #F2F2F2;"
-                " border: 1px solid #555555;"
+                "QLineEdit, QComboBox, QDateEdit {"
+                " background-color: #2F343A;"
+                " color: #F0F0F0;"
+                " border: 1px solid #5A6470;"
                 " border-radius: 3px;"
                 " padding: 2px 4px;"
+                f" selection-background-color: {sel_bg};"
+                " selection-color: #FFFFFF;"
                 "}"
                 "QComboBox QAbstractItemView {"
-                " background-color: #2D3540;"
-                " color: #F2F2F2;"
+                " background-color: #2F343A;"
+                " color: #F0F0F0;"
                 f" selection-background-color: {sel_bg};"
                 " selection-color: #FFFFFF;"
                 "}"
             )
             return {
-                "group_bg_hex": ["#263544", "#243A2A"],
-                "fg_hex": "#F2F2F2",
+                "group_bg_hex": ["#2B3036", "#252A30"],
+                "fg_hex": "#F0F0F0",
                 "warning_color": "#FFB000",
                 "sel_bg": sel_bg,
                 "widget_ss": widget_ss,
+                # 表全体の配色（要件3・ダーク）。背景は濃いグレー、ヘッダーはさらに濃く、
+                # グリッド線は暗めの境界線にする。
+                "table_bg": "#1F2328",
+                "header_bg": "#343A40",
+                "header_fg": "#F0F0F0",
+                "gridline": "#555555",
             }
         else:
             sel_bg = "#2D78B8"
             widget_ss = (
-                "QComboBox, QDateEdit {"
+                "QLineEdit, QComboBox, QDateEdit {"
                 " background-color: #FFFFFF;"
-                " color: #1A1A1A;"
+                " color: #000000;"
                 " border: 1px solid #AAAAAA;"
                 " border-radius: 3px;"
                 " padding: 2px 4px;"
+                f" selection-background-color: {sel_bg};"
+                " selection-color: #FFFFFF;"
                 "}"
                 "QComboBox QAbstractItemView {"
                 " background-color: #FFFFFF;"
@@ -962,6 +1323,11 @@ class RegistrationPreviewDialog(QDialog):
                 "warning_color": "#B35C00",
                 "sel_bg": sel_bg,
                 "widget_ss": widget_ss,
+                # 表全体の配色（要件3・ライト）。背景は白、ヘッダーは薄いグレー。
+                "table_bg": "#FFFFFF",
+                "header_bg": "#E8E8E8",
+                "header_fg": "#1A1A1A",
+                "gridline": "#C8C8C8",
             }
 
     def _populate_table(self) -> None:
@@ -975,10 +1341,19 @@ class RegistrationPreviewDialog(QDialog):
         warning_color: str = pal["warning_color"]      # type: ignore[assignment]
         widget_ss: str = pal["widget_ss"]              # type: ignore[assignment]
         sel_bg: str = pal["sel_bg"]                    # type: ignore[assignment]
+        table_bg: str = pal["table_bg"]                # type: ignore[assignment]
+        header_bg: str = pal["header_bg"]              # type: ignore[assignment]
+        header_fg: str = pal["header_fg"]              # type: ignore[assignment]
+        gridline: str = pal["gridline"]                # type: ignore[assignment]
 
-        # 選択セルの色（item セルのみ有効; widget セルは widget が全面を覆う）
+        # 表全体（背景・グリッド線・ヘッダー）をテーマに合わせて配色する（要件9）。
+        # 選択セルの色は item セルのみ有効（widget セルは widget が全面を覆う）。
         self.table.setStyleSheet(
+            f"QTableWidget {{ background-color: {table_bg}; gridline-color: {gridline}; color: {pal['fg_hex']}; }}"
             f"QTableWidget::item:selected {{ background-color: {sel_bg}; color: #FFFFFF; }}"
+            f"QHeaderView::section {{ background-color: {header_bg}; color: {header_fg};"
+            f" border: 0px; border-right: 1px solid {gridline}; border-bottom: 1px solid {gridline}; padding: 3px; }}"
+            f"QTableCornerButton::section {{ background-color: {header_bg}; }}"
         )
 
         fg_brush = QBrush(QColor(fg_hex))
@@ -994,31 +1369,62 @@ class RegistrationPreviewDialog(QDialog):
             # Item セル（文字色・背景色を明示）
             self._set_ro(row_idx, _COL_NO, str(row_idx + 1), bg=bg_brush, fg=fg_brush)
             self._set_ro(row_idx, _COL_ORDER_NO, row.get("受注No", ""), bold=is_first, bg=bg_brush, fg=fg_brush)
+            self._set_ro(row_idx, _COL_PRODUCT, row.get("商品名称", ""), bg=bg_brush, fg=fg_brush)
             self._set_ro(row_idx, _COL_KAKURITSU_CODE, row.get("掛率集計コード", ""), bg=bg_brush, fg=fg_brush)
             self._set_ro(row_idx, _COL_KAKURITSU_NAME, row.get("掛率集計名称", ""), bg=bg_brush, fg=fg_brush)
             self._set_ro(row_idx, _COL_TYPE, row.get("硝/加工", ""), bg=bg_brush, fg=fg_brush)
 
+            # 加工種類セル（要件1〜4）。硝/加工 = '2' の行だけテキスト入力可能。
+            if row.get("硝/加工", "") == _PROCESSING_TYPE:
+                current_code = self._state.kakou_type_by_row[row_idx] or DEFAULT_KAKOU_TYPE
+                kakou_type = KakouTypeEdit(current_code)
+                # 内部状態を初期値に揃える（既定 1：四方）。
+                self._state.set_kakou_type(row_idx, kakou_type.code())
+                kakou_type.setStyleSheet(widget_ss)
+                self._kakou_type_widgets.append(kakou_type)
+                self.table.setCellWidget(row_idx, _COL_KAKOU_TYPE, kakou_type)
+                kakou_type.committed.connect(
+                    lambda _code, ri=row_idx: self._on_kakou_type_changed(ri)
+                )
+                kakou_type.move_to_next_requested.connect(
+                    lambda ri=row_idx: self._move_from_kakou_type_to_next_cell(ri)
+                )
+            else:
+                # 硝/加工 ≠ '2' は編集不可・空欄表示（加工mm計算対象外。要件4）。
+                self._kakou_type_widgets.append(None)
+                self._set_ro(row_idx, _COL_KAKOU_TYPE, "", bg=bg_brush, fg=fg_brush)
+
             if is_first:
-                # 仕上日ウィジェット（受注No先頭行のみ）
+                # 仕上日ウィジェット（受注No先頭行のみ）。
+                # 「なし」（空欄）は最小日付＋特別表示文字で表現する（要件3・5）。
                 date_edit = PopupDateEdit()
                 date_edit.setCalendarPopup(False)
                 date_edit.setDisplayFormat("yyyy-MM-dd")
-                date_edit.setDate(_date_from_text(self._state.shiage_by_row[row_idx]))
+                date_edit.setSpecialValueText(SHUKKA_NONE_LABEL)
+                date_edit.setMinimumDate(_SHIAGE_NONE_DATE)
+                shiage_text = self._state.shiage_by_row[row_idx]
+                if shiage_text:
+                    date_edit.setDate(_date_from_text(shiage_text))
+                else:
+                    date_edit.setDate(_SHIAGE_NONE_DATE)
                 date_edit.setStyleSheet(widget_ss)
                 self._shiage_widgets.append(date_edit)
                 self.table.setCellWidget(row_idx, _COL_SHIAGE, date_edit)
                 date_edit.dateChanged.connect(
-                    lambda d, ri=row_idx: self._on_shiage_changed(ri, d)
+                    lambda _d, ri=row_idx: self._on_shiage_changed(ri)
                 )
 
-                # 出荷区分ウィジェット（受注No先頭行のみ）
+                # 出荷区分ウィジェット（受注No先頭行のみ）。先頭に「なし」（空欄）を追加。
                 shukka = QComboBox()
+                shukka.addItem(SHUKKA_NONE_LABEL)
                 shukka.addItems(self._shukka_options)
                 current = self._state.shukka_by_row[row_idx]
                 if current and current not in self._shukka_options:
                     shukka.addItem(current)
                 if current:
                     shukka.setCurrentText(current)
+                else:
+                    shukka.setCurrentText(SHUKKA_NONE_LABEL)
                 shukka.setStyleSheet(widget_ss)
                 self._shukka_widgets.append(shukka)
                 self.table.setCellWidget(row_idx, _COL_SHUKKA, shukka)
@@ -1031,6 +1437,10 @@ class RegistrationPreviewDialog(QDialog):
                 for key, label in self._kakou_options:
                     customer.addItem(label, key)
                 customer.setStyleSheet(widget_ss)
+                current_key = self._state.customer_key_by_row[row_idx]
+                idx = customer.findData(current_key)
+                if idx >= 0:
+                    customer.setCurrentIndex(idx)
                 self._customer_widgets.append(customer)
                 self.table.setCellWidget(row_idx, _COL_CUSTOMER, customer)
                 customer.currentIndexChanged.connect(
@@ -1073,18 +1483,38 @@ class RegistrationPreviewDialog(QDialog):
             item.setForeground(fg)
         self.table.setItem(row, col, item)
 
+    # ── 仕上日 / 出荷区分 の「なし」（空欄）正規化 ──────────────
+
+    @staticmethod
+    def _shiage_text_of(widget: "PopupDateEdit | None") -> str | None:
+        """仕上日ウィジェットの値を文字列で返す。「なし」（最小日付）は空欄。"""
+        if widget is None:
+            return None
+        if widget.date() == widget.minimumDate():
+            return ""
+        return widget.date().toString("yyyy-MM-dd")
+
+    @staticmethod
+    def _shukka_text_of(widget: "QComboBox | None") -> str | None:
+        """出荷区分ウィジェットの値を文字列で返す。「なし」は空欄。"""
+        if widget is None:
+            return None
+        text = widget.currentText()
+        return "" if text == SHUKKA_NONE_LABEL else text
+
     # ── 仕上日 変更ハンドラ ───────────────────────────────
 
-    def _on_shiage_changed(self, row_idx: int, date: QDate) -> None:
+    def _on_shiage_changed(self, row_idx: int) -> None:
         # PreviewState を更新（同一受注No 全行に反映）
         # 先頭行のみウィジェットを持つため他ウィジェットへの同期は不要
-        self._state.set_shiage(row_idx, date.toString("yyyy-MM-dd"))
+        text = self._shiage_text_of(self._shiage_widgets[row_idx]) or ""
+        self._state.set_shiage(row_idx, text)
 
     # ── 出荷区分 変更ハンドラ ─────────────────────────────
 
     def _on_shukka_changed(self, row_idx: int, text: str) -> None:
-        # PreviewState を更新（同一受注No 全行に反映）
-        self._state.set_shukka(row_idx, text)
+        # PreviewState を更新（同一受注No 全行に反映）。「なし」は空欄扱い。
+        self._state.set_shukka(row_idx, "" if text == SHUKKA_NONE_LABEL else text)
 
     # ── 得意先選択 変更ハンドラ ───────────────────────────
 
@@ -1096,6 +1526,42 @@ class RegistrationPreviewDialog(QDialog):
         # 同一受注No の全行の判定加工名を更新
         for i in self._state.indices_for_order(row_idx):
             self._refresh_kakou_label(i)
+
+    def _apply_initial_customer_matches(self) -> None:
+        first_indices = self._state.first_indices_by_order()
+        for row_idx in sorted(first_indices):
+            key = customer_key_from_name(
+                self._state.rows[row_idx].get("得意先名称", ""),
+                self._customer_match_patterns,
+            )
+            if key == DEFAULT_CUSTOMER_KEY:
+                continue
+            self._state.set_customer_key_for_order(row_idx, key)
+            widget = self._customer_widgets[row_idx]
+            if widget is not None:
+                idx = widget.findData(key)
+                if idx >= 0:
+                    widget.blockSignals(True)
+                    widget.setCurrentIndex(idx)
+                    widget.blockSignals(False)
+            for i in self._state.indices_for_order(row_idx):
+                self._refresh_kakou_label(i)
+
+    # ── 加工種類 変更ハンドラ ─────────────────────────────
+
+    def _on_kakou_type_changed(self, row_idx: int) -> None:
+        """加工種類入力の確定値を PreviewState に反映する（行ごと独立。要件4・9）。"""
+        widget = self._kakou_type_widgets[row_idx]
+        if widget is None:
+            return
+        self._state.set_kakou_type(row_idx, widget.code() or DEFAULT_KAKOU_TYPE)
+
+    def _move_from_kakou_type_to_next_cell(self, row: int) -> None:
+        """加工種類セルから同じ行の次セル（仕上日列）へ移動する（要件1〜3）。"""
+        self.table.setCurrentCell(row, _COL_SHIAGE)
+        widget = self.table.cellWidget(row, _COL_SHIAGE)
+        if widget is not None:
+            widget.setFocus()
 
     def _refresh_kakou_label(self, row_idx: int) -> None:
         name = self._state.compute_kakou_name(row_idx, self._master)
@@ -1120,15 +1586,101 @@ class RegistrationPreviewDialog(QDialog):
         非先頭行は先頭行の値が set_shiage/set_shukka/set_customer_key_for_order で既に反映済み。
         """
         for i in range(len(self._state.rows)):
-            if self._shiage_widgets[i] is not None:
-                self._state.set_shiage(i, self._shiage_widgets[i].date().toString("yyyy-MM-dd"))
-            if self._shukka_widgets[i] is not None:
-                self._state.set_shukka(i, self._shukka_widgets[i].currentText())
+            shiage_text = self._shiage_text_of(self._shiage_widgets[i])
+            if shiage_text is not None:
+                self._state.set_shiage(i, shiage_text)
+            shukka_text = self._shukka_text_of(self._shukka_widgets[i])
+            if shukka_text is not None:
+                self._state.set_shukka(i, shukka_text)
             if self._customer_widgets[i] is not None:
                 self._state.set_customer_key_for_order(
                     i, self._customer_widgets[i].currentData() or DEFAULT_CUSTOMER_KEY
                 )
+            if self._kakou_type_widgets[i] is not None:
+                self._state.set_kakou_type(
+                    i, self._kakou_type_widgets[i].code() or DEFAULT_KAKOU_TYPE
+                )
         return self._state.build_registration_rows(self._master)
+
+    def build_registration_records_from_preview(self) -> list[dict[str, str]]:
+        """登録ボタン押下時にkintoneへ送信する登録用データを生成して返す（要件9）。
+
+        登録処理（registration_rows）とCSV出力で生成処理が分岐しないよう共通化した入口。
+        """
+        return self.registration_rows()
+
+    # ── CSV出力先 ───────────────────────────────
+
+    def _settings(self) -> QSettings:
+        return QSettings(SETTINGS_ORG, SETTINGS_APP)
+
+    def _default_csv_output_dir(self) -> str:
+        """CSV出力先の初期値。Documents を基本とし、取得できなければ空文字。"""
+        docs = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        return docs or ""
+
+    def _load_csv_output_dir(self) -> None:
+        """保存済みのCSV出力先を復元する。未保存なら Documents を初期表示する（要件3）。"""
+        saved = str(self._settings().value(SETTINGS_CSV_OUTPUT_DIR, "") or "").strip()
+        self.csv_output_dir_edit.setText(saved or self._default_csv_output_dir())
+
+    def _save_csv_output_dir(self, output_dir: str) -> None:
+        settings = self._settings()
+        settings.setValue(SETTINGS_CSV_OUTPUT_DIR, output_dir)
+        settings.sync()
+
+    def _browse_csv_output_dir(self) -> None:
+        current = self.csv_output_dir_edit.text().strip() or self._default_csv_output_dir()
+        selected = QFileDialog.getExistingDirectory(self, "CSV出力先を選択", current)
+        if not selected:
+            return
+        self.csv_output_dir_edit.setText(selected)
+        self._save_csv_output_dir(selected)
+
+    def _on_create_csv(self) -> None:
+        """登録ボタン押下時と同じ登録用データを確認用CSVへ出力する（要件4）。
+
+        kintone API送信・登録状態更新・Teams通知・updated_at更新などは一切行わない。
+        """
+        # 登録対象データの有無を確認（要件12）。
+        records = self.build_registration_records_from_preview()
+        if not records:
+            QMessageBox.warning(self, "CSV作成", "登録対象データがありません。")
+            return
+
+        # 出力先の検証（要件11）。
+        raw = self.csv_output_dir_edit.text().strip()
+        if not raw:
+            QMessageBox.warning(self, "CSV作成", "CSV出力先を指定してください。")
+            return
+        output_dir = Path(raw).expanduser()
+        if not output_dir.is_dir():
+            QMessageBox.warning(self, "CSV作成", f"CSV出力先が存在しません。\n{output_dir}")
+            return
+        if not os.access(output_dir, os.W_OK):
+            QMessageBox.warning(self, "CSV作成", f"CSV出力先に書き込みできません。\n{output_dir}")
+            return
+
+        # 出力先を保存し、次回も同じパスを表示する（要件3）。
+        self._save_csv_output_dir(str(output_dir))
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = unique_timestamp_csv_path(output_dir, timestamp)
+        try:
+            export_registration_records_to_csv(records, output_path)
+        except OSError as exc:
+            QMessageBox.critical(self, "CSV作成", f"CSVの作成に失敗しました。\n{exc}")
+            return
+
+        result = QMessageBox.question(
+            self,
+            "CSV作成",
+            f"CSVを作成しました。\n{output_path}\n\n保存先フォルダを開きますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if result == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_dir)))
 
     # ── 印刷 ─────────────────────────────────
 
@@ -1146,13 +1698,13 @@ class RegistrationPreviewDialog(QDialog):
         for i, row in enumerate(self._state.rows):
             order_no = row.get("受注No", "")
             if order_no not in order_values:
-                shiage_w = self._shiage_widgets[i]
-                shukka_w = self._shukka_widgets[i]
+                shiage_text = self._shiage_text_of(self._shiage_widgets[i])
+                shukka_text = self._shukka_text_of(self._shukka_widgets[i])
                 order_values[order_no] = {
-                    "仕上日": (shiage_w.date().toString("yyyy-MM-dd")
-                               if shiage_w is not None else self._state.shiage_by_row[i]),
-                    "出荷区分": (shukka_w.currentText()
-                                if shukka_w is not None else self._state.shukka_by_row[i]),
+                    "仕上日": (shiage_text if shiage_text is not None
+                               else self._state.shiage_by_row[i]),
+                    "出荷区分": (shukka_text if shukka_text is not None
+                                else self._state.shukka_by_row[i]),
                 }
         try:
             from app import print_service
@@ -1279,8 +1831,35 @@ class SettingsDialog(QDialog):
         target_index = self.kintone_target.findData(current_target)
         self.kintone_target.setCurrentIndex(target_index if target_index >= 0 else 0)
 
+        self.teams_enabled = QCheckBox("Teams通知を有効にする")
+        self.teams_enabled.setChecked(_settings_bool(settings, SETTINGS_TEAMS_ENABLED, True))
+        test_default = default_teams_webhook_url_test()
+        prod_default = default_teams_webhook_url_prod()
+        self.teams_webhook_url_test = QLineEdit()
+        self.teams_webhook_url_test.setEchoMode(QLineEdit.EchoMode.Password)
+        self.teams_webhook_url_test.setText(str(settings.value(SETTINGS_TEAMS_WEBHOOK_URL_TEST, test_default) or ""))
+        self.teams_webhook_url_prod = QLineEdit()
+        self.teams_webhook_url_prod.setEchoMode(QLineEdit.EchoMode.Password)
+        self.teams_webhook_url_prod.setText(str(settings.value(SETTINGS_TEAMS_WEBHOOK_URL_PROD, prod_default) or ""))
+        self.teams_webhook_url_test_label = QLabel("テスト用Webhook URL")
+        self.teams_webhook_url_prod_label = QLabel("本番用Webhook URL")
+        debug_visible = _settings_bool(settings, SETTINGS_DEBUG_VISIBLE, False)
+        self._debug_visible = debug_visible
+        self.kintone_target.setEnabled(debug_visible)
+        self.teams_enabled.setEnabled(debug_visible)
+        for widget in (
+            self.teams_webhook_url_test_label,
+            self.teams_webhook_url_test,
+            self.teams_webhook_url_prod_label,
+            self.teams_webhook_url_prod,
+        ):
+            widget.setVisible(debug_visible)
+
         form = QFormLayout()
         form.addRow("Kintone接続先", self.kintone_target)
+        form.addRow("", self.teams_enabled)
+        form.addRow(self.teams_webhook_url_test_label, self.teams_webhook_url_test)
+        form.addRow(self.teams_webhook_url_prod_label, self.teams_webhook_url_prod)
 
         self.advanced_button = QPushButton("高度な設定を開く")
 
@@ -1314,12 +1893,21 @@ class SettingsDialog(QDialog):
             self.cleanup_callback()
 
     def accept(self) -> None:
-        self.settings.setValue(SETTINGS_KINTONE_TARGET, self.kintone_target.currentData())
+        # 制限モード中は接続先・Teams関連設定を表示専用とし、既存値を保持する。
+        if self._debug_visible:
+            self.settings.setValue(SETTINGS_KINTONE_TARGET, self.kintone_target.currentData())
+            self.settings.setValue(SETTINGS_TEAMS_ENABLED, self.teams_enabled.isChecked())
+            self.settings.setValue(SETTINGS_TEAMS_WEBHOOK_URL_TEST, self.teams_webhook_url_test.text().strip())
+            self.settings.setValue(SETTINGS_TEAMS_WEBHOOK_URL_PROD, self.teams_webhook_url_prod.text().strip())
         self.settings.sync()
         super().accept()
 
 
 class MainWindow(QMainWindow):
+    # 受注No入力欄が変化したことを外部（伝票作成・印刷画面）へ通知する（要件3・5）。
+    order_numbers_changed = Signal()
+    kintone_registration_completed = Signal(list)
+
     def __init__(
         self,
         initial_olap_id: str | None = None,
@@ -1328,6 +1916,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._initial_olap_id = initial_olap_id
         self._initial_olap_password = initial_olap_password
+        self._olap_login_id = (initial_olap_id or "").strip()
+        self._olap_password = initial_olap_password or ""
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         self.setWindowTitle(f"TKS OLAP to kintone {VERSION_NAME}")
         self.setWindowIcon(QIcon(str(resource_path("assets/app_icon.ico"))))
@@ -1340,12 +1930,9 @@ class MainWindow(QMainWindow):
         self.update_check_worker: UpdateCheckWorkerThread | None = None
         self.update_check_manual = False
         self._closing = False
-        self._auto_update_timer = QTimer(self)
-        self._auto_update_timer.setSingleShot(True)
-        self._auto_update_timer.timeout.connect(self.start_auto_update_check)
+        # 起動直後の自動更新確認は廃止。更新確認は機能選択画面（LauncherWindow）表示時に行う。
+        # ここでは設定画面からの手動更新確認のみを残す。
 
-        self.company_code = QLineEdit()
-        self.company_code.setReadOnly(True)
         self.tks_client_mode_label = QLabel("TKS_CLIENT_MODE")
         self.tks_client_mode = QLineEdit()
         self.tks_client_mode.setReadOnly(True)
@@ -1355,15 +1942,6 @@ class MainWindow(QMainWindow):
         self.programdata_path_label = QLabel("ProgramDataフォルダ")
         self.programdata_path = QLineEdit()
         self.programdata_path.setReadOnly(True)
-        self.login_id = QLineEdit()
-        self.password = QLineEdit()
-        self.password.setEchoMode(QLineEdit.Password)
-        self.password_visible = False
-        self.password_visibility_action = self.password.addAction(
-            QIcon(str(resource_path("assets/eye.svg"))),
-            QLineEdit.ActionPosition.TrailingPosition,
-        )
-        self.password_visibility_action.setToolTip("パスワードを表示")
         self.denpyo_numbers = QPlainTextEdit()
         self.denpyo_numbers.setPlaceholderText("1386680\n1386681")
         self.shiage_date = PopupDateEdit()
@@ -1371,12 +1949,20 @@ class MainWindow(QMainWindow):
         self.shiage_date.setDate(QDate.currentDate())
         self.shiage_date.setMinimumHeight(36)
         self.shiage_date.setStyleSheet("QDateEdit { padding: 4px 8px; }")
+        # 仕上日「なし」チェック。ONで仕上日を空欄扱いにする（要件3）。
+        self.shiage_none = QCheckBox("なし")
+        self.shiage_none.setToolTip("チェックすると仕上日を「なし」（空欄）にします。")
+        self.shiage_none.toggled.connect(self.shiage_date.setDisabled)
         self.shukka_kbn = QComboBox()
+        # 受注Noごとの override（伝票作成・印刷画面から渡された仕上日／AM・PM）。
+        # 画面連携中のみ保持し、永続化はしない（要件4）。
+        self._order_overrides: dict[str, dict[str, object]] = {}
         self.run_button = QPushButton("実行")
         self.settings_button = QPushButton("⚙")
         self.settings_button.setToolTip("設定")
         self.settings_button.setAccessibleName("設定")
-        self.settings_button.setFixedSize(34, 34)
+        self.settings_button.setMinimumSize(40, 40)
+        self.settings_button.setStyleSheet("QPushButton { font-size: 20px; padding: 4px; }")
         self.tks_login_test_button = QPushButton("TKS接続テスト")
         self.olap_test_button = QPushButton("OLAP取得テスト")
         self.cleanup_button = QPushButton("古いファイル削除")
@@ -1394,11 +1980,14 @@ class MainWindow(QMainWindow):
         self._build_layout()
         apply_theme(str(self.settings.value(SETTINGS_THEME, THEME_SYSTEM) or THEME_SYSTEM))
         self.run_button.clicked.connect(self.start_run)
+        # 受注No欄の変更を外部へ通知する（伝票画面のボタン状態同期: 要件3）。
+        self.denpyo_numbers.textChanged.connect(self.order_numbers_changed)
+        # 受注Noが削除されたら対応する override も破棄する（要件4）。
+        self.denpyo_numbers.textChanged.connect(self._prune_order_overrides)
         self.settings_button.clicked.connect(self.open_settings)
         self.tks_login_test_button.clicked.connect(self.start_tks_login_test)
         self.olap_test_button.clicked.connect(self.start_olap_test)
         self.cleanup_button.clicked.connect(self.run_manual_cleanup)
-        self.password_visibility_action.triggered.connect(self.toggle_password_visibility)
         self.open_config_button.clicked.connect(lambda: self.open_folder("config"))
         self.open_log_button.clicked.connect(lambda: self.open_folder("log"))
         self.open_work_button.clicked.connect(lambda: self.open_folder("work"))
@@ -1406,18 +1995,19 @@ class MainWindow(QMainWindow):
         self.customer_labels_button.clicked.connect(self.open_customer_label_settings)
         self._load_config()
         self._apply_debug_visibility()
-        self._auto_update_timer.start(1200)
 
     def _build_layout(self) -> None:
         form = QFormLayout()
-        form.addRow("契約会社コード", self.company_code)
         form.addRow(self.tks_client_mode_label, self.tks_client_mode)
         form.addRow(self.kintone_target_label, self.kintone_target_display)
         form.addRow(self.programdata_path_label, self.programdata_path)
-        form.addRow("OLAPログインID", self.login_id)
-        form.addRow("OLAPパスワード", self.password)
-        form.addRow("伝票番号", self.denpyo_numbers)
-        form.addRow("仕上日", self.shiage_date)
+        form.addRow("受注No", self.denpyo_numbers)
+        shiage_row = QHBoxLayout()
+        shiage_row.addWidget(self.shiage_date, 1)
+        shiage_row.addWidget(self.shiage_none)
+        shiage_holder = QWidget()
+        shiage_holder.setLayout(shiage_row)
+        form.addRow("仕上日", shiage_holder)
         form.addRow("出荷区分", self.shukka_kbn)
 
         input_group = QGroupBox("入力")
@@ -1459,8 +2049,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """初期化途中でも安全に閉じられるように、遅延処理とワーカーを停止する。"""
         self._closing = True
-        if hasattr(self, "_auto_update_timer"):
-            self._auto_update_timer.stop()
         for worker in (
             self.worker,
             self.debug_worker,
@@ -1491,15 +2079,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "設定不足", str(exc))
             return
 
-        self.company_code.setText(self.config.company_code)
         self.tks_client_mode.setText(self.config.tks_client_mode)
         self._update_kintone_target_display()
         self.programdata_path.setText(str(self.config.paths.base_dir))
+        # 「なし」（空欄扱い）を先頭に追加し、AM・PM等の設定値を続ける（要件3）。
+        self.shukka_kbn.clear()
+        self.shukka_kbn.addItem(SHUKKA_NONE_LABEL)
         self.shukka_kbn.addItems(self.config.shukka_kbn_options)
+        # 既定選択は従来どおり設定値の先頭（AM等）にし、挙動を変えない。
+        if self.config.shukka_kbn_options:
+            self.shukka_kbn.setCurrentText(self.config.shukka_kbn_options[0])
         self.append_log(f"設定ファイル: {self.config.paths.config_env}")
         op_fields = ",".join(self.config.tks_voucher_olap_enabled_op_fields)
         self.append_log(f"TKS_VOUCHER_OLAP_ENABLED_OP_FIELDS={op_fields}")
-        self._load_saved_credentials()
         self._cleanup_old_files()
 
     def open_folder(self, target: str) -> None:
@@ -1536,12 +2128,13 @@ class MainWindow(QMainWindow):
         if self.config is None:
             QMessageBox.warning(self, "設定不足", "設定が読み込まれていません。")
             return
-        dialog = CustomerLabelDialog(self.config.customer_labels, self)
+        dialog = CustomerLabelDialog(self.config.customer_labels, self.config.customer_match_patterns, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         new_labels = dialog.result_labels()
+        new_patterns = dialog.result_match_patterns()
         try:
-            update_customer_labels_in_config(self.config.paths.config_env, new_labels)
+            update_customer_labels_in_config(self.config.paths.config_env, new_labels, new_patterns)
             self.config = load_app_config()
             QMessageBox.information(self, "保存完了", "得意先ヘッダー設定を保存しました。")
         except Exception as exc:
@@ -1549,6 +2142,17 @@ class MainWindow(QMainWindow):
 
     def start_run(self) -> None:
         if self.config is None:
+            return
+        # 同じ受注Noが複数入力されている場合は実行前に警告して中止する（要件5）。
+        duplicates = find_duplicate_order_numbers(
+            parse_order_numbers(self.denpyo_numbers.toPlainText())
+        )
+        if duplicates:
+            QMessageBox.warning(
+                self,
+                "受注Noの重複",
+                "以下の受注Noはすでに一覧に存在します。\n" + "\n".join(duplicates),
+            )
             return
         try:
             run_input = self._collect_input(require_denpyo=True)
@@ -1562,7 +2166,6 @@ class MainWindow(QMainWindow):
         self._set_buttons_enabled(False)
         self.worker = WorkerThread(self._effective_config(), run_input)
         self.worker.log_line.connect(self.append_log)
-        self.worker.credentials_validated.connect(self._save_credentials)
         self.worker.succeeded.connect(self.on_succeeded)
         self.worker.pending_registration.connect(self.on_pending_registration)
         self.worker.failed.connect(self.on_failed)
@@ -1595,7 +2198,6 @@ class MainWindow(QMainWindow):
         self._set_buttons_enabled(False)
         self.debug_worker = TksDebugWorkerThread(self._effective_config(), run_input, mode)
         self.debug_worker.log_line.connect(self.append_log)
-        self.debug_worker.credentials_validated.connect(self._save_credentials)
         self.debug_worker.succeeded.connect(self.on_debug_succeeded)
         self.debug_worker.failed.connect(self.on_failed)
         self.debug_worker.finished.connect(lambda: self._set_buttons_enabled(True))
@@ -1608,15 +2210,15 @@ class MainWindow(QMainWindow):
             self._apply_debug_visibility()
             self._cleanup_old_files()
 
-    def start_auto_update_check(self) -> None:
-        if self._closing:
-            return
-        self._start_update_check(manual=False)
-
     def start_manual_update_check(self) -> None:
+        if not updates_enabled():
+            QMessageBox.information(self._message_parent(), "更新確認", "このビルドでは更新機能は無効です。")
+            return
         self._start_update_check(manual=True)
 
     def _start_update_check(self, manual: bool) -> None:
+        if not updates_enabled():
+            return
         if self.update_check_worker is not None and self.update_check_worker.isRunning():
             if manual:
                 QMessageBox.information(self._message_parent(), "更新確認", "更新確認を実行中です。")
@@ -1629,7 +2231,7 @@ class MainWindow(QMainWindow):
         self.update_check_worker.failed.connect(self.on_update_check_failed)
         self.update_check_worker.start()
 
-    def on_update_check_succeeded(self, info: UpdateInfo | None) -> None:
+    def on_update_check_succeeded(self, info: object | None) -> None:
         if info is None:
             if self.update_check_manual:
                 self.append_log("更新確認結果: 最新です。")
@@ -1655,18 +2257,34 @@ class MainWindow(QMainWindow):
             self.append_log(f"更新確認失敗: {message}")
             QMessageBox.warning(self._message_parent(), "更新確認失敗", message)
 
-    def start_update_download(self, info: UpdateInfo) -> None:
+    def start_update_download(self, info: object) -> None:
         try:
-            launch_external_update(info, default_update_dir(), Path(sys.executable).resolve())
+            update_client = _update_client_module()
+            launch_external_update = update_client.launch_external_update
+            default_update_dir = update_client.default_update_dir
+            started = launch_external_update(
+                info,
+                default_update_dir(),
+                Path(sys.executable).resolve(),
+            )
         except Exception as exc:
             QMessageBox.warning(self._message_parent(), "更新失敗", str(exc))
+            return
+        if not started:
+            QMessageBox.warning(
+                self._message_parent(),
+                "更新失敗",
+                "更新インストーラを起動できませんでした。\n"
+                "ログフォルダの update_installer.log を確認してください。",
+            )
             return
         QMessageBox.information(
             self._message_parent(),
             "更新開始",
             "更新を開始します。\nアプリを終了し、自動でダウンロードとインストールを行います。",
         )
-        QApplication.quit()
+        # インストーラ起動が成功したので本体を速やかに終了する。
+        quit_app_for_update()
 
     def _message_parent(self) -> QWidget:
         active_window = QApplication.activeWindow()
@@ -1676,13 +2294,44 @@ class MainWindow(QMainWindow):
         if self.config is None:
             return
         master = load_master(self.config.paths.kakou_master_csv)
+        # 伝票作成・印刷画面から渡された受注Noごとの仕上日／AM・PMを反映する（要件1・5）。
+        preview_rows = apply_order_overrides(pending.rows, self.get_order_overrides())
+
+        # Kintone既存データの検索に失敗していたら、画面を開く前に続行/中止を確認する（要件11）。
+        existing_records = pending.existing_kintone_records
+        if pending.existing_fetch_error:
+            answer = QMessageBox.question(
+                self._message_parent(),
+                "Kintone既存データの確認に失敗",
+                "Kintone既存データの確認に失敗しました。\n"
+                f"{pending.existing_fetch_error}\n\n"
+                "このままOLAP取得データのみで登録前確認を開きますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.result_label.setText("処理を中止しました（Kintone既存データの確認に失敗）。")
+                return
+            existing_records = []
+
+        # Kintone既存データを登録前確認の行へ反映する（要件4〜7）。
+        preview_rows, existing_by_row = merge_existing_kintone_records_into_preview_rows(
+            preview_rows, existing_records
+        )
+        reflection_message = summarize_existing_reflection(existing_records)
+        if reflection_message:
+            self.append_log(reflection_message)
+
         dialog = RegistrationPreviewDialog(
-            pending.rows,
+            preview_rows,
             self.config.shukka_kbn_options,
             master,
             self.config.customer_labels,
+            self.config.customer_match_patterns,
             self,
             preview_color_theme=self.config.preview_color_theme,
+            debug_visible=_settings_bool(self.settings, SETTINGS_DEBUG_VISIBLE, False),
+            kintone_existing_by_row=existing_by_row,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self.result_label.setText(
@@ -1705,60 +2354,133 @@ class MainWindow(QMainWindow):
             pending.timestamp,
         )
         self.register_worker.log_line.connect(self.append_log)
+        self.register_worker.registration_completed.connect(self._on_kintone_registration_completed)
         self.register_worker.succeeded.connect(self.on_succeeded)
         self.register_worker.failed.connect(self.on_failed)
         self.register_worker.finished.connect(lambda: self._set_buttons_enabled(True))
         self.register_worker.start()
 
     def _collect_input(self, require_denpyo: bool) -> RunInput:
-        login_id = self.login_id.text().strip()
-        password = self.password.text()
-        denpyo_numbers = [value.strip() for value in re.split(r"[,\n\r]+", self.denpyo_numbers.toPlainText()) if value.strip()]
-        if not login_id:
-            raise ValueError("OLAPログインIDを入力してください。")
-        if not password:
-            raise ValueError("OLAPパスワードを入力してください。")
+        # 同じ受注Noで二重にOLAP取得・Kintone既存検索・CSV作成・登録が走らないよう
+        # 登録前確認画面へ渡す前に重複を排除する（要件6）。
+        denpyo_numbers = dedupe_order_numbers(
+            parse_order_numbers(self.denpyo_numbers.toPlainText())
+        )
         if require_denpyo and not denpyo_numbers:
-            raise ValueError("伝票番号を1件以上入力してください。")
+            raise ValueError("受注Noを1件以上入力してください。")
+        # 仕上日「なし」・出荷区分「なし」は空欄（未設定）として扱う（要件3）。
+        shiage_date = "" if self.shiage_none.isChecked() else self.shiage_date.date().toString("yyyy-MM-dd")
+        shukka_kbn = self.shukka_kbn.currentText()
+        if shukka_kbn == SHUKKA_NONE_LABEL:
+            shukka_kbn = ""
         return RunInput(
-            company_code=self.company_code.text(),
-            olap_login_id=login_id,
-            olap_password=password,
+            company_code=self.config.company_code if self.config is not None else "",
+            olap_login_id=self._olap_login_id,
+            olap_password=self._olap_password,
             denpyo_numbers=denpyo_numbers,
-            shiage_date=self.shiage_date.date().toString("yyyy-MM-dd"),
-            shukka_kbn=self.shukka_kbn.currentText(),
+            shiage_date=shiage_date,
+            shukka_kbn=shukka_kbn,
         )
 
-    def toggle_password_visibility(self) -> None:
-        self.password_visible = not self.password_visible
-        if self.password_visible:
-            self.password.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.password_visibility_action.setIcon(QIcon(str(resource_path("assets/eye-off.svg"))))
-            self.password_visibility_action.setToolTip("パスワードを非表示")
-        else:
-            self.password.setEchoMode(QLineEdit.EchoMode.Password)
-            self.password_visibility_action.setIcon(QIcon(str(resource_path("assets/eye.svg"))))
-            self.password_visibility_action.setToolTip("パスワードを表示")
+    def get_order_numbers(self) -> set[str]:
+        """受注No入力欄に現在入力されている受注Noの集合を返す（要件4・5）。
 
-    def _load_saved_credentials(self) -> None:
-        if self._initial_olap_id is not None:
-            self.login_id.setText(self._initial_olap_id)
-            if self._initial_olap_password is not None:
-                self.password.setText(self._initial_olap_password)
+        改行・カンマ・全角カンマ・空白・全角空白で区切り、前後空白を除去する。
+        受注Noは文字列扱いで先頭ゼロを保持する。
+        """
+        return set(parse_order_numbers(self.denpyo_numbers.toPlainText()))
+
+    def add_order_no(
+        self,
+        order_no: str,
+        finish_date: date | None = None,
+        am_pm: str | None = None,
+    ) -> None:
+        """外部（伝票作成・印刷画面）から受注Noを入力欄へ追記する。
+
+        既存入力は消さず、改行区切りで末尾へ追加する。空の場合は何もしない。
+        finish_date / am_pm が渡された場合は受注Noごとの override として保持し、
+        登録前確認の仕上日／出荷区分の初期値に反映する（要件1・4）。
+        追記後はこの画面を前面に出して分かりやすくする。
+        """
+        order_no = (order_no or "").strip()
+        if not order_no:
             return
-        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        login_id = str(settings.value(SETTINGS_LOGIN_ID, "") or "")
-        password = str(settings.value(SETTINGS_PASSWORD, "") or "")
-        if login_id:
-            self.login_id.setText(login_id)
-        if password:
-            self.password.setText(password)
+        # 行設定が渡された場合は override を保持（再追加でも最新値で更新する）。
+        if finish_date is not None or am_pm is not None:
+            self.set_order_overrides(order_no, finish_date, am_pm)
+        existing = self.denpyo_numbers.toPlainText()
+        if order_no in set(parse_order_numbers(existing)):
+            # 既に入力済みの受注Noは重複追加しない（既存の重複防止仕様を維持: 要件4）。
+            # 前面化だけ行い、override は上で更新済み。
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            return
+        if existing.strip():
+            # 既存入力の末尾に改行区切りで追加する（既存仕様の改行区切りに合わせる）。
+            new_text = existing.rstrip("\n\r") + "\n" + order_no
+        else:
+            new_text = order_no
+        self.denpyo_numbers.setPlainText(new_text)
+        # カーソルを末尾へ移動して追記内容が見えるようにする。
+        cursor = self.denpyo_numbers.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.denpyo_numbers.setTextCursor(cursor)
+        # 画面を前面化する。
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
-    def _save_credentials(self, login_id: str, password: str) -> None:
-        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        settings.setValue(SETTINGS_LOGIN_ID, login_id)
-        settings.setValue(SETTINGS_PASSWORD, password)
-        settings.sync()
+    def set_order_overrides(
+        self,
+        order_no: str,
+        finish_date: date | None,
+        am_pm: str | None,
+    ) -> None:
+        """受注Noごとの仕上日／AM・PM override を保持する（要件4）。
+
+        伝票作成・印刷画面で「なし」を指定した場合は finish_date=None / am_pm="none"
+        が渡され、登録前確認で空欄として扱われる。
+        """
+        order_no = (order_no or "").strip()
+        if not order_no:
+            return
+        self._order_overrides[order_no] = {
+            "finish_date": finish_date,
+            "am_pm": am_pm,
+        }
+
+    def get_order_overrides(self) -> dict[str, dict[str, object]]:
+        """現在入力欄に存在する受注Noの override だけを返す（要件4・5）。
+
+        受注No欄から削除されたNoの override は登録前確認へ誤適用しない。
+        """
+        active = self.get_order_numbers()
+        return {
+            order_no: dict(override)
+            for order_no, override in self._order_overrides.items()
+            if order_no in active
+        }
+
+    def _prune_order_overrides(self) -> None:
+        """受注No欄から消えた受注Noの override を破棄する（要件4）。"""
+        active = self.get_order_numbers()
+        for order_no in list(self._order_overrides):
+            if order_no not in active:
+                del self._order_overrides[order_no]
+
+    def remove_order_numbers(self, order_numbers: list[str] | set[str]) -> None:
+        """登録成功した受注Noだけを入力欄から削除する。"""
+        remove_set = {str(value).strip() for value in order_numbers if str(value).strip()}
+        if not remove_set:
+            return
+        remaining = [order_no for order_no in parse_order_numbers(self.denpyo_numbers.toPlainText()) if order_no not in remove_set]
+        self.denpyo_numbers.setPlainText("\n".join(remaining))
+
+    def _on_kintone_registration_completed(self, order_numbers: list[str]) -> None:
+        self.remove_order_numbers(order_numbers)
+        self.kintone_registration_completed.emit(order_numbers)
 
     def _effective_config(self) -> AppConfig:
         if self.config is None:
@@ -1858,6 +2580,23 @@ class MainWindow(QMainWindow):
             widget.setVisible(False)
 
 
+def quit_app_for_update() -> None:
+    """更新インストーラ起動後に本体アプリを確実に終了する。
+
+    インストーラが本体ファイルを上書きできるよう、``quit()`` だけでは終了しない
+    ケースに備えて全トップレベルウィンドウを閉じてから ``quit()`` する。
+    """
+    app = QApplication.instance()
+    if app is None:
+        return
+    for widget in list(app.topLevelWidgets()):
+        try:
+            widget.close()
+        except Exception:  # pragma: no cover - 終了処理は best-effort
+            pass
+    app.quit()
+
+
 def run_gui() -> int:
     app = QApplication([])
     app.setOrganizationName(SETTINGS_ORG)
@@ -1882,6 +2621,10 @@ def run_gui() -> int:
             return 1
 
     settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    # QSettings 側の既定値を補完する。config.env / 加工名マスタは load_app_config() で補完する。
+    from app.settings_service import ensure_default_webhook_urls
+
+    ensure_default_webhook_urls(settings)
     apply_theme(str(settings.value(SETTINGS_THEME, THEME_SYSTEM) or THEME_SYSTEM))
     from app.launcher_window import LauncherWindow
     window = LauncherWindow()
@@ -1918,6 +2661,34 @@ def _format_error_message(exc: Exception, log_file: Path, debug_file: Path | Non
     if debug_file is not None:
         lines.append(f"最新debugファイル: {debug_file}")
     return "\n".join(lines)
+
+
+def _unique_order_numbers(rows: list[dict[str, str]]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        order_no = str(row.get("受注No", "") or "").strip()
+        if order_no and order_no not in seen:
+            seen.add(order_no)
+            result.append(order_no)
+    return result
+
+
+def split_customer_match_keywords(value: str) -> list[str]:
+    """得意先自動判定文字列をキーワードに分割する。"""
+    return [part for part in re.split(r"[,、\s　]+", str(value or "").strip()) if part]
+
+
+def customer_key_from_name(customer_name: str, match_patterns: dict[str, str]) -> str:
+    """得意先名称に合う得意先キーを、得意先1〜4の順で返す。"""
+    name = str(customer_name or "")
+    if not name:
+        return DEFAULT_CUSTOMER_KEY
+    for key in CUSTOMER_KEYS:
+        for keyword in split_customer_match_keywords(match_patterns.get(key, "")):
+            if keyword and keyword in name:
+                return key
+    return DEFAULT_CUSTOMER_KEY
 
 
 def _date_from_text(value: str) -> QDate:
@@ -2031,18 +2802,29 @@ def apply_theme(theme: str) -> None:
     app = QApplication.instance()
     if app is None:
         return
-    from app.theme_utils import apply_app_font_size, apply_title_bar_theme_to_top_level_widgets, current_app_is_dark
+    from app.theme_utils import (
+        SEMANTIC_BUTTON_STYLESHEET,
+        apply_app_font_size,
+        apply_title_bar_theme_to_top_level_widgets,
+        current_app_is_dark,
+    )
 
     apply_app_font_size()
     if theme == THEME_DARK:
-        app.setStyleSheet(_with_checkmark_assets(DARK_STYLESHEET))
+        app.setStyleSheet(_with_checkmark_assets(DARK_STYLESHEET + SEMANTIC_BUTTON_STYLESHEET))
         apply_title_bar_theme_to_top_level_widgets(True)
     elif theme == THEME_LIGHT:
-        app.setStyleSheet(_with_checkmark_assets(LIGHT_STYLESHEET))
+        app.setStyleSheet(_with_checkmark_assets(LIGHT_STYLESHEET + SEMANTIC_BUTTON_STYLESHEET))
         apply_title_bar_theme_to_top_level_widgets(False)
     else:
-        app.setStyleSheet("")
+        app.setStyleSheet(SEMANTIC_BUTTON_STYLESHEET)
         apply_title_bar_theme_to_top_level_widgets(current_app_is_dark())
+    # 指図書編集画面の反映先ボタンはグローバルQSSより強い直接スタイルを使う。
+    # テーマ変更時は、既に開いている画面の通常色も現在テーマへ更新する。
+    for widget in app.topLevelWidgets():
+        refresh = getattr(widget, "_refresh_reflect_target_button_styles", None)
+        if callable(refresh):
+            refresh()
 
 
 def _with_checkmark_assets(stylesheet: str) -> str:
@@ -2062,11 +2844,23 @@ QWidget {
   color: #1f2933;
   font-size: 12pt;
 }
-QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QDateEdit, QTableWidget {
+QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QDateEdit, QTableWidget, QTableView {
   background: #ffffff;
   color: #1f2933;
   border: 1px solid #c7d0d9;
   border-radius: 4px;
+}
+QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled,
+QComboBox:disabled, QDateEdit:disabled {
+  background: #e5e9ed;
+  color: #4b5563;
+  border-color: #a8b2bc;
+}
+QAbstractItemView {
+  background: #ffffff;
+  color: #1f2933;
+  selection-background-color: #1565c0;
+  selection-color: #ffffff;
 }
 QHeaderView::section {
   background: #e9eef3;
@@ -2091,11 +2885,40 @@ QCheckBox::indicator:unchecked {
   border: 1px solid #777777;
   background: #ffffff;
 }
+QCheckBox:disabled, QRadioButton:disabled {
+  color: #66717c;
+}
+QCheckBox::indicator:disabled {
+  border-color: #9aa3ac;
+  background: #e1e5e9;
+}
+QRadioButton {
+  color: #1f2933;
+}
+QRadioButton::indicator {
+  width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  border: 2px solid #5f6b76;
+  background: #ffffff;
+}
+QRadioButton::indicator:checked {
+  border: 2px solid #0d6efd;
+  background: #0d6efd;
+}
+QRadioButton::indicator:disabled {
+  border-color: #9aa3ac;
+  background: #dfe4e8;
+}
+QRadioButton::indicator:checked:disabled {
+  border-color: #7f8b96;
+  background: #7f8b96;
+}
 QPushButton, QToolButton {
   background: #1f7a8c;
   color: #ffffff;
   border: 0;
-  border-radius: 4px;
+  border-radius: 6px;
   padding: 6px 12px;
   font-size: 12pt;
 }
@@ -2113,6 +2936,39 @@ QPushButton:checked:hover, QToolButton:checked:hover {
 }
 QPushButton:disabled, QToolButton:disabled {
   background: #9aa7b2;
+  color: #f4f6f8;
+  border-radius: 6px;
+}
+QPushButton[reflectTargetButton="true"]:checked,
+QPushButton#reflectTargetButton[reflectTargetSelected="true"],
+QPushButton[reflectTargetSelected="true"] {
+  background-color: #0d6efd;
+  color: #ffffff;
+  border: 2px solid #66b2ff;
+  font-weight: bold;
+}
+QPushButton[reflectTargetSelected="true"]:disabled {
+  background-color: #9aa7b2;
+  color: #f4f6f8;
+  border: 1px solid #7f8b96;
+}
+QTabWidget::pane {
+  border: 1px solid #c7d0d9;
+  background: #ffffff;
+}
+QTabBar::tab {
+  color: #222222;
+  background: #e9ecef;
+  border: 1px solid #c7d0d9;
+  padding: 7px 14px;
+}
+QTabBar::tab:selected {
+  color: #ffffff;
+  background: #1565c0;
+}
+QTabBar::tab:disabled {
+  color: #66717c;
+  background: #d9dee3;
 }
 QGroupBox {
   border: 1px solid #c7d0d9;
@@ -2128,11 +2984,23 @@ QWidget {
   color: #eef2f6;
   font-size: 12pt;
 }
-QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QDateEdit, QTableWidget {
+QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QDateEdit, QTableWidget, QTableView {
   background: #2b323a;
   color: #eef2f6;
   border: 1px solid #52606d;
   border-radius: 4px;
+}
+QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled,
+QComboBox:disabled, QDateEdit:disabled {
+  background: #343c45;
+  color: #b9c2cb;
+  border-color: #65717d;
+}
+QAbstractItemView {
+  background: #2b323a;
+  color: #eef2f6;
+  selection-background-color: #1976d2;
+  selection-color: #ffffff;
 }
 QHeaderView::section {
   background: #333c46;
@@ -2157,11 +3025,40 @@ QCheckBox::indicator:unchecked {
   border: 1px solid #9aa7b2;
   background: #20252b;
 }
+QCheckBox:disabled, QRadioButton:disabled {
+  color: #aeb8c2;
+}
+QCheckBox::indicator:disabled {
+  border-color: #697580;
+  background: #343c45;
+}
+QRadioButton {
+  color: #eef2f6;
+}
+QRadioButton::indicator {
+  width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  border: 2px solid #aab4be;
+  background: #20252b;
+}
+QRadioButton::indicator:checked {
+  border: 2px solid #42a5f5;
+  background: #42a5f5;
+}
+QRadioButton::indicator:disabled {
+  border-color: #697580;
+  background: #343c45;
+}
+QRadioButton::indicator:checked:disabled {
+  border-color: #7b8792;
+  background: #7b8792;
+}
 QPushButton, QToolButton {
   background: #2f9bb3;
   color: #ffffff;
   border: 0;
-  border-radius: 4px;
+  border-radius: 6px;
   padding: 6px 12px;
   font-size: 12pt;
 }
@@ -2179,6 +3076,39 @@ QPushButton:checked:hover, QToolButton:checked:hover {
 }
 QPushButton:disabled, QToolButton:disabled {
   background: #52606d;
+  color: #e1e6eb;
+  border-radius: 6px;
+}
+QPushButton[reflectTargetButton="true"]:checked,
+QPushButton#reflectTargetButton[reflectTargetSelected="true"],
+QPushButton[reflectTargetSelected="true"] {
+  background-color: #0d6efd;
+  color: #ffffff;
+  border: 2px solid #66b2ff;
+  font-weight: bold;
+}
+QPushButton[reflectTargetSelected="true"]:disabled {
+  background-color: #52606d;
+  color: #e1e6eb;
+  border: 1px solid #697580;
+}
+QTabWidget::pane {
+  border: 1px solid #52606d;
+  background: #2b323a;
+}
+QTabBar::tab {
+  color: #f0f0f0;
+  background: #3a424b;
+  border: 1px solid #52606d;
+  padding: 7px 14px;
+}
+QTabBar::tab:selected {
+  color: #ffffff;
+  background: #1976d2;
+}
+QTabBar::tab:disabled {
+  color: #aeb8c2;
+  background: #303840;
 }
 QGroupBox {
   border: 1px solid #52606d;

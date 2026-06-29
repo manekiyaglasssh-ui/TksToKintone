@@ -258,7 +258,8 @@ class CustomerLabelReloadTest(unittest.TestCase):
         """update + load_app_config() で customer_labels が更新される。"""
         def run(base: Path) -> None:
             cfg = load_app_config()
-            self.assertEqual(cfg.customer_labels["得意先1"], "得意先1")
+            # 初回起動時の得意先1既定値は「東芝・日立・フジテック」。
+            self.assertEqual(cfg.customer_labels["得意先1"], "東芝・日立・フジテック")
 
             new_labels = {
                 "得意先1": "吉田硝子",
@@ -272,6 +273,22 @@ class CustomerLabelReloadTest(unittest.TestCase):
             self.assertEqual(cfg2.customer_labels["得意先2"], "標準A")
             self.assertEqual(cfg2.customer_labels["得意先3"], "特注")
             self.assertEqual(cfg2.customer_labels["得意先4"], "予備")
+
+        self._with_temp_home(run)
+
+    def test_customer_match_patterns_saved_and_reloaded(self) -> None:
+        """得意先判定文字列も config.env に保存され、load_app_config で復元される。"""
+        def run(base: Path) -> None:
+            cfg = load_app_config()
+            update_customer_labels_in_config(
+                cfg.paths.config_env,
+                {"得意先1": "吉田硝子", "得意先2": "標準A"},
+                {"得意先1": "東芝,日立", "得意先2": "フジテック"},
+            )
+            cfg2 = load_app_config()
+            self.assertEqual(cfg2.customer_match_patterns["得意先1"], "東芝,日立")
+            self.assertEqual(cfg2.customer_match_patterns["得意先2"], "フジテック")
+            self.assertEqual(cfg2.customer_match_patterns["得意先3"], "")
 
         self._with_temp_home(run)
 
@@ -296,6 +313,32 @@ class CustomerLabelReloadTest(unittest.TestCase):
         self.assertEqual(kakou_options[2][1], "標準A")
         self.assertEqual(kakou_options[3][1], "特注")
         self.assertEqual(kakou_options[4][1], "予備")
+
+
+class CustomerAutoMatchTest(unittest.TestCase):
+    def test_keyword_match_selects_customer_key(self) -> None:
+        from app.gui import customer_key_from_name
+
+        patterns = {"得意先1": "東芝,日立,フジテック", "得意先2": ""}
+        self.assertEqual(customer_key_from_name("東芝エレベータ株式会社", patterns), "得意先1")
+
+    def test_younger_customer_key_wins_when_keywords_overlap(self) -> None:
+        from app.gui import customer_key_from_name
+
+        patterns = {"得意先1": "東芝", "得意先2": "東芝", "得意先3": "東芝"}
+        self.assertEqual(customer_key_from_name("東芝エレベータ株式会社", patterns), "得意先1")
+
+    def test_empty_keywords_ignored_and_no_match_is_selected(self) -> None:
+        from app.gui import DEFAULT_CUSTOMER_KEY, customer_key_from_name
+
+        self.assertEqual(customer_key_from_name("東芝エレベータ株式会社", {"得意先1": ""}), DEFAULT_CUSTOMER_KEY)
+        self.assertEqual(customer_key_from_name("一致なし", {"得意先1": "東芝"}), DEFAULT_CUSTOMER_KEY)
+
+    def test_full_width_comma_and_spaces_split_keywords(self) -> None:
+        from app.gui import customer_key_from_name
+
+        patterns = {"得意先1": "東芝、 日立　フジテック"}
+        self.assertEqual(customer_key_from_name("日立ビルシステム", patterns), "得意先1")
 
 
 # ── 確認点2: config.env が存在しない場合 ─────────────────────────────────────

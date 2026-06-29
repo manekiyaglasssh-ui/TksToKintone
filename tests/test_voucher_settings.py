@@ -44,11 +44,11 @@ class TestVoucherSettings(unittest.TestCase):
             voucher_settings.save_default_print_types([])
             self.assertEqual(voucher_settings.load_default_print_types(), [])
 
-    def test_cache_retention_default_is_7(self) -> None:
+    def test_cache_retention_default_is_60(self) -> None:
         from app import voucher_settings
 
         with _temp_home():
-            self.assertEqual(voucher_settings.load_cache_retention_days(), 7)
+            self.assertEqual(voucher_settings.load_cache_retention_days(), 60)
 
     def test_save_and_load_cache_retention(self) -> None:
         from app import voucher_settings
@@ -60,9 +60,28 @@ class TestVoucherSettings(unittest.TestCase):
     def test_invalid_retention_falls_back_to_default(self) -> None:
         from app import voucher_settings
 
-        self.assertEqual(voucher_settings.normalize_cache_retention_days("abc"), 7)
-        self.assertEqual(voucher_settings.normalize_cache_retention_days(0), 7)
-        self.assertEqual(voucher_settings.normalize_cache_retention_days(-3), 7)
+        self.assertEqual(voucher_settings.normalize_cache_retention_days("abc"), 60)
+        self.assertEqual(voucher_settings.normalize_cache_retention_days(0), 60)
+        self.assertEqual(voucher_settings.normalize_cache_retention_days(-3), 60)
+
+    def test_record_retention_default_is_1095(self) -> None:
+        from app import voucher_settings
+
+        with _temp_home():
+            self.assertEqual(voucher_settings.load_record_retention_days(), 1095)
+
+    def test_save_and_load_record_retention(self) -> None:
+        from app import voucher_settings
+
+        with _temp_home():
+            voucher_settings.save_record_retention_days(365)
+            self.assertEqual(voucher_settings.load_record_retention_days(), 365)
+
+    def test_invalid_record_retention_falls_back_to_default(self) -> None:
+        from app import voucher_settings
+
+        self.assertEqual(voucher_settings.normalize_record_retention_days("abc"), 1095)
+        self.assertEqual(voucher_settings.normalize_record_retention_days(0), 1095)
 
     def test_parse_print_types_filters_unknown(self) -> None:
         from app import voucher_settings

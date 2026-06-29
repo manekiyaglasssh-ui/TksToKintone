@@ -89,6 +89,37 @@ def ensure_master_file(path: Path) -> None:
     save_master(path, [])
 
 
+def load_default_master(default_csv_path: Path) -> list[dict[str, str]]:
+    """同梱のデフォルト加工名マスタCSVを読み込む（UTF-8 BOM等を自動判定）。
+
+    ファイルが無い場合は空リストを返す。
+    """
+    if not default_csv_path.exists():
+        return []
+    rows, _encoding = read_csv_with_auto_encoding(default_csv_path)
+    return [{h: str(row.get(h, "") or "") for h in KAKOU_MASTER_HEADERS} for row in rows]
+
+
+def ensure_default_kakou_master(path: Path, default_csv_path: Path) -> bool:
+    """初回起動時のみ、同梱デフォルトCSVを加工名マスタへ投入する。
+
+    投入するのは「マスタファイルが存在しない、または0件の場合」だけ。
+    既にユーザーがマスタを登録・編集済み（1件以上データがある）なら一切上書きしない。
+
+    戻り値: デフォルトを投入したら True。
+    """
+    if path.exists() and load_master(path):
+        # 1件以上データがある＝ユーザー登録済みとみなして触らない。
+        return False
+    rows = load_default_master(default_csv_path)
+    if not rows:
+        # デフォルトCSVが無い/空なら従来どおりヘッダーのみの空マスタを用意する。
+        ensure_master_file(path)
+        return False
+    save_master(path, rows)
+    return True
+
+
 def apply_kakou_names_to_rows(
     rows: list[dict[str, str]],
     master: list[dict[str, str]],

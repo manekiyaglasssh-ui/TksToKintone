@@ -1,7 +1,7 @@
 """OLAP取得データの受注Noごとのキャッシュ保存。
 
 ボタン押下（指図書編集 / PDF作成 / 印刷 / 選択PDF作成 / 選択印刷）時に取得した
-OLAPデータを受注Noごとに1ファイル（JSON）で保存する。保存期間（デフォルト7日）を
+OLAPデータを受注Noごとに1ファイル（JSON）で保存する。保存期間（デフォルト60日）を
 過ぎたキャッシュは削除する。
 
 このキャッシュは「指図書編集オブジェクト」とは別ディレクトリに保存し、
@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from app.path_utils import get_voucher_cache_dir
+from app.voucher_settings import DEFAULT_CACHE_RETENTION_DAYS
 
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -96,7 +97,7 @@ def cleanup_expired_cache(
     base = cache_dir or get_voucher_cache_dir()
     if not base.exists():
         return 0
-    days = retention_days if retention_days and retention_days > 0 else 7
+    days = retention_days if retention_days and retention_days > 0 else DEFAULT_CACHE_RETENTION_DAYS
     cutoff = (time.time() if now is None else now) - days * 24 * 60 * 60
     deleted = 0
     for path in base.glob("*.json"):

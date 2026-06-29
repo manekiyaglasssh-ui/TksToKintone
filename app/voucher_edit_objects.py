@@ -29,17 +29,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.line_decorations import normalize_line_type
 from app.path_utils import get_voucher_edit_objects_dir
 from app.voucher_cache import sanitize_order_no
 
-OBJECT_TYPES = ("text", "symbol_text", "line", "rectangle", "ellipse", "image")
+OBJECT_TYPES = (
+    "text", "symbol_text", "line", "rectangle", "ellipse", "image",
+    "freehand", "freehand_layer",
+)
+DEFAULT_LINE_TYPE = "line"
 DEFAULT_FONT_FAMILY = "Yu Gothic UI"
 DEFAULT_FONT_SIZE = 12.0
 DEFAULT_LINE_WIDTH = 1.0
+# 手書きペンの既定の太さ（タブレット編集レイヤー用）。
+DEFAULT_PEN_WIDTH = 3.0
 DEFAULT_STROKE_COLOR = "#000000"
 DEFAULT_TEXT_COLOR = "#000000"
 DEFAULT_TEXT_WIDTH = 60.0
 DEFAULT_TEXT_HEIGHT = 18.0
+# 反映先伝票の既定（旧データ互換: 指図書(1)/指図書(2)/梱包明細書）。
+DEFAULT_TARGET_VOUCHERS = ["03", "04", "05"]
 COORDINATE_ORIGIN = "scene_top_left"
 GEOMETRY_BASIS = "object_geometry_v2"
 _log = logging.getLogger("tks_to_kintone_app")
@@ -130,9 +139,68 @@ def _normalize_object(obj: dict[str, Any], now: str) -> dict[str, Any]:
     return out
 
 
+def _normalize_target_vouchers(value: Any) -> list[str]:
+    """target_vouchers を正規化する。未設定/不正なら既定（03/04/05）扱い（要件3・7）。"""
+    if isinstance(value, list):
+        cleaned = [str(v).strip() for v in value if str(v).strip()]
+        if cleaned:
+            return cleaned
+    return list(DEFAULT_TARGET_VOUCHERS)
+
+
+def _normalize_stroke_points(points: Any) -> list[list[float]]:
+    """ストロークの points を [[x, y], ...] の float ペア配列へ正規化する。"""
+    result: list[list[float]] = []
+    if not isinstance(points, (list, tuple)):
+        return result
+    for p in points:
+        try:
+            x = float(p[0])
+            y = float(p[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        result.append([x, y])
+    return result
+
+
+def _normalize_freehand_layer(obj: dict[str, Any]) -> dict[str, Any]:
+    """freehand_layer の欠落属性を補完し strokes を正規化する（要件2）。"""
+    layer_id = str(obj.get("layer_id") or obj.get("id") or "").strip()
+    if not layer_id:
+        layer_id = str(uuid.uuid4())
+    obj["layer_id"] = layer_id
+    obj.setdefault("layer_name", "レイヤー")
+    obj["pen_width"] = float(obj.get("pen_width") or obj.get("line_width")
+                             or DEFAULT_PEN_WIDTH)
+    obj["line_width"] = obj["pen_width"]
+    obj.setdefault("stroke_color", DEFAULT_STROKE_COLOR)
+    obj["visible"] = bool(obj.get("visible", True))
+    obj["locked"] = bool(obj.get("locked", False))
+    strokes: list[dict[str, Any]] = []
+    raw_strokes = obj.get("strokes")
+    if isinstance(raw_strokes, list):
+        for s in raw_strokes:
+            if not isinstance(s, dict):
+                continue
+            pts = _normalize_stroke_points(s.get("points"))
+            if not pts:
+                continue
+            strokes.append({
+                "points": pts,
+                "pen_width": float(s.get("pen_width") or obj["pen_width"]),
+                "stroke_color": str(s.get("stroke_color") or obj["stroke_color"]),
+            })
+    obj["strokes"] = strokes
+    return obj
+
+
 def _with_compat_defaults(obj: dict[str, Any]) -> dict[str, Any]:
     """旧JSONの欠落属性を現行スキーマの既定値で補完する。"""
     kind = obj.get("type")
+    # 反映先伝票は全オブジェクト共通で補完する（旧データは ["03","04","05"]）。
+    obj["target_vouchers"] = _normalize_target_vouchers(obj.get("target_vouchers"))
+    if kind == "freehand_layer":
+        return _normalize_freehand_layer(obj)
     if kind in ("text", "rectangle", "ellipse"):
         width = obj.get("width", obj.get("w", DEFAULT_TEXT_WIDTH))
         height = obj.get("height", obj.get("h", DEFAULT_TEXT_HEIGHT))
@@ -160,6 +228,9 @@ def _with_compat_defaults(obj: dict[str, Any]) -> dict[str, Any]:
     if kind in ("text", "line", "rectangle", "ellipse"):
         obj["line_width"] = float(obj.get("line_width") or DEFAULT_LINE_WIDTH)
         obj.setdefault("stroke_color", DEFAULT_STROKE_COLOR)
+    if kind == "line":
+        # 旧データ（line_type 無し）は通常の直線として扱う（要件: 互換）。
+        obj["line_type"] = normalize_line_type(obj.get("line_type"))
     if kind in ("text", "rectangle", "ellipse"):
         obj.setdefault("fill_color", None)
     if kind == "image":

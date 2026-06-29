@@ -61,6 +61,12 @@ class AppConfig:
         "得意先3": "得意先3",
         "得意先4": "得意先4",
     })
+    customer_match_patterns: dict[str, str] = field(default_factory=lambda: {
+        "得意先1": "",
+        "得意先2": "",
+        "得意先3": "",
+        "得意先4": "",
+    })
     preview_color_theme: str = "light"
     voucher_output_dir: Path | None = None
 
@@ -69,6 +75,7 @@ class AppConfig:
 class KintoneResult:
     success_count: int = 0
     failure_count: int = 0
+    successful_records: list[dict[str, str]] = field(default_factory=list)
     failed_records: list[dict[str, str]] = field(default_factory=list)
 
 
@@ -90,6 +97,10 @@ class PendingRegistration:
     output_count: int
     log_file: Path
     timestamp: str
+    # Kintoneから取得した同一受注Noの既存レコード（CSV列名キー）。検索に失敗した場合は空。
+    existing_kintone_records: list[dict[str, str]] = field(default_factory=list)
+    # Kintone既存データ検索に失敗した場合のエラーメッセージ（成功時は None）。
+    existing_fetch_error: str | None = None
 
 
 @dataclass

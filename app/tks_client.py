@@ -193,6 +193,38 @@ class HttpTksClient(BaseTksClient):
             ]
         )
 
+    def _self_repair_olap_template(self, kind: str, template_path: Path) -> Path:
+        """OLAP取得直前にテンプレートが無ければ同梱側から自己復旧する。
+
+        復旧できればその配置先パスを返す。復旧できない場合は、探したパスと
+        ログファイルの場所を含む分かりやすいエラーを送出する。
+        """
+        from app.config import (
+            ensure_olap_templates_installed,
+            olap_template_dir,
+            olap_template_source_dirs,
+        )
+
+        self.logger.warning(
+            "%s のOLAPリクエストテンプレートが見つかりません。同梱側から復旧を試みます: %s",
+            kind,
+            template_path,
+        )
+        ensure_olap_templates_installed()
+        repaired = olap_template_dir() / template_path.name
+        if repaired.exists():
+            self.logger.info("OLAPテンプレートを自己復旧しました: %s", repaired)
+            return repaired
+
+        searched = [str(directory / template_path.name) for directory in olap_template_source_dirs()]
+        log_dir = getattr(self.config.paths, "log_dir", None)
+        log_hint = f"\nログファイル: {log_dir}" if log_dir else ""
+        raise FileNotFoundError(
+            f"{kind} のOLAPリクエストテンプレートが見つかりません: {template_path}\n"
+            "同梱側からの自動復旧にも失敗しました。\n"
+            "探したコピー元パス:\n  " + "\n  ".join(searched) + log_hint
+        )
+
     def _build_olap_payload(self, kind: str, denpyo_numbers: list[str]) -> OrderedDict[str, object]:
         if kind == "kakou":
             template_path = self.config.tks_kakou_request_template
@@ -203,13 +235,16 @@ class HttpTksClient(BaseTksClient):
         if template_path is None:
             raise RuntimeError(f"{kind} のOLAPリクエストテンプレートが設定されていません。")
         if not template_path.exists():
-            raise FileNotFoundError(f"{kind} のOLAPリクエストテンプレートが見つかりません: {template_path}")
+            # OLAP取得直前の安全網: 同梱側から ProgramData へ自己復旧する。
+            template_path = self._self_repair_olap_template(kind, template_path)
 
         with template_path.open("r", encoding="utf-8-sig") as fp:
             payload = json.load(fp, object_pairs_hook=OrderedDict)
         if not isinstance(payload, dict):
             raise RuntimeError(f"{kind} のOLAPリクエストテンプレートはJSONオブジェクトにしてください: {template_path}")
         payload = copy.deepcopy(payload)
+        if _ensure_op_kubun_in_r1list(payload):
+            self.logger.info("OLAP R1List に必須項目 OP区分 を補完しました。")
         if kind == "kakou":
             _apply_r2_overrides(payload, self.config.tks_kakou_r2_overrides)
         else:
@@ -333,6 +368,72 @@ def _mask_login_payload(payload: OrderedDict[str, object]) -> OrderedDict[str, o
 def _screen_name_value(value: str) -> int | str:
     stripped = value.strip()
     return int(stripped) if stripped.isdigit() else stripped
+
+
+# OP区分（商品基本マスタ）。古いテンプレートにこの項目が無いと、CSV/kintone登録で
+# ㎡・総㎡がOP区分で算出できず空欄になる。送信直前に必ず補完する自己修復用の定義。
+_OP_KUBUN_LABEL = "OP区分"
+_OP_KUBUN_DISPLAY_NO = 34
+_OP_KUBUN_R1_ITEM = OrderedDict(
+    [
+        ("OLAP表示No", _OP_KUBUN_DISPLAY_NO),
+        ("OLAP表示名", _OP_KUBUN_LABEL),
+        ("OLAPデータ区分", "1"),
+        ("エンティティ論理名", "OLAP_M03-02 商品基本マスタ"),
+        ("フィールド論理名", _OP_KUBUN_LABEL),
+        ("OLAP表示幅", 3),
+        ("OLAPフォントサイズ２", "0"),
+        ("OLAP空白値表示", "-"),
+        ("OLAP日付のフォーマットフラグ", "1"),
+        ("OLAP数値の3桁区切りフラグ", "1"),
+        ("OLAP桁数", 0),
+        ("OLAP小数", 0),
+        ("OLAP丸め", "0"),
+        ("OLAP出力順序No", None),
+        ("OLAP出力順", "2"),
+        ("OLAP空白値を先頭表示フラグ", "0"),
+        ("OLAP集計方法", "0"),
+        ("OLAP合計表示フラグ", "0"),
+        ("OLAP合計ラベル", "計"),
+        ("OLAP合計ラベルのみ表示フラグ", ""),
+        ("OLAP重複を除くフラグ", "0"),
+        ("OLAP演算式", ""),
+        ("OLAP演算式表記", ""),
+        ("OLAPドメイン分類", "3"),
+        (
+            "XupperRoutingItems",
+            [
+                OrderedDict(
+                    [
+                        ("参照順", 1),
+                        ("エンティティ論理名", "OLAP_T01-04 受注明細加工完成品データ2"),
+                        ("エンティティ表示名", "受注明細加工完成品データ2"),
+                        ("フィールド論理名", "商品コード"),
+                        ("フィールド表示名", "商品コード"),
+                    ]
+                )
+            ],
+        ),
+    ]
+)
+
+
+def _ensure_op_kubun_in_r1list(payload: dict[str, object]) -> bool:
+    """R1List に OP区分 が無ければ補完する。
+
+    加工/素板どちらのテンプレートにも適用される。既に OP区分（表示名または
+    フィールド論理名）が存在する場合は重複追加しない。補完したら True を返す。
+    """
+    r1_list = payload.get("R1List")
+    if not isinstance(r1_list, list):
+        return False
+    for item in r1_list:
+        if not isinstance(item, dict):
+            continue
+        if item.get("OLAP表示名") == _OP_KUBUN_LABEL or item.get("フィールド論理名") == _OP_KUBUN_LABEL:
+            return False
+    r1_list.append(copy.deepcopy(_OP_KUBUN_R1_ITEM))
+    return True
 
 
 def _replace_order_no_condition(payload: dict[str, object], order_no_value: str, template_path: Path) -> None:

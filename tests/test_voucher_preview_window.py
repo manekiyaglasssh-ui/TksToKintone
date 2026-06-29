@@ -72,6 +72,18 @@ class TestVoucherPreviewWindow(unittest.TestCase):
         win._on_zoom_reset()
         self.assertEqual(win._zoom, 1.0)
 
+    def test_opened_preview_is_maximized(self) -> None:
+        from app.voucher_window import VoucherWindow
+
+        owner = mock.MagicMock()
+        with mock.patch(
+            "app.voucher_preview_window.VoucherPrintPreviewWindow"
+        ) as preview_cls:
+            preview = preview_cls.return_value
+            result = VoucherWindow._open_preview_window(owner, _MINIMAL_PDF)
+        preview.showMaximized.assert_called_once_with()
+        self.assertIs(result, preview)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -41,6 +41,7 @@ SOURCE_HEADERS = [
     "品種区分",
     "発注先コード",
     "加工完成品仕入先コード",
+    "OP区分",
 ]
 
 OUTPUT_HEADERS = [
@@ -84,12 +85,15 @@ OUTPUT_HEADERS = [
     "加工判定",
     "洗浄区分",
     "判定",
+    "OP区分",
 ]
 
 HQ_ORDER_CODES = {"11111"}
 GLASS = "1"
 PROCESSING = "2"
-OPTIONAL_SOURCE_HEADERS = {"総重量"}
+# OP区分 は ㎡/総㎡ の算出に使うが、OP区分 を含まない旧抽出CSVでも処理を止めないよう
+# 必須列チェックの対象外にする（取得できない場合は ㎡/総㎡ を空欄にする）。
+OPTIONAL_SOURCE_HEADERS = {"総重量", "OP区分"}
 
 
 def transform_files(

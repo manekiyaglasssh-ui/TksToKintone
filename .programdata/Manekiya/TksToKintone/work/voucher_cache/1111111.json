@@ -1,11 +1,11 @@
 {
   "order_no": "1111111",
-  "fetched_at": "2026-06-12T11:18:59",
+  "fetched_at": "2026-06-17T12:26:58",
   "request_conditions": {
     "order_no": "1111111"
   },
   "row_settings": {
-    "finish_date": "2026-06-12",
+    "finish_date": "2026-06-17",
     "am_pm": "AM",
     "process_checks": {
       "エッジング": false,
@@ -33,7 +33,7 @@
   "raw_rows": [],
   "pages": [
     {
-      "row_finish_date": "2026-06-12",
+      "row_finish_date": "2026-06-17",
       "row_am_pm": "AM",
       "row_process_checks": {
         "エッジング": false,

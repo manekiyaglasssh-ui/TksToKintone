@@ -65,8 +65,8 @@ class TestResizeHandles(unittest.TestCase):
         item.setSelected(True)
         win._on_selection_changed()
         handles = [h for h in win._handles if isinstance(h, _ResizeHandle)]
-        self.assertEqual(len(handles), 1)
-        return handles[0]
+        self.assertEqual(len(handles), 8)
+        return [h for h in handles if h._position == "bottom_right"][0]
 
     # ── 各オブジェクトがハンドルでリサイズできる ────────────────────────────
     def test_image_resized_by_dragging_handle(self) -> None:
@@ -258,6 +258,55 @@ class TestResizeHandles(unittest.TestCase):
         # ハンドル押下後も対象は選択されたまま＝ハンドルが撤去されない。
         self.assertTrue(item.isSelected())
         self.assertTrue(scene._press_handle)
+
+    def test_corner_handle_keeps_aspect_ratio(self) -> None:
+        win = self._make_window()
+        item = win.add_image(_png_bytes(width=20, height=10),
+                             rect=QRectF(20.0, 20.0, 100.0, 50.0))
+        handle = self._select_resize_handle(win, item)
+        handle.setPos(QPointF(220.0, 90.0))
+        obj = win.serialize_objects()[0]
+        self.assertAlmostEqual(obj["width"] / obj["height"], 2.0, delta=0.01)
+
+    def test_top_bottom_handles_change_only_height(self) -> None:
+        from app.voucher_edit_window import _ResizeHandle
+
+        win = self._make_window()
+        item = win.add_rect(QRectF(20.0, 20.0, 100.0, 50.0), text="r")
+        win._scene.clearSelection()
+        item.setSelected(True)
+        win._on_selection_changed()
+        handle = [h for h in win._handles
+                  if isinstance(h, _ResizeHandle) and h._position == "bottom"][0]
+        handle.setPos(QPointF(70.0, 120.0))
+        obj = win.serialize_objects()[0]
+        self.assertAlmostEqual(obj["width"], 100.0, delta=0.01)
+        self.assertGreater(obj["height"], 50.0)
+
+    def test_left_right_handles_change_only_width(self) -> None:
+        from app.voucher_edit_window import _ResizeHandle
+
+        win = self._make_window()
+        item = win.add_rect(QRectF(20.0, 20.0, 100.0, 50.0), text="r")
+        win._scene.clearSelection()
+        item.setSelected(True)
+        win._on_selection_changed()
+        handle = [h for h in win._handles
+                  if isinstance(h, _ResizeHandle) and h._position == "right"][0]
+        handle.setPos(QPointF(160.0, 45.0))
+        obj = win.serialize_objects()[0]
+        self.assertGreater(obj["width"], 100.0)
+        self.assertAlmostEqual(obj["height"], 50.0, delta=0.01)
+
+    def test_resize_does_not_go_below_minimum(self) -> None:
+        from app.voucher_edit_window import MIN_OBJECT_WIDTH, _ResizeHandle
+
+        win = self._make_window()
+        item = win.add_rect(QRectF(20.0, 20.0, 100.0, 50.0), text="r")
+        handle = _ResizeHandle(item, "right")
+        handle._resize_target(QPointF(21.0, 45.0))
+        obj = item.serialize_edit_object()
+        self.assertGreaterEqual(obj["width"], MIN_OBJECT_WIDTH)
 
 
 @unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")

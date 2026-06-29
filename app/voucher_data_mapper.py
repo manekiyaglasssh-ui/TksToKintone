@@ -46,6 +46,7 @@ _DISPLAY_NAME_ALIASES = {
     "加工仕上日": "finish_date",
     "納入先住所1": "delivery_address1",
     "受注見出摘要": "order_summary",
+    "客先注文No_10桁": "customer_order_no_10",
     "物件No": "property_no",
     "物件名称1": "property_name",
     "営業担当者コード": "sales_rep_code",
@@ -95,6 +96,10 @@ _FALLBACK_DISPLAY_KEYS = {
     "order_summary": ("30", "29"),
     "property_no": ("31", "30"),
     "property_name": ("32", "31"),
+    # 客先注文No_10桁（OLAP表示No=45）。OP列(36-44)が無いレイアウトでは
+    # _is_current_olap_layout が False になり alias 解決をすり抜けるため、
+    # 表示No=45 を明示的なフォールバックキーとして常に解決できるようにする。
+    "customer_order_no_10": ("45",),
     "sales_rep": ("34", "33"),
     "construction_rep": ("36", "35"),
     "op_type": ("40",),
@@ -154,6 +159,14 @@ def parse_denpyo_numbers(text: str) -> list[str]:
         seen.add(stripped)
         values.append(stripped)
     return values
+
+
+def is_missing_voucher_no(value: object) -> bool:
+    """伝票Noが未発行相当か判定する。空/None/ゼロのみは未発行扱い。"""
+    text = str(value or "").strip()
+    if not text:
+        return True
+    return text.isdigit() and int(text) == 0
 
 
 def extract_r1_rows(response_data: object, *, logger: logging.Logger | None = None) -> list[dict[str, str]]:
@@ -296,6 +309,7 @@ def _build_page(rows: list[dict[str, str]], today: date) -> dict[str, Any]:
         "code_no": _v(first, "customer_code"),
         "customer_name": _v(first, "customer_name"),
         "order_no": _v(first, "order_no"),
+        "customer_order_no_10": _v(first, "customer_order_no_10"),
         "issue_date": today.strftime("%y/%m/%d"),
         "delivery_date": format_date_yy_mm_dd(_v(first, "delivery_date")),
         "voucher_no": _v(first, "voucher_no"),
@@ -318,6 +332,8 @@ def _build_page(rows: list[dict[str, str]], today: date) -> dict[str, Any]:
         "total_note_upper": format_number(str(upper_total), force_int=True),
         "total_note_lower": format_number(str(lower_total), force_int=True),
         "qr_order_no": _v(first, "order_no"),
+        # 取引区分（移動伝票=8 のPDF表示制御用）。OLAP取得時に得意先コードから付与される。
+        "transaction_type": _s(first, "transaction_type"),
     }
 
 
@@ -337,7 +353,10 @@ def _detail_row(row: dict[str, str]) -> dict[str, Any]:
     upper_note = " ".join(part for part in (format_number(_v(row, "sales_unit_price"), force_int=True), upper_suffix) if part)
     lower_note = " ".join(part for part in (format_number(_v(row, "purchase_unit_price"), force_int=True), _v(row, "delivery_short_name")) if part)
     return {
-        "name": _v(row, "product_name"),
+        # 品名列の表示はトリムしない（商品名称内のブランク・前後空白を保持する）。
+        # 空判定・name=="*" 判定は別途 strip 済みの name_key / _v を使う（is_star 等）。
+        "name": _v_raw(row, "product_name"),
+        "name_key": _v(row, "product_name"),
         "item_name": _v(row, "product_name"),
         "dims": _v(row, "product_note"),
         "item_note": _v(row, "product_note"),
@@ -350,6 +369,10 @@ def _detail_row(row: dict[str, str]) -> dict[str, Any]:
         "amount_display": amount_display,
         "note_lines": [] if is_star else [line for line in (upper_note, lower_note) if line],
         "finish_date": finish,
+        # 合計欄（上下2段）算出用の元データ。表示用整形前の生値を保持する。
+        "sales_unit_price": "" if is_star else _v(row, "sales_unit_price"),
+        "purchase_unit_price": "" if is_star else _v(row, "purchase_unit_price"),
+        "ordered_quantity": "" if is_star else _v(row, "ordered_quantity"),
     }
 
 
@@ -490,6 +513,50 @@ def _v(row: dict[str, str], alias: str) -> str:
         if value:
             return value
     return ""
+
+
+def _s_raw(row: dict[str, str], key: str) -> str:
+    """値をトリムせず文字列化して返す（前後・全角・連続空白を保持する）。
+
+    `_s` と異なり strip しない。品名など、ブランクを保持したい表示用途で使う。
+    None は空文字にする。
+    """
+    value = row.get(key)
+    return "" if value is None else str(value)
+
+
+def _v_raw(row: dict[str, str], alias: str) -> str:
+    """`_v` と同じキー解決で、値だけはトリムせず生のまま返す（品名のブランク保持用）。
+
+    どのキーを採用するか（本来のキー or フォールバックキー）の判定は `_v` と同じく
+    strip 後の非空判定で行うが、返す文字列は元のブランクを保持した生値にする。
+
+    注意: alias 自体のキー（例 "product_name"）には `_with_display_name_aliases` が
+    strip 済みの値を格納しているため、raw 取得ではそれを読まず、元の表示Noキー
+    （または fallback キー）から生値を読み直す。これを怠ると先頭・末尾・全角の
+    空白が失われる。
+    """
+    for key in _raw_source_keys(row, alias):
+        if _s(row, key):
+            return _s_raw(row, key)
+    # 元キーが特定できない／全て空の場合のみ alias 値（strip 済みの可能性あり）に頼る。
+    return _s_raw(row, alias)
+
+
+def _raw_source_keys(row: dict[str, str], alias: str) -> list[str]:
+    """`_v_raw` 用に、alias の元値が入っている生値キーを優先順で返す。
+
+    現行レイアウトでは表示Noキー（例 商品名称=16）、加えて fallback キーを候補にする。
+    alias 自体のキー（strip 済み値）は含めない。
+    """
+    keys: list[str] = []
+    display = _r1_display_alias_keys().get(alias)
+    if display and _is_current_olap_layout(row):
+        keys.append(display[1])
+    for key in _fallback_keys(row, alias):
+        if key not in keys:
+            keys.append(key)
+    return keys
 
 
 def _fallback_keys(row: dict[str, str], alias: str) -> tuple[str, ...]:

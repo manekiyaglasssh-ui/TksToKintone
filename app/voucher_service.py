@@ -26,6 +26,7 @@ from reportlab.lib.utils import ImageReader
 import pypdf
 
 from app.config import resource_path
+from app.line_decorations import line_segments, normalize_line_type
 from app.path_utils import ensure_voucher_output_dir, get_default_voucher_output_dir
 from app.voucher_data_mapper import build_qr_code_image
 from app.voucher_templates import (
@@ -37,25 +38,31 @@ from app.voucher_templates import (
     FORM_ML, FORM_MR, FORM_MB, CORNER_R,
     FORM_TITLE_X, FORM_TITLE_Y, FORM_TITLE_UL_Y, FORM_TITLE_UL_HALF,
     GEN_CIRCLE_X, NOKI_LINE_X, STAMP_X, STAMP_W, STAMP_H, STAMP_GAP,
+    DELIV_STAMP_W, DELIV_STAMP_H, DELIV_STAMP_GAP,
     COMPANY_LOGO_H, COMPANY_LOGO_W, COMPANY_LOGO_X, COMPANY_NAME_Y, COMPANY_INFO_X,
     FORM_HDR_TOP, FORM_HDR_MID, FORM_HDR_BOT, FORM_HDR_LEFT, FORM_HDR_RIGHT,
-    HDR_ROW1_DIVS, HDR_ROW2_DIVS,
+    HDR_ROW1_DIVS, HDR_ROW2_DIVS, HDR_DELIVERY_X,
+    HDR_DELIVERY_RIGHT, HDR_VOUCHER_RIGHT, HDR_TRADE_RIGHT,
+    HDR_OPERATOR_X, HDR_ORDER_NO_X, HDR_AMPM_X,
     HDR_SHIAGE_LABEL_Y, HDR_SHIAGE_MONTH_DAY_Y,
+    HDR_SHIAGE_DATA_FS, HDR_SHIAGE_LABEL_FS,
+    HDR_SHIAGE_DAY_LABEL_RX, HDR_SHIAGE_MONTH_LABEL_CX,
+    HDR_SHIAGE_MONTH_DATA_RX, HDR_SHIAGE_DAY_DATA_RX,
     FORM_DETAIL_ROWS, FORM_DETAIL_ROW_H, FORM_TBL_HDR_BOT,
     FORM_DETAIL_BOT, FORM_TOTAL_ROW_H, FORM_TOTAL_BOT,
     FORM_TOTAL_CELL_LEFT, FORM_TOTAL_CELL_RIGHT,
     TBL_COLS, TBL_COL_LABELS,
     SHIZU_TBL_COLS, SHIZU_COL_LABELS, SHIZU_MAX_W_NYUKI,
-    DATA_X_PAD, HDR_DATA_Y_INNER, DET_UPPER_OFFSET, DET_LOWER_OFFSET,
+    DATA_X_PAD, HDR_DATA_Y_INNER, DET_UPPER_OFFSET, DET_LOWER_OFFSET, DET_QTY_LOWER_OFFSET,
     TBL_X_NAME, TBL_X_QTY, TBL_X_UNIT, TBL_X_AMT, TBL_X_NOTE,
     TBL_MAX_NAME, TBL_MAX_QTY, TBL_MAX_UNIT, TBL_MAX_AMT, TBL_MAX_NOTE,
     DET_NAME_RX, DET_QTY_RX, FS_DIM_LARGE, DIM_SHIFT_LEFT,
     TBL_NOTE_MID_X, TBL_NOTE_MID_PAD,
-    SUM_STAFF_X,
     FORM_SUM_GAP, FORM_SUM_TOP, FORM_SUM_BOT,
     FORM_BKNO_TOP, FORM_BKNO_BOT,
-    FORM_SUM_RIGHT, FORM_SUBROW_LBL_W,
-    TAX_NOTICE, TAX_Y,
+    FORM_SUM_RIGHT, FORM_SUBROW_LBL_W, SUM_STAFF_X,
+    TAX_Y,
+    CUSTOMER_ORDER_NO_LABEL, CUSTOMER_ORDER_NO_FONT_SIZE,
     FORM_LWR_TOP, FORM_LWR_BOT, FORM_CHK_RIGHT, FORM_RGHT_LEFT,
     FORM_LWR_LEFT, FORM_LWR_RIGHT, FORM_CUT_LEFT, FORM_CUT_TOP, FORM_CUT_BOT,
     PROC_LABELS,
@@ -75,6 +82,117 @@ _FONT_NAME = "HeiseiKakuGo-W5"
 _FONT_REGISTERED = False
 DELIVERY_MASK_RGB = (0.7, 0.7, 0.7)
 _log = logging.getLogger("tks_to_kintone_app")
+
+# ── データ部分の文字サイズ（要件2）─────────────────────────────────────────────
+# OLAPデータ・画面入力値など「データ部分」だけを拡大する。タイトル・社名・各ラベル
+# （FS_LBL=6.0 など）・加工名ラベル・固定文言・罫線はこの定数を使わず据え置く。
+DATA_FONT_SIZE = 8.6          # 旧 FS_VAL=7.8（得意先名/受注No/品名/数量/単価/金額 等）
+DETAIL_DATA_FONT_SIZE = 7.8   # 旧 FS_DIM=7.0（摘要/物件No/担当/受注見出摘要 等）
+NYUKI_DATA_FONT_SIZE = 7.0    # 旧 FS_NYUKI=6.5（指図書系 受入日列）
+
+# ── 明細データ拡大フォント（要件1・2）─────────────────────────────────────────
+# 品名列2段目の寸法表示「（○○ * ○○ ミリ）」を従来比1.5倍にする。基準は従来の
+# 寸法フォント FS_DIM_LARGE。品名1段目・加工名・摘要・ヘッダー文字は据え置く。
+DETAIL_DIM_FONT_SIZE = FS_DIM_LARGE * 1.5          # 寸法表示専用（従来 FS_DIM_LARGE の1.5倍）
+# 数量のデータ部分を従来比1.5倍にする。基準は従来のデータフォント DATA_FONT_SIZE。
+# 列ヘッダー（数量/単価/金額）は据え置く。
+DETAIL_QTY_VALUE_FONT_SIZE = DATA_FONT_SIZE * 1.5  # 数量データ専用
+# 単価・金額のデータ部分（旧 1.5倍）を現在比 0.8倍へ縮小する（結果的に基準の約1.2倍）。
+DETAIL_UNIT_PRICE_FONT_SIZE = DATA_FONT_SIZE * 1.5 * 0.8  # 単価データ専用
+DETAIL_AMOUNT_FONT_SIZE = DATA_FONT_SIZE * 1.5 * 0.8      # 金額データ専用
+
+# 品名一段目（商品名）を従来比1.2倍にする（要件3）。
+# 二段目の寸法表示（DETAIL_DIM_FONT_SIZE）・品名ヘッダーは対象外。
+DETAIL_NAME_FONT_SIZE = DATA_FONT_SIZE * 1.2       # 品名1段目（商品名）専用
+# 摘要列データを従来比1.2倍にする（要件4）。摘要ヘッダー・物件No/担当等は据え置く。
+DETAIL_NOTE_FONT_SIZE = DETAIL_DATA_FONT_SIZE * 1.2  # 摘要列データ専用
+# 表の摘要列フォント（売上伝票）。指図書系(03-06)の右端「受入日」列もこれに揃える。
+TABLE_REMARK_FONT_SIZE = DETAIL_NOTE_FONT_SIZE
+
+# ── ヘッダーデータ拡大フォント（要件1）──────────────────────────────────────────
+# 上部ヘッダーのデータ部分（コードNo/得意先名/受注No/発行日/伝票No/入力者名/仕上日/
+# 納品日/出荷区分）を現在の基準サイズから1.3倍にする。ラベル文字（コードNo・得意先名
+# など）と取引区分データは据え置く。
+HEADER_MAIN_VALUE_FONT_SIZE = DATA_FONT_SIZE * 1.3           # 主要ヘッダーデータ専用
+HEADER_NOUHIN_VALUE_FONT_SIZE = DATA_FONT_SIZE * 1.3          # 納品日データ専用
+HEADER_SHIPPING_VALUE_FONT_SIZE = DATA_FONT_SIZE * 1.3        # 出荷区分データ専用
+# 取引区分データは出荷区分データと同じサイズ（1.3倍）にする（要件1）。ラベルは据え置き。
+HEADER_TRADE_VALUE_FONT_SIZE = HEADER_SHIPPING_VALUE_FONT_SIZE  # 取引区分データ専用
+# 得意先名データは基準の1.2倍からさらに1.2倍（＝基準の1.44倍）にする。ラベルは据え置き。
+HEADER_CUSTOMER_VALUE_FONT_SIZE = DATA_FONT_SIZE * 1.2 * 1.2  # 得意先名データ専用
+HEADER_FINISH_DATE_VALUE_FONT_SIZE = HDR_SHIAGE_DATA_FS * 1.3  # 仕上日の月・日データ専用
+
+# 中央の「摘要」「物件No」のデータだけを現在サイズから1.1倍にする。
+# ラベル文字「摘　要」「物件No」は据え置く。
+SUMMARY_PREVIOUS_TEXT_SCALE = 0.8
+PROPERTY_PREVIOUS_TEXT_SCALE = 0.8
+SUMMARY_TEXT_SCALE = SUMMARY_PREVIOUS_TEXT_SCALE * 1.1
+PROPERTY_TEXT_SCALE = PROPERTY_PREVIOUS_TEXT_SCALE * 1.1
+SUMMARY_VALUE_BASE_FONT_SIZE = DETAIL_DATA_FONT_SIZE * 1.3
+PROPERTY_VALUE_BASE_FONT_SIZE = DETAIL_DATA_FONT_SIZE * 1.3
+SUMMARY_VALUE_FONT_SIZE = SUMMARY_VALUE_BASE_FONT_SIZE * SUMMARY_TEXT_SCALE
+PROPERTY_VALUE_FONT_SIZE = PROPERTY_VALUE_BASE_FONT_SIZE * PROPERTY_TEXT_SCALE
+
+# 摘要は従来の下線右端まで、担当者名データはその右側へ表示する。
+# 営業担当・工事担当の固定ラベルは描画しない。
+SUMMARY_TEXT_RIGHT = FORM_SUM_RIGHT
+STAFF_TEXT_RIGHT = STAMP_X - 8.0
+STAFF_PREVIOUS_X = SUM_STAFF_X
+STAFF_SHIFT_RIGHT = 28.35  # 約1cm
+STAFF_TEXT_X = STAFF_PREVIOUS_X + STAFF_SHIFT_RIGHT
+# 営業担当者名は摘要下段、工事担当者名は物件No行と同じベースラインに置く。
+SALES_REP_Y = FORM_SUM_BOT + 3.0
+CONSTRUCTION_REP_Y = FORM_BKNO_BOT + 3.0
+
+# 加工名一覧のラベルを基準(6.5)の1.2倍にする（要件5）。チェック欄・外枠は据え置く。
+PROCESS_LABEL_BASE_FONT_SIZE = 6.5
+PROCESS_LABEL_FONT_SIZE = PROCESS_LABEL_BASE_FONT_SIZE * 1.2  # 加工名ラベル専用
+
+# AM・PM 丸印の線幅。従来 0.9 の2倍へ太くする（前回調整済み・維持）。
+AMPM_CIRCLE_LINE_WIDTH = 1.8
+# 「AM・PM」表示文字のフォントサイズ。基準11.0を1.2倍にする（要件1）。
+AMPM_TEXT_BASE_FONT_SIZE = 11.0
+AMPM_TEXT_FONT_SIZE = AMPM_TEXT_BASE_FONT_SIZE * 1.2
+# AM/PMを囲う丸印の半径倍率。基準（基準フォント時の半径）を1.2倍にする（要件2）。
+# 線幅は AMPM_CIRCLE_LINE_WIDTH で別管理（今回は変更しない）。
+AMPM_CIRCLE_SCALE = 1.2
+# 「AM・PM」表示のベースラインY。従来は FORM_HDR_BOT+8.0（やや上寄り）だったが、
+# 行2セル(FORM_HDR_BOT〜FORM_HDR_MID)の縦中央へ下げて中央表示にする。
+# fs*0.35 は全角文字の視覚中心をベースラインへ補正する係数。丸印もこのYに追従する。
+AMPM_BASELINE_Y = (FORM_HDR_BOT + FORM_HDR_MID) / 2 - AMPM_TEXT_FONT_SIZE * 0.35
+
+# 得意先名データの右端に置く「殿」「御中」用の確保幅（pt）。得意先名が長くても
+# この分を残してクリップし、敬称と重ならないようにする（要件3）。
+CUSTOMER_HONORIFIC_RESERVE = 20.0
+
+
+def _customer_max_w() -> float:
+    """得意先名データの最大幅。受注Noセル左端の手前で「殿/御中」分を残してクリップする。"""
+    start = HDR_ROW1_DIVS[0] + DATA_X_PAD
+    return HDR_ORDER_NO_X - CUSTOMER_HONORIFIC_RESERVE - start
+
+
+# 反映先伝票の既定（旧データ互換: 指図書(1)/指図書(2)/梱包明細書）。
+DEFAULT_EDIT_TARGET_VOUCHERS = ("03", "04", "05")
+
+
+def _object_target_vouchers(obj: dict[str, Any]) -> list[str]:
+    """編集オブジェクトの反映先伝票を返す。未設定なら ["03","04","05"]（要件7 旧互換）。"""
+    targets = obj.get("target_vouchers")
+    if isinstance(targets, list) and targets:
+        return [str(v).strip() for v in targets if str(v).strip()]
+    return list(DEFAULT_EDIT_TARGET_VOUCHERS)
+
+
+def _filter_edit_objects(objects: list[dict[str, Any]] | None,
+                         voucher_id: str) -> list[dict[str, Any]]:
+    """反映先 target_vouchers に当該伝票が含まれるオブジェクトだけを抽出する（要件7）。"""
+    if not objects:
+        return []
+    return [
+        obj for obj in objects
+        if isinstance(obj, dict) and voucher_id in _object_target_vouchers(obj)
+    ]
 
 
 def _ensure_font() -> None:
@@ -106,8 +224,28 @@ def _summary_lines(data: dict[str, Any]) -> list[str]:
     return [_clean_display_text(line) for line in (list(lines) + ["", ""])[:2]]
 
 
+# 摘要上段（index=0）だけを少し上へ持ち上げ、下段（index=1）との間隔を広げる（要件6）。
+# 下段の位置は変えない。物件No行・表本体と重ならない範囲（2pt）に留める。
+SUMMARY_UPPER_SHIFT_UP = 2.0
+
+
+def _is_star_row(row: dict[str, Any]) -> bool:
+    """品名が対象外マーカー「*」の行か判定する（判定用の正規化値で比較する）。
+
+    表示用の name はトリムしないため、空白付きでも正しく判定できるよう、優先して
+    トリム済みの name_key を使い、無ければ name を strip して比較する。
+    """
+    key = row.get("name_key")
+    if key is None:
+        key = str(row.get("name", "")).strip().strip("　")
+    return key == "*"
+
+
 def _summary_line_y(index: int) -> float:
-    return FORM_SUM_BOT + 12.0 - index * 9.0
+    y = FORM_SUM_BOT + 12.0 - index * 9.0
+    if index == 0:
+        y += SUMMARY_UPPER_SHIFT_UP
+    return y
 
 
 def _draw_summary_lines(c: rl_canvas.Canvas, data: dict[str, Any], fs: float) -> None:
@@ -116,7 +254,90 @@ def _draw_summary_lines(c: rl_canvas.Canvas, data: dict[str, Any], fs: float) ->
         if not line:
             continue
         _str(c, str(line), note_line_x, _summary_line_y(index), fs,
-             max_w=FORM_SUM_RIGHT - note_line_x)
+             max_w=SUMMARY_TEXT_RIGHT - note_line_x)
+
+
+def _draw_customer_order_no(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
+    """摘要/物件No下に「お客様注文No. xxxx」を表示する（全伝票共通）。
+
+    旧・消費税固定文言があった位置・基準で表示し、
+    文字サイズは従来比1.2倍。客先注文No_10桁が空欄/None/空白のみの場合は何も描かない。
+    """
+    value = data.get("customer_order_no_10")
+    if _name_debug_enabled():
+        _log.info("customer_order_no_10 repr=%r", value)
+    text = "" if value is None else str(value).strip().strip("　")
+    if not text:
+        return
+    note_line_x = FORM_HDR_LEFT + FORM_SUBROW_LBL_W + 18.0
+    c.setFont(_FONT_NAME, CUSTOMER_ORDER_NO_FONT_SIZE)
+    c.drawString(note_line_x, TAX_Y, f"{CUSTOMER_ORDER_NO_LABEL}{text}")
+
+
+def _draw_staff_values(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
+    """営業担当・工事担当のデータだけを表示し、固定ラベルは描画しない。"""
+    values = (
+        (data.get("sales_rep", ""), SALES_REP_Y),
+        (data.get("construction_rep", ""), CONSTRUCTION_REP_Y),
+    )
+    for value, y in values:
+        if value:
+            _str(
+                c,
+                str(value),
+                STAFF_TEXT_X,
+                y,
+                DETAIL_DATA_FONT_SIZE,
+                max_w=STAFF_TEXT_RIGHT - STAFF_TEXT_X,
+            )
+
+
+# ── 移動伝票（取引区分8）専用表示 ─────────────────────────────────────────────
+# 「移動伝票」ラベルは取引区分8のとき全伝票(01〜08)に表示する。
+# 単価列・金額列の下段表示（_draw_move_slip_columns）は売上伝票(01)・工場控(02)・
+# 納品書(07) のみ対象。
+MOVE_SLIP_LABEL = "移動伝票"
+# 工事担当者名（CONSTRUCTION_REP_Y）の下に表示する。摘要/物件No/お客様注文No/QR/
+# 会社情報/担当者名と重ならない位置。文字サイズは担当者名（DETAIL_DATA_FONT_SIZE）に合わせる。
+MOVE_SLIP_LABEL_Y = CONSTRUCTION_REP_Y - 10.0
+
+
+def _draw_move_slip_label(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
+    """取引区分8のとき工事担当者名の下へ「移動伝票」を表示する（全伝票共通）。"""
+    if not is_move_slip_transaction_type(data.get("transaction_type")):
+        return
+    _str(c, MOVE_SLIP_LABEL, STAFF_TEXT_X, MOVE_SLIP_LABEL_Y, DETAIL_DATA_FONT_SIZE,
+         max_w=STAFF_TEXT_RIGHT - STAFF_TEXT_X)
+
+
+def _draw_move_slip_columns(c: rl_canvas.Canvas, data: dict[str, Any],
+                            unit_rx: float, amt_rx: float) -> None:
+    """取引区分8のとき単価列・金額列の下段、金額列合計行の下段を表示する。
+
+    （要件: 表示変更2/3/4）。上段の既存表示は変更しない。PDF表示専用の制御。
+    """
+    if not is_move_slip_transaction_type(data.get("transaction_type")):
+        return
+    details = data.get("details", [])[:FORM_DETAIL_ROWS]
+    for i, row in enumerate(details):
+        if _is_star_row(row):
+            continue
+        row_top = FORM_TBL_HDR_BOT - i * FORM_DETAIL_ROW_H
+        yl = row_top - DET_LOWER_OFFSET   # 下段ベースライン
+        unit = _parse_number_or_none(row.get("sales_unit_price"))
+        if unit is not None:
+            # 単価列下段: 売上単価（3桁区切り・右寄せ）。空欄・非数値は表示しない。
+            _rstr(c, _format_total(unit), unit_rx, yl, DETAIL_UNIT_PRICE_FONT_SIZE, max_w=TBL_MAX_UNIT)
+        qty = _parse_number_or_none(row.get("ordered_quantity"))
+        if unit is not None and qty is not None:
+            # 金額列下段: 売上単価 × 受注数量（元データの受注数量を使用・右寄せ）。
+            _rstr(c, _format_total(unit * qty), amt_rx, yl, DETAIL_AMOUNT_FONT_SIZE, max_w=TBL_MAX_AMT)
+
+    # 金額列の合計行下段: Σ(売上単価 × 受注数量)。
+    total = calculate_sales_amount_total_for_move_slip(details)
+    if total:
+        total_lower_y = FORM_DETAIL_BOT - DET_LOWER_OFFSET
+        _rstr(c, _format_total(total), amt_rx, total_lower_y, DETAIL_AMOUNT_FONT_SIZE)
 
 
 def _scene_rect_to_pdf_rect(x: float, y: float, w: float, h: float) -> tuple[float, float, float, float]:
@@ -145,6 +366,93 @@ def _extract_note_number(s: str) -> float:
     if m:
         return float(m.group(1).replace(',', ''))
     return 0.0
+
+
+def _to_number(value: object) -> float:
+    """単価・受注数量を数値へ変換する。空欄・非数値・記号付きは0扱い。
+
+    表示用に '*' やカンマが付いた値でも数値部分のみを取り出す。
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    m = re.search(r'-?[\d,]*\.?\d+', str(value).replace(',', ''))
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return 0.0
+
+
+def calculate_unit_price_totals(rows: list[dict]) -> tuple[float, float]:
+    """伝票ページの明細行から合計欄の上下2段を算出する。
+
+    上段(sales_total)   = Σ(売上単価 × 受注数量)
+    下段(purchase_total) = Σ(仕入単価 × 受注数量)
+
+    金額列の合計ではなく、各行の元データ（売上単価・仕入単価・受注数量）から
+    計算する。'*' 行（対象外行）や空行は合計に含めない。空欄・非数値は0扱い。
+    """
+    sales_total = 0.0
+    purchase_total = 0.0
+    for row in rows:
+        if _is_star_row(row):
+            continue
+        qty = _to_number(row.get("ordered_quantity"))
+        sales_total += _to_number(row.get("sales_unit_price")) * qty
+        purchase_total += _to_number(row.get("purchase_unit_price")) * qty
+    return sales_total, purchase_total
+
+
+def is_move_slip_transaction_type(value: Any) -> bool:
+    """取引区分が8（移動伝票）か判定する。文字列 "8"・数値 8 の両方を許容する。"""
+    if value is None:
+        return False
+    text = str(value).strip()
+    if text == "8":
+        return True
+    try:
+        return float(text) == 8.0
+    except ValueError:
+        return False
+
+
+def _parse_number_or_none(value: Any) -> float | None:
+    """数値変換できれば float、空欄・非数値なら None を返す（移動伝票の下段表示判定用）。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    m = re.search(r'-?[\d,]*\.?\d+', text.replace(',', ''))
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def calculate_sales_amount_total_for_move_slip(rows: list[dict]) -> float:
+    """移動伝票(取引区分8)の金額列合計行下段 Σ(売上単価 × 受注数量) を算出する。
+
+    name == "*" の対象外行・空行は対象外。空欄・非数値は0扱い。元データの受注数量を使う。
+    右下合計欄の calculate_unit_price_totals とは役割が別（金額列の移動伝票専用合計）。
+    """
+    total = 0.0
+    for row in rows:
+        if _is_star_row(row):
+            continue
+        qty = _to_number(row.get("ordered_quantity"))
+        total += _to_number(row.get("sales_unit_price")) * qty
+    return total
+
+
+def _format_total(value: float) -> str:
+    """合計欄の表示整形。3桁区切り・整数なら小数なし、小数が出れば2桁に丸める。"""
+    return f"{value:,.0f}" if value == int(value) else f"{value:,.2f}"
 
 
 def _is_date_str(s: str) -> bool:
@@ -184,6 +492,28 @@ def _str(c: rl_canvas.Canvas, text: str, x: float, y: float, fs: float,
     if max_w:
         text = _clip(c, text, max_w, fs)
     c.drawString(x, y, text)
+
+
+def _name_debug_enabled() -> bool:
+    """品名（商品名称）の描画直前デバッグログを出すか。
+
+    通常は無効。テスト・デバッグ時に環境変数 VOUCHER_NAME_DEBUG を真値にすると、
+    PDF描画直前の品名文字列を repr 形式でログ出力する（先頭スペース保持の確認用）。
+    """
+    return str(os.environ.get("VOUCHER_NAME_DEBUG") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _str_name(c: rl_canvas.Canvas, text: str, x: float, y: float, fs: float,
+              max_w: float | None = None) -> None:
+    """品名列の描画。先頭・末尾・連続スペースを保持したまま `_str` で描く。
+
+    `_str` 同様トリムは一切行わない。デバッグ時のみ描画直前の値を repr で記録する。
+    """
+    if _name_debug_enabled():
+        _log.info("product_name_display repr=%r", text)
+    _str(c, text, x, y, fs, max_w=max_w)
 
 
 def _cstr(c: rl_canvas.Canvas, text: str, cx: float, y: float, fs: float,
@@ -378,26 +708,25 @@ def _draw_form_structure_01(c: rl_canvas.Canvas,
         c.drawString(x + 1.5, y, text)
 
     r1_lbl_y = FORM_HDR_TOP - 8.0
-    lbl("コードNo", FORM_HDR_LEFT, r1_lbl_y)
-    lbl("得意先名", 90.0,          r1_lbl_y)
-    lbl("受注No",   284.0,         r1_lbl_y)
-    lbl("仕上日",   371.0,         HDR_SHIAGE_LABEL_Y)
-    c.drawString(FORM_HDR_RIGHT - 28.0 - FINISH_DATE_SHIFT, HDR_SHIAGE_MONTH_DAY_Y, "月")
-    c.drawRightString(FORM_HDR_RIGHT - 4.0 - FINISH_DATE_SHIFT, HDR_SHIAGE_MONTH_DAY_Y, "日")
+    lbl("コードNo", FORM_HDR_LEFT,     r1_lbl_y)
+    lbl("得意先名", HDR_ROW1_DIVS[0],  r1_lbl_y)
+    lbl("受注No",   HDR_ORDER_NO_X,             r1_lbl_y)
+    lbl("仕上日",   HDR_ROW1_DIVS[-1], HDR_SHIAGE_LABEL_Y)
+    _draw_shiage_month_day_labels(c)
 
     # 「殿」── 得意先名欄の右寄り。左罫線は描かない。
     c.setFont(_FONT_NAME, 11)
-    c.drawRightString(279.0, (FORM_HDR_MID + FORM_HDR_TOP) / 2 - 5.0, "殿")
+    c.drawRightString(HDR_ORDER_NO_X - 5.0, (FORM_HDR_MID + FORM_HDR_TOP) / 2 - 5.0, "殿")
 
     r2_lbl_y = FORM_HDR_MID - 8.0
     lbl("発行日",   FORM_HDR_LEFT, r2_lbl_y)
-    lbl("納品日",   90.0,          r2_lbl_y)
-    lbl("伝票No",   145.0,         r2_lbl_y)
-    lbl("取引区分", 197.0,         r2_lbl_y)
-    lbl("出荷区分", 245.0,         r2_lbl_y)
-    lbl("入力者名", 284.0,         r2_lbl_y)
-    c.setFont(_FONT_NAME, 11.0)
-    c.drawCentredString((371.0 + FORM_HDR_RIGHT) / 2, FORM_HDR_BOT + 8.0, "AM・PM")
+    lbl("納品日",   HDR_DELIVERY_X, r2_lbl_y)
+    lbl("伝票No",   HDR_DELIVERY_RIGHT,         r2_lbl_y)
+    lbl("取引区分", HDR_VOUCHER_RIGHT,         r2_lbl_y)
+    lbl("出荷区分", HDR_TRADE_RIGHT,         r2_lbl_y)
+    lbl("入力者名", HDR_OPERATOR_X,         r2_lbl_y)
+    c.setFont(_FONT_NAME, AMPM_TEXT_FONT_SIZE)
+    c.drawCentredString((HDR_AMPM_X + FORM_HDR_RIGHT) / 2, AMPM_BASELINE_Y, "AM・PM")
 
     # ─── 明細テーブル外枠（角丸）──────────────────────────────────────────────
     table_left = TBL_COLS[0]
@@ -486,10 +815,6 @@ def _draw_form_structure_01(c: rl_canvas.Canvas,
     c.drawString(FORM_HDR_LEFT + 18.0, FORM_BKNO_BOT + 3.0, "物件No")
     c.line(note_line_x, FORM_BKNO_BOT, FORM_SUM_RIGHT, FORM_BKNO_BOT)
 
-    # ─── 消費税注記 ────────────────────────────────────────────────────────────
-    c.setFont(_FONT_NAME, 7.5)
-    c.drawString(note_line_x, TAX_Y, TAX_NOTICE)
-
     # ─── 下部チェック欄・右側大枠 ────────────────────────────────────────────
     _draw_lower_section(c)
 
@@ -521,8 +846,9 @@ def _draw_lower_section(c: rl_canvas.Canvas) -> None:
         item_bot = item_top - item_h
         if i > 0:
             c.line(ML, item_top, CHK_R, item_top)
-        c.setFont(_FONT_NAME, 6.5)
-        c.drawString(ML + 3.0, item_bot + (item_h - 6.5) / 2 + 0.5, label)
+        # 加工名ラベルは1.2倍（要件5）。各セル内で縦中央寄せにし枠線と重ならないようにする。
+        c.setFont(_FONT_NAME, PROCESS_LABEL_FONT_SIZE)
+        c.drawString(ML + 3.0, item_bot + (item_h - PROCESS_LABEL_FONT_SIZE) / 2 + 0.5, label)
         cb_x = CHK_R - CB_W - 3.0
         cb_y = item_bot + (item_h - CB_H) / 2
         c.rect(cb_x, cb_y, CB_W, CB_H)
@@ -547,17 +873,23 @@ def _draw_lower_section(c: rl_canvas.Canvas) -> None:
 # 売上伝票(01)・工場控(02)・指図書系(03-06) に共通で重ねて描画する。
 # 納品書(07)・受領書(08) では呼び出さない（仕上日/AM-PM欄をマスクしているため）。
 
-# 仕上日（月・日）表示の左シフト量。月/日ラベルごと少し左へ寄せる（約3mm）。
-# 01〜06 の仕上日欄にのみ適用し、07納品書・08受領書には適用しない。
-FINISH_DATE_SHIFT: float = 8.0
+def _draw_shiage_month_day_labels(c: rl_canvas.Canvas) -> None:
+    """仕上日サブセルの「月」（中央寄せ）「日」（右寄せ）ラベルを描画する（要件3）。
+
+    01〜06 の仕上日欄で共通利用する。月・日の数値データ（_draw_header_finish_date）は
+    各ラベルの左側に右寄せ配置されるため、ここでラベルだけを固定位置に描く。
+    """
+    c.setFont(_FONT_NAME, HDR_SHIAGE_LABEL_FS)
+    c.drawCentredString(HDR_SHIAGE_MONTH_LABEL_CX, HDR_SHIAGE_MONTH_DAY_Y, "月")
+    c.drawRightString(HDR_SHIAGE_DAY_LABEL_RX, HDR_SHIAGE_MONTH_DAY_Y, "日")
 
 
 def _draw_header_finish_date(c: rl_canvas.Canvas, finish_date: Any) -> None:
     """画面行設定の仕上日をヘッダー「仕上日」欄へ 〇月〇日 形式で描画する。
 
     OLAP取得データに仕上日があっても、画面で設定した値（finish_date）を優先する。
-    既存フォームの「月」「日」ラベル位置に合わせて月・日の数値だけを埋める。
-    全体を FINISH_DATE_SHIFT 分だけ左へ寄せる（ラベルも同量左に寄せて重ならないようにする）。
+    月の数値は「月」ラベルの左、日の数値は「日」ラベルの左へ大きめフォントで
+    右寄せ配置し、「月」「日」ラベルと重ならないようにする（要件3）。
     """
     if not finish_date:
         return
@@ -565,35 +897,41 @@ def _draw_header_finish_date(c: rl_canvas.Canvas, finish_date: Any) -> None:
     day = getattr(finish_date, "day", None)
     if month is None or day is None:
         return
-    c.setFont(_FONT_NAME, 8.0)
-    # 「月」ラベルは FORM_HDR_RIGHT - 28、「日」ラベルは右揃え FORM_HDR_RIGHT - 4。
-    c.drawRightString(FORM_HDR_RIGHT - 30.0 - FINISH_DATE_SHIFT, HDR_SHIAGE_MONTH_DAY_Y, str(month))
-    c.drawRightString(FORM_HDR_RIGHT - 8.0 - FINISH_DATE_SHIFT, HDR_SHIAGE_MONTH_DAY_Y, str(day))
+    c.setFont(_FONT_NAME, HEADER_FINISH_DATE_VALUE_FONT_SIZE)
+    c.drawRightString(HDR_SHIAGE_MONTH_DATA_RX, HDR_SHIAGE_MONTH_DAY_Y, str(month))
+    c.drawRightString(HDR_SHIAGE_DAY_DATA_RX, HDR_SHIAGE_MONTH_DAY_Y, str(day))
 
 
 def _draw_ampm_circle(c: rl_canvas.Canvas, am_pm: Any) -> None:
-    """画面行設定の AM/PM に応じて「AM・PM」欄の該当文字へ丸印を描画する。"""
-    if not am_pm:
+    """画面行設定の AM/PM に応じて「AM・PM」欄の該当文字へ丸印を描画する。
+
+    「なし」（"none" / 空）の場合は AM・PM のどちらにも丸を付けない（要件1）。
+    """
+    stripped = str(am_pm or "").strip()
+    if not stripped or stripped.lower() == "none":
         return
-    fs = 11.0
-    baseline = FORM_HDR_BOT + 8.0
-    cx = (371.0 + FORM_HDR_RIGHT) / 2
+    # 文字は1.2倍（要件1）。丸の中心位置は実際に描画される1.2倍テキストに合わせて算出する。
+    fs = AMPM_TEXT_FONT_SIZE
+    base_fs = AMPM_TEXT_BASE_FONT_SIZE
+    baseline = AMPM_BASELINE_Y
+    cx = (HDR_AMPM_X + FORM_HDR_RIGHT) / 2
     total_w = c.stringWidth("AM・PM", _FONT_NAME, fs)
     left = cx - total_w / 2
     am_w = c.stringWidth("AM", _FONT_NAME, fs)
     sep_w = c.stringWidth("・", _FONT_NAME, fs)
     pm_w = c.stringWidth("PM", _FONT_NAME, fs)
-    if str(am_pm).strip().upper().startswith("P"):
+    if stripped.upper().startswith("P"):
         seg_center = left + am_w + sep_w + pm_w / 2
-        seg_w = pm_w
+        base_seg_w = c.stringWidth("PM", _FONT_NAME, base_fs)
     else:
         seg_center = left + am_w / 2
-        seg_w = am_w
+        base_seg_w = c.stringWidth("AM", _FONT_NAME, base_fs)
     cy = baseline + fs * 0.32
-    rx = seg_w / 2 + 3.0
-    ry = fs * 0.62
+    # 丸の半径は基準フォント時の半径を1.2倍にする（要件2）。線幅は別管理で変更しない。
+    rx = (base_seg_w / 2 + 3.0) * AMPM_CIRCLE_SCALE
+    ry = (base_fs * 0.62) * AMPM_CIRCLE_SCALE
     c.saveState()
-    c.setLineWidth(0.9)
+    c.setLineWidth(AMPM_CIRCLE_LINE_WIDTH)
     c.ellipse(seg_center - rx, cy - ry, seg_center + rx, cy + ry, stroke=1, fill=0)
     c.restoreState()
 
@@ -669,9 +1007,9 @@ def _draw_special_notes_section(c: rl_canvas.Canvas) -> None:
 
 def _draw_delivery_stamp_boxes(c: rl_canvas.Canvas) -> None:
     """受領書中央右側の検印/配送者印枠を描画する。"""
-    box_w = 42.0
-    box_h = 32.0
-    gap = 8.0
+    box_w = DELIV_STAMP_W
+    box_h = DELIV_STAMP_H
+    gap = DELIV_STAMP_GAP
     x = STAMP_X - box_w - gap
     y = FORM_SUM_TOP - box_h - 2.0
     for index, title in enumerate(("検印", "配送者印")):
@@ -786,23 +1124,22 @@ def _draw_form_structure_shizu(c: rl_canvas.Canvas, title: str,
         c.drawString(x + 1.5, y, text)
 
     r1_lbl_y = FORM_HDR_TOP - 8.0
-    lbl("コードNo", FORM_HDR_LEFT, r1_lbl_y)
-    lbl("得意先名", 90.0,          r1_lbl_y)
-    lbl("受注No",   284.0,         r1_lbl_y)
-    lbl("仕上日",   371.0,         HDR_SHIAGE_LABEL_Y)
-    c.drawString(FORM_HDR_RIGHT - 28.0 - FINISH_DATE_SHIFT, HDR_SHIAGE_MONTH_DAY_Y, "月")
-    c.drawRightString(FORM_HDR_RIGHT - 4.0 - FINISH_DATE_SHIFT, HDR_SHIAGE_MONTH_DAY_Y, "日")
+    lbl("コードNo", FORM_HDR_LEFT,     r1_lbl_y)
+    lbl("得意先名", HDR_ROW1_DIVS[0],  r1_lbl_y)
+    lbl("受注No",   HDR_ORDER_NO_X,             r1_lbl_y)
+    lbl("仕上日",   HDR_ROW1_DIVS[-1], HDR_SHIAGE_LABEL_Y)
+    _draw_shiage_month_day_labels(c)
     c.setFont(_FONT_NAME, 11)
-    c.drawRightString(279.0, (FORM_HDR_MID + FORM_HDR_TOP) / 2 - 5.0, "殿")
+    c.drawRightString(HDR_ORDER_NO_X - 5.0, (FORM_HDR_MID + FORM_HDR_TOP) / 2 - 5.0, "殿")
     r2_lbl_y = FORM_HDR_MID - 8.0
     lbl("発行日",   FORM_HDR_LEFT, r2_lbl_y)
-    lbl("納品日",   90.0,          r2_lbl_y)
-    lbl("伝票No",   145.0,         r2_lbl_y)
-    lbl("取引区分", 197.0,         r2_lbl_y)
-    lbl("出荷区分", 245.0,         r2_lbl_y)
-    lbl("入力者名", 284.0,         r2_lbl_y)
-    c.setFont(_FONT_NAME, 11.0)
-    c.drawCentredString((371.0 + FORM_HDR_RIGHT) / 2, FORM_HDR_BOT + 8.0, "AM・PM")
+    lbl("納品日",   HDR_DELIVERY_X, r2_lbl_y)
+    lbl("伝票No",   HDR_DELIVERY_RIGHT,         r2_lbl_y)
+    lbl("取引区分", HDR_VOUCHER_RIGHT,         r2_lbl_y)
+    lbl("出荷区分", HDR_TRADE_RIGHT,         r2_lbl_y)
+    lbl("入力者名", HDR_OPERATOR_X,         r2_lbl_y)
+    c.setFont(_FONT_NAME, AMPM_TEXT_FONT_SIZE)
+    c.drawCentredString((HDR_AMPM_X + FORM_HDR_RIGHT) / 2, AMPM_BASELINE_Y, "AM・PM")
 
     # ─── 明細テーブル（指図書系: 合計行なし）────────────────────────────────
     table_left  = SHIZU_TBL_COLS[0]
@@ -853,10 +1190,6 @@ def _draw_form_structure_shizu(c: rl_canvas.Canvas, title: str,
     c.drawString(FORM_HDR_LEFT + 18.0, FORM_BKNO_BOT + 3.0, "物件No")
     c.line(note_line_x, FORM_BKNO_BOT, FORM_SUM_RIGHT, FORM_BKNO_BOT)
 
-    # ─── 消費税注記 ────────────────────────────────────────────────────────────
-    c.setFont(_FONT_NAME, 7.5)
-    c.drawString(note_line_x, TAX_Y, TAX_NOTICE)
-
     # ─── 下部チェック欄 ───────────────────────────────────────────────────────
     _draw_lower_section(c)
 
@@ -867,8 +1200,8 @@ def _draw_form_structure_shizu(c: rl_canvas.Canvas, title: str,
 
 def _draw_form_data_shizu(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
     """指図書系フォームにデータを印字する（品名・数量・受入日のみ表示）。"""
-    FS_VAL = 7.8
-    FS_DIM = 7.0
+    FS_VAL = DATA_FONT_SIZE
+    FS_DIM = DETAIL_DATA_FONT_SIZE
 
     def val(text: str, x: float, y: float, fs: float = FS_VAL,
             max_w: float | None = None) -> None:
@@ -889,25 +1222,34 @@ def _draw_form_data_shizu(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
         if tel_fax:
             c.drawString(COMPANY_INFO_X, COMPANY_NAME_Y - 21.0, tel_fax)
 
-    # ヘッダー行1
+    # ヘッダー行1（データは1.3倍・下線ギリギリまで下寄せ。要件1/3）
     r1_y = FORM_HDR_MID + HDR_DATA_Y_INNER
-    val(data.get("code_no", ""),       x=FORM_HDR_LEFT + DATA_X_PAD, y=r1_y)
-    val(data.get("customer_name", ""), x=90.0 + DATA_X_PAD,          y=r1_y, max_w=178.0)
-    val(data.get("order_no", ""),      x=284.0 + DATA_X_PAD,         y=r1_y)
+    val(data.get("code_no", ""),       x=FORM_HDR_LEFT + DATA_X_PAD, y=r1_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_ROW1_DIVS[0] - FORM_HDR_LEFT - DATA_X_PAD)
+    val(data.get("customer_name", ""), x=HDR_ROW1_DIVS[0] + DATA_X_PAD, y=r1_y,
+        fs=HEADER_CUSTOMER_VALUE_FONT_SIZE, max_w=_customer_max_w())
+    val(data.get("order_no", ""),      x=HDR_ORDER_NO_X + DATA_X_PAD, y=r1_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_AMPM_X - HDR_ORDER_NO_X - DATA_X_PAD)
 
-    # ヘッダー行2
+    # ヘッダー行2（データは1.3倍。取引区分データも出荷区分と同じ1.3倍・要件1）
     r2_y = FORM_HDR_BOT + HDR_DATA_Y_INNER
-    val(data.get("issue_date", ""),    x=FORM_HDR_LEFT + DATA_X_PAD, y=r2_y)
-    val(data.get("delivery_date", ""), x=90.0 + DATA_X_PAD,          y=r2_y)
-    val(data.get("voucher_no", ""),    x=145.0 + DATA_X_PAD,         y=r2_y)
-    val(data.get("trade_type", ""),    x=197.0 + DATA_X_PAD,         y=r2_y)
-    val(data.get("ship_type", ""),     x=245.0 + DATA_X_PAD,         y=r2_y)
-    val(data.get("operator", ""),      x=284.0 + DATA_X_PAD,         y=r2_y, max_w=80.0)
+    val(data.get("issue_date", ""),    x=FORM_HDR_LEFT + DATA_X_PAD, y=r2_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_DELIVERY_X - FORM_HDR_LEFT - DATA_X_PAD)
+    val(data.get("delivery_date", ""), x=HDR_DELIVERY_X + DATA_X_PAD,  y=r2_y, fs=HEADER_NOUHIN_VALUE_FONT_SIZE, max_w=HDR_DELIVERY_RIGHT - HDR_DELIVERY_X - DATA_X_PAD)
+    val(data.get("voucher_no", ""),    x=HDR_DELIVERY_RIGHT + DATA_X_PAD, y=r2_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_VOUCHER_RIGHT - HDR_DELIVERY_RIGHT - DATA_X_PAD)
+    val(data.get("trade_type", ""),    x=HDR_VOUCHER_RIGHT + DATA_X_PAD, y=r2_y,
+        fs=HEADER_TRADE_VALUE_FONT_SIZE, max_w=HDR_TRADE_RIGHT - HDR_VOUCHER_RIGHT - DATA_X_PAD)
+    val(data.get("ship_type", ""),     x=HDR_TRADE_RIGHT + DATA_X_PAD, y=r2_y,
+        fs=HEADER_SHIPPING_VALUE_FONT_SIZE, max_w=HDR_OPERATOR_X - HDR_TRADE_RIGHT - DATA_X_PAD)
+    val(data.get("operator", ""),      x=HDR_OPERATOR_X + DATA_X_PAD, y=r2_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_AMPM_X - HDR_OPERATOR_X - DATA_X_PAD)
 
     # 受入日列の表示X。日付/場所は「加」のすぐ右の同一列に揃える。
     nyuki_x = SHIZU_TBL_COLS[-2] + DATA_X_PAD   # 受入日列左端（636.5pt）
     nyuki_data_x = nyuki_x + 16.0
-    FS_NYUKI = 6.5
+    # 右端「受入日」列は売上伝票の摘要列と同じフォントサイズに揃える。
+    FS_NYUKI = TABLE_REMARK_FONT_SIZE
 
     # 明細行
     details = data.get("details", [])[:FORM_DETAIL_ROWS]
@@ -916,16 +1258,18 @@ def _draw_form_data_shizu(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
         yu = row_top - DET_UPPER_OFFSET
         yl = row_top - DET_LOWER_OFFSET
 
-        is_star = row.get("name", "") == "*"
+        is_star = _is_star_row(row)
 
         # 品名（1段目=左寄せ、2段目=右寄せ大フォント）
-        _str(c, row.get("name", ""), TBL_X_NAME, yu, FS_VAL, max_w=TBL_MAX_NAME)
-        _rstr(c, row.get("dims", ""), DET_NAME_RX - DIM_SHIFT_LEFT, yl, FS_DIM_LARGE, max_w=TBL_MAX_NAME)
+        _str_name(c, row.get("name", ""), TBL_X_NAME, yu, DETAIL_NAME_FONT_SIZE, max_w=TBL_MAX_NAME)
+        _rstr(c, row.get("dims", ""), DET_NAME_RX - DIM_SHIFT_LEFT, yl, DETAIL_DIM_FONT_SIZE, max_w=TBL_MAX_NAME)
 
         if not is_star:
             # 数量（1段目=左寄せ、2段目=右寄せ）
             _str(c, row.get("qty_spec", ""), TBL_X_QTY, yu, FS_VAL, max_w=TBL_MAX_QTY)
-            _rstr(c, row.get("qty", ""), DET_QTY_RX, yl, FS_VAL, max_w=TBL_MAX_QTY)
+            # 数量2段目はセル中央あたりへ寄せる（要件3）。他列の下段(yl)より上に置く。
+            _rstr(c, row.get("qty", ""), DET_QTY_RX, row_top - DET_QTY_LOWER_OFFSET,
+                  DETAIL_QTY_VALUE_FONT_SIZE, max_w=TBL_MAX_QTY)
 
             # 受入日列: 加工記号は左、日付/場所はそのすぐ右に揃える。
             notes = row.get("note_lines", [])
@@ -944,22 +1288,16 @@ def _draw_form_data_shizu(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
             if txt1:
                 _str(c, txt1, nyuki_data_x, yl, FS_NYUKI, max_w=SHIZU_MAX_W_NYUKI)
 
-    # 摘要 / 物件No データ
+    # 摘要 / 物件No データ（直前バージョンのサイズから1.1倍）
     note_line_x = FORM_HDR_LEFT + FORM_SUBROW_LBL_W + 18.0
-    _draw_summary_lines(c, data, FS_DIM)
+    _draw_summary_lines(c, data, SUMMARY_VALUE_FONT_SIZE)
+    _draw_staff_values(c, data)
     for index, line in enumerate(
         [line for line in data.get("property_lines", []) if line][:1]
     ):
         val(str(line), x=note_line_x, y=FORM_BKNO_BOT + 3.0 + index * 9.0,
-            fs=FS_DIM, max_w=FORM_SUM_RIGHT - note_line_x)
-
-    # 営業担当（ラベル常時表示）
-    sales_rep = str(data.get("sales_rep", "") or "")
-    _str(c, f"営業担当：{sales_rep}", SUM_STAFF_X, FORM_SUM_BOT + 6.0, FS_DIM)
-
-    # 工事担当（ラベル常時表示）
-    construction_rep = str(data.get("construction_rep", "") or "")
-    _str(c, f"工事担当：{construction_rep}", SUM_STAFF_X, FORM_BKNO_BOT + 4.0, FS_DIM)
+            fs=PROPERTY_VALUE_FONT_SIZE, max_w=SUMMARY_TEXT_RIGHT - note_line_x)
+    _draw_customer_order_no(c, data)
 
     # QR コード
     qr_order_no = str(data.get("qr_order_no") or data.get("order_no") or "")
@@ -970,6 +1308,10 @@ def _draw_form_data_shizu(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
 
     # 画面行設定（仕上日・AM/PM・加工名チェック）を反映
     _draw_row_settings(c, data)
+
+    # 移動伝票(取引区分8)ラベル（指図書(1)/(2)・梱包明細書・配送指示書共通）。
+    # 単価列・金額列の下段表示は対象外（売上伝票/工場控/納品書のみ）。
+    _draw_move_slip_label(c, data)
 
 
 def _draw_form_shizu(c: rl_canvas.Canvas, data: dict[str, Any],
@@ -1042,17 +1384,74 @@ def _draw_edit_objects(c: rl_canvas.Canvas,
                 c.setLineWidth(float(obj.get("line_width") or 1.0))
                 x1 = float(obj.get("x1", 0.0)); y1 = float(obj.get("y1", 0.0))
                 x2 = float(obj.get("x2", 0.0)); y2 = float(obj.get("y2", 0.0))
+                line_type = normalize_line_type(obj.get("line_type"))
                 pdf_x1, pdf_y1, pdf_x2, pdf_y2 = _scene_line_to_pdf(x1, y1, x2, y2)
                 _log.debug(
-                    "edit_object object_id=%s type=%s scene_x1=%s scene_y1=%s "
-                    "scene_x2=%s scene_y2=%s pdf_x1=%s pdf_y1=%s "
-                    "pdf_x2=%s pdf_y2=%s PAGE_W=%s PAGE_H=%s",
-                    obj_id, obj_type, x1, y1, x2, y2, pdf_x1, pdf_y1,
+                    "edit_object object_id=%s type=%s line_type=%s "
+                    "scene_x1=%s scene_y1=%s scene_x2=%s scene_y2=%s "
+                    "pdf_x1=%s pdf_y1=%s pdf_x2=%s pdf_y2=%s PAGE_W=%s PAGE_H=%s",
+                    obj_id, obj_type, line_type, x1, y1, x2, y2, pdf_x1, pdf_y1,
                     pdf_x2, pdf_y2, PAGE_W, PAGE_H,
                 )
-                c.line(pdf_x1, pdf_y1, pdf_x2, pdf_y2)
+                # 矢じり線分・二重平行線は scene 座標で計算し、各端点を PDF 座標へ
+                # 変換して描く（編集画面と同じ line_decorations ロジックを使う）。
+                for sx1, sy1, sx2, sy2 in line_segments(line_type, x1, y1, x2, y2):
+                    px1, py1, px2, py2 = _scene_line_to_pdf(sx1, sy1, sx2, sy2)
+                    c.line(px1, py1, px2, py2)
                 if debug_boxes:
                     _draw_debug_line_points(c, pdf_x1, pdf_y1, pdf_x2, pdf_y2)
+            elif obj_type == "freehand":
+                # 手書きフリーハンド。scene座標の points をPDF座標へ変換し、丸い継ぎ目の
+                # ポリラインとして描く（編集画面と同じ見え方・同じ位置に出す）。
+                c.setLineWidth(float(obj.get("pen_width") or obj.get("line_width") or 1.0))
+                c.setLineCap(1)   # round cap
+                c.setLineJoin(1)  # round join
+                raw_points = obj.get("points") or []
+                pdf_points: list[tuple[float, float]] = []
+                for p in raw_points:
+                    try:
+                        sx = float(p[0]); sy = float(p[1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    pdf_points.append(_scene_point_to_pdf_point(sx, sy))
+                if len(pdf_points) >= 2:
+                    path = c.beginPath()
+                    path.moveTo(pdf_points[0][0], pdf_points[0][1])
+                    for px, py in pdf_points[1:]:
+                        path.lineTo(px, py)
+                    c.drawPath(path, stroke=1, fill=0)
+            elif obj_type == "freehand_layer":
+                # 手書きレイヤー。visible=false は描画しない（要件6）。各 stroke の
+                # pen_width / stroke_color を反映し、scene座標をPDF座標へ変換して描く。
+                if not bool(obj.get("visible", True)):
+                    pass
+                else:
+                    c.setLineCap(1)   # round cap
+                    c.setLineJoin(1)  # round join
+                    layer_pw = float(obj.get("pen_width") or obj.get("line_width") or 1.0)
+                    layer_color = obj.get("stroke_color") or "#000000"
+                    for stroke in (obj.get("strokes") or []):
+                        if not isinstance(stroke, dict):
+                            continue
+                        raw_points = stroke.get("points") or []
+                        pdf_points = []
+                        for p in raw_points:
+                            try:
+                                sx = float(p[0]); sy = float(p[1])
+                            except (TypeError, ValueError, IndexError):
+                                continue
+                            pdf_points.append(_scene_point_to_pdf_point(sx, sy))
+                        if len(pdf_points) < 2:
+                            continue
+                        c.setLineWidth(float(stroke.get("pen_width") or layer_pw))
+                        s_rgb = _coerce_rgb(stroke.get("stroke_color") or layer_color)
+                        if s_rgb is not None:
+                            c.setStrokeColorRGB(*s_rgb)
+                        path = c.beginPath()
+                        path.moveTo(pdf_points[0][0], pdf_points[0][1])
+                        for px, py in pdf_points[1:]:
+                            path.lineTo(px, py)
+                        c.drawPath(path, stroke=1, fill=0)
             elif obj_type == "rectangle":
                 scene_x = float(obj.get("x", 0.0)); scene_y = float(obj.get("y", 0.0))
                 w = float(obj.get("width") or obj.get("w") or 0.0)
@@ -1311,8 +1710,8 @@ def _build_scratch_shizu(data: dict[str, Any], title: str,
 
 def _draw_form_data_01(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
     """アプリ描画方式フォームにデータを印字する。"""
-    FS_VAL = 7.8
-    FS_DIM = 7.0
+    FS_VAL = DATA_FONT_SIZE
+    FS_DIM = DETAIL_DATA_FONT_SIZE
 
     def val(text: str, x: float, y: float, fs: float = FS_VAL,
             max_w: float | None = None) -> None:
@@ -1330,20 +1729,28 @@ def _draw_form_data_01(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
         if tel_fax:
             c.drawString(COMPANY_INFO_X, COMPANY_NAME_Y - 21.0, tel_fax)
 
-    # ヘッダー行1（ベースライン: 行2境界 + HDR_DATA_Y_INNER）
+    # ヘッダー行1（ベースライン: 下線ギリギリまで下寄せ。データは1.3倍・要件1/3）
     r1_y = FORM_HDR_MID + HDR_DATA_Y_INNER
-    val(data.get("code_no", ""),       x=FORM_HDR_LEFT + DATA_X_PAD, y=r1_y)
-    val(data.get("customer_name", ""), x=90.0 + DATA_X_PAD,          y=r1_y, max_w=178.0)
-    val(data.get("order_no", ""),      x=284.0 + DATA_X_PAD,         y=r1_y)
+    val(data.get("code_no", ""),       x=FORM_HDR_LEFT + DATA_X_PAD, y=r1_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_ROW1_DIVS[0] - FORM_HDR_LEFT - DATA_X_PAD)
+    val(data.get("customer_name", ""), x=HDR_ROW1_DIVS[0] + DATA_X_PAD, y=r1_y,
+        fs=HEADER_CUSTOMER_VALUE_FONT_SIZE, max_w=_customer_max_w())
+    val(data.get("order_no", ""),      x=HDR_ORDER_NO_X + DATA_X_PAD, y=r1_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_AMPM_X - HDR_ORDER_NO_X - DATA_X_PAD)
 
-    # ヘッダー行2
+    # ヘッダー行2（データは1.3倍・要件1/3。取引区分データも出荷区分と同じ1.3倍・要件1）
     r2_y = FORM_HDR_BOT + HDR_DATA_Y_INNER
-    val(data.get("issue_date", ""),    x=FORM_HDR_LEFT + DATA_X_PAD, y=r2_y)
-    val(data.get("delivery_date", ""), x=90.0 + DATA_X_PAD,          y=r2_y)
-    val(data.get("voucher_no", ""),    x=145.0 + DATA_X_PAD,         y=r2_y)
-    val(data.get("trade_type", ""),    x=197.0 + DATA_X_PAD,         y=r2_y)
-    val(data.get("ship_type", ""),     x=245.0 + DATA_X_PAD,         y=r2_y)
-    val(data.get("operator", ""),      x=284.0 + DATA_X_PAD,         y=r2_y, max_w=80.0)
+    val(data.get("issue_date", ""),    x=FORM_HDR_LEFT + DATA_X_PAD, y=r2_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_DELIVERY_X - FORM_HDR_LEFT - DATA_X_PAD)
+    val(data.get("delivery_date", ""), x=HDR_DELIVERY_X + DATA_X_PAD,  y=r2_y, fs=HEADER_NOUHIN_VALUE_FONT_SIZE, max_w=HDR_DELIVERY_RIGHT - HDR_DELIVERY_X - DATA_X_PAD)
+    val(data.get("voucher_no", ""),    x=HDR_DELIVERY_RIGHT + DATA_X_PAD, y=r2_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_VOUCHER_RIGHT - HDR_DELIVERY_RIGHT - DATA_X_PAD)
+    val(data.get("trade_type", ""),    x=HDR_VOUCHER_RIGHT + DATA_X_PAD, y=r2_y,
+        fs=HEADER_TRADE_VALUE_FONT_SIZE, max_w=HDR_TRADE_RIGHT - HDR_VOUCHER_RIGHT - DATA_X_PAD)
+    val(data.get("ship_type", ""),     x=HDR_TRADE_RIGHT + DATA_X_PAD, y=r2_y,
+        fs=HEADER_SHIPPING_VALUE_FONT_SIZE, max_w=HDR_OPERATOR_X - HDR_TRADE_RIGHT - DATA_X_PAD)
+    val(data.get("operator", ""),      x=HDR_OPERATOR_X + DATA_X_PAD, y=r2_y,
+        fs=HEADER_MAIN_VALUE_FONT_SIZE, max_w=HDR_AMPM_X - HDR_OPERATOR_X - DATA_X_PAD)
 
     # 列右端 X（セル配置用）
     unit_rx  = TBL_COLS[4] - DATA_X_PAD           # 単価列右端
@@ -1354,10 +1761,6 @@ def _draw_form_data_01(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
     note_left_max_w  = TBL_NOTE_MID_X - TBL_COLS[5] - TBL_NOTE_MID_PAD
     note_right_max_w = TBL_COLS[6] - TBL_NOTE_MID_X - TBL_NOTE_MID_PAD - DATA_X_PAD
 
-    # 摘要集計（合計行用）
-    upper_vals: list[float] = []
-    lower_vals: list[float] = []
-
     # 明細行
     details = data.get("details", [])[:FORM_DETAIL_ROWS]
     for i, row in enumerate(details):
@@ -1365,20 +1768,22 @@ def _draw_form_data_01(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
         yu = row_top - DET_UPPER_OFFSET   # 上段ベースライン
         yl = row_top - DET_LOWER_OFFSET   # 下段ベースライン
 
-        is_star = row.get("name", "") == "*"
+        is_star = _is_star_row(row)
 
         # 品名列: 1段目=左寄せ、2段目=右寄せ（大フォント）
-        _str(c, row.get("name", ""), TBL_X_NAME, yu, FS_VAL, max_w=TBL_MAX_NAME)
-        _rstr(c, row.get("dims", ""), DET_NAME_RX - DIM_SHIFT_LEFT, yl, FS_DIM_LARGE, max_w=TBL_MAX_NAME)
+        _str_name(c, row.get("name", ""), TBL_X_NAME, yu, DETAIL_NAME_FONT_SIZE, max_w=TBL_MAX_NAME)
+        _rstr(c, row.get("dims", ""), DET_NAME_RX - DIM_SHIFT_LEFT, yl, DETAIL_DIM_FONT_SIZE, max_w=TBL_MAX_NAME)
 
         if not is_star:
             # 数量列: 1段目=左寄せ、2段目=右寄せ
             _str(c, row.get("qty_spec", ""), TBL_X_QTY, yu, FS_VAL, max_w=TBL_MAX_QTY)
-            _rstr(c, row.get("qty", ""), DET_QTY_RX, yl, FS_VAL, max_w=TBL_MAX_QTY)
+            # 数量2段目はセル中央あたりへ寄せる（要件3）。他列の下段(yl)より上に置く。
+            _rstr(c, row.get("qty", ""), DET_QTY_RX, row_top - DET_QTY_LOWER_OFFSET,
+                  DETAIL_QTY_VALUE_FONT_SIZE, max_w=TBL_MAX_QTY)
 
             # 単価・金額（右揃え）
-            _rstr(c, row.get("unit_price", ""), unit_rx, yu, FS_VAL, max_w=TBL_MAX_UNIT)
-            _rstr(c, row.get("amount", ""),     amt_rx,  yu, FS_VAL, max_w=TBL_MAX_AMT)
+            _rstr(c, row.get("unit_price", ""), unit_rx, yu, DETAIL_UNIT_PRICE_FONT_SIZE, max_w=TBL_MAX_UNIT)
+            _rstr(c, row.get("amount", ""),     amt_rx,  yu, DETAIL_AMOUNT_FONT_SIZE, max_w=TBL_MAX_AMT)
 
             # 摘要: 数値は左側、加工記号は数値の右隣、日付/場所はそのすぐ右に揃える。
             notes = row.get("note_lines", [])
@@ -1386,44 +1791,42 @@ def _draw_form_data_01(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
             note_text_x = TBL_NOTE_MID_X + TBL_NOTE_MID_PAD
             note_data_x = note_text_x + 16.0
 
+            # 摘要列データは専用フォント（基準の1.2倍）で描く（要件4）。
+            FS_NOTE = DETAIL_NOTE_FONT_SIZE
+
             def draw_note_text(text: str, y: float) -> None:
                 if not text:
                     return
                 if text == "加":
-                    _str(c, text, note_text_x, y, FS_DIM, max_w=note_right_max_w)
+                    _str(c, text, note_text_x, y, FS_NOTE, max_w=note_right_max_w)
                 else:
-                    _str(c, text, note_data_x, y, FS_DIM, max_w=note_right_max_w)
+                    _str(c, text, note_data_x, y, FS_NOTE, max_w=note_right_max_w)
 
             if notes:
                 note_rows = _split_note_rows(notes[0])
                 num, txt = note_rows[0]
-                _rstr(c, num, TBL_NOTE_MID_X - TBL_NOTE_MID_PAD, yu, FS_DIM, max_w=note_left_max_w)
+                _rstr(c, num, TBL_NOTE_MID_X - TBL_NOTE_MID_PAD, yu, FS_NOTE, max_w=note_left_max_w)
                 draw_note_text(txt, yu)
                 if len(note_rows) > 1 and len(notes) == 1:
                     num, txt = note_rows[1]
-                    _rstr(c, num, TBL_NOTE_MID_X - TBL_NOTE_MID_PAD, yl, FS_DIM, max_w=note_left_max_w)
+                    _rstr(c, num, TBL_NOTE_MID_X - TBL_NOTE_MID_PAD, yl, FS_NOTE, max_w=note_left_max_w)
                     draw_note_text(txt, yl)
-                    lower_vals.append(_extract_note_number(notes[0].split("/", 1)[1]))
-                upper_vals.append(_extract_note_number(notes[0]))
             if finish_date:
-                _str(c, finish_date, note_data_x, yu, FS_DIM, max_w=note_right_max_w)
+                _str(c, finish_date, note_data_x, yu, FS_NOTE, max_w=note_right_max_w)
             if len(notes) > 1:
                 num, txt = _split_note_rows(notes[1])[0]
-                _rstr(c, num, TBL_NOTE_MID_X - TBL_NOTE_MID_PAD, yl, FS_DIM, max_w=note_left_max_w)
+                _rstr(c, num, TBL_NOTE_MID_X - TBL_NOTE_MID_PAD, yl, FS_NOTE, max_w=note_left_max_w)
                 draw_note_text(txt, yl)
-                lower_vals.append(_extract_note_number(notes[1]))
 
     # 合計行: 摘要列の右端に上段・下段の合計を右揃えで表示。
+    # 上段=Σ(売上単価×受注数量)、下段=Σ(仕入単価×受注数量)。金額列合計ではない。
     total_upper_y = FORM_DETAIL_BOT - DET_UPPER_OFFSET
     total_lower_y = FORM_DETAIL_BOT - DET_LOWER_OFFSET
-    if upper_vals:
-        s = sum(upper_vals)
-        _rstr(c, f"{s:,.0f}" if s == int(s) else f"{s:,.2f}",
-              note_rx, total_upper_y, FS_DIM)
-    if lower_vals:
-        s = sum(lower_vals)
-        _rstr(c, f"{s:,.0f}" if s == int(s) else f"{s:,.2f}",
-              note_rx, total_lower_y, FS_DIM)
+    sales_total, purchase_total = calculate_unit_price_totals(details)
+    if sales_total:
+        _rstr(c, _format_total(sales_total), note_rx, total_upper_y, DETAIL_NOTE_FONT_SIZE)
+    if purchase_total:
+        _rstr(c, _format_total(purchase_total), note_rx, total_lower_y, DETAIL_NOTE_FONT_SIZE)
 
     # 受注No / 伝票No（表の摘要列右下外側）
     order_no = str(data.get("order_no", "") or "")
@@ -1434,17 +1837,16 @@ def _draw_form_data_01(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
         _rstr(c, f"伝  {voucher_no}", note_rx, FORM_TOTAL_BOT - 16.0, FS_DIM)
 
     note_line_x = FORM_HDR_LEFT + FORM_SUBROW_LBL_W + 18.0
-    _draw_summary_lines(c, data, FS_DIM)
+    _draw_summary_lines(c, data, SUMMARY_VALUE_FONT_SIZE)
+    _draw_staff_values(c, data)
     for index, line in enumerate([line for line in data.get("property_lines", []) if line][:1]):
-        val(str(line), x=note_line_x, y=FORM_BKNO_BOT + 3.0 + index * 9.0, fs=FS_DIM, max_w=FORM_SUM_RIGHT - note_line_x)
+        val(str(line), x=note_line_x, y=FORM_BKNO_BOT + 3.0 + index * 9.0,
+            fs=PROPERTY_VALUE_FONT_SIZE, max_w=SUMMARY_TEXT_RIGHT - note_line_x)
+    _draw_customer_order_no(c, data)
 
-    # 営業担当（摘要下線の右側）: データが空でもラベルは常時表示
-    sales_rep = str(data.get("sales_rep", "") or "")
-    _str(c, f"営業担当：{sales_rep}", SUM_STAFF_X, FORM_SUM_BOT + 6.0, FS_DIM)
-
-    # 工事担当（物件No下線の右側）: データが空でもラベルは常時表示
-    construction_rep = str(data.get("construction_rep", "") or "")
-    _str(c, f"工事担当：{construction_rep}", SUM_STAFF_X, FORM_BKNO_BOT + 4.0, FS_DIM)
+    # 移動伝票(取引区分8)専用表示（売上伝票/工場控）。8以外は何も描画しない。
+    _draw_move_slip_columns(c, data, unit_rx, amt_rx)
+    _draw_move_slip_label(c, data)
 
     qr_order_no = str(data.get("qr_order_no") or data.get("order_no") or "")
     if qr_order_no:
@@ -1457,12 +1859,14 @@ def _draw_form_data_01(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
 
 
 def _build_scratch_01(data: dict[str, Any],
-                       title: str = "売　上　伝　票") -> bytes:
+                       title: str = "売　上　伝　票",
+                       edit_objects: list[dict[str, Any]] | None = None) -> bytes:
     """売上伝票(01)または工場控を一から描画したPDFをバイト列で返す。"""
     _ensure_font()
     buf = io.BytesIO()
     c = rl_canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
     _draw_form_01(c, data, title)
+    _draw_edit_objects(c, edit_objects)
     c.save()
     return buf.getvalue()
 
@@ -1581,18 +1985,18 @@ def _draw_header_no_issue(c: rl_canvas.Canvas) -> None:
 
     r1_lbl_y = FORM_HDR_TOP - 8.0
     lbl("コードNo", FORM_HDR_LEFT, r1_lbl_y)
-    lbl("得意先名", 90.0, r1_lbl_y)
-    lbl("受注No", 284.0, r1_lbl_y)
+    lbl("得意先名", HDR_ROW1_DIVS[0], r1_lbl_y)
+    lbl("受注No", HDR_ORDER_NO_X, r1_lbl_y)
     c.setFont(_FONT_NAME, 11)
-    c.drawRightString(279.0, (FORM_HDR_MID + FORM_HDR_TOP) / 2 - 5.0, "御中")
+    c.drawRightString(HDR_ORDER_NO_X - 5.0, (FORM_HDR_MID + FORM_HDR_TOP) / 2 - 5.0, "御中")
 
     r2_lbl_y = FORM_HDR_MID - 8.0
     c.setFont(_FONT_NAME, 6.0)
-    lbl("納品日", 90.0, r2_lbl_y)
-    lbl("伝票No", 145.0, r2_lbl_y)
-    lbl("取引区分", 197.0, r2_lbl_y)
-    lbl("出荷区分", 245.0, r2_lbl_y)
-    lbl("入力者名", 284.0, r2_lbl_y)
+    lbl("納品日", HDR_DELIVERY_X, r2_lbl_y)
+    lbl("伝票No", HDR_DELIVERY_RIGHT, r2_lbl_y)
+    lbl("取引区分", HDR_VOUCHER_RIGHT, r2_lbl_y)
+    lbl("出荷区分", HDR_TRADE_RIGHT, r2_lbl_y)
+    lbl("入力者名", HDR_OPERATOR_X, r2_lbl_y)
 
 
 def _draw_company_detail_lines(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
@@ -1773,23 +2177,33 @@ def _draw_receipt_table_08(c: rl_canvas.Canvas) -> None:
 
 
 def _draw_delivery_data_common(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
-    FS_VAL = 7.8
+    FS_VAL = DATA_FONT_SIZE
+    FS_MAIN = HEADER_MAIN_VALUE_FONT_SIZE
+    # ヘッダーデータは1.3倍・下線ギリギリまで下寄せ（要件1/3）。取引区分のみ据え置き。
     r1_y = FORM_HDR_MID + HDR_DATA_Y_INNER
-    _str(c, data.get("code_no", ""), FORM_HDR_LEFT + DATA_X_PAD, r1_y, FS_VAL)
-    _str(c, data.get("customer_name", ""), 90.0 + DATA_X_PAD, r1_y, FS_VAL, max_w=178.0)
-    _str(c, data.get("order_no", ""), 284.0 + DATA_X_PAD, r1_y, FS_VAL)
+    _str(c, data.get("code_no", ""), FORM_HDR_LEFT + DATA_X_PAD, r1_y, FS_MAIN,
+         max_w=HDR_ROW1_DIVS[0] - FORM_HDR_LEFT - DATA_X_PAD)
+    _str(c, data.get("customer_name", ""), HDR_ROW1_DIVS[0] + DATA_X_PAD, r1_y,
+         HEADER_CUSTOMER_VALUE_FONT_SIZE, max_w=_customer_max_w())
+    _str(c, data.get("order_no", ""), HDR_ORDER_NO_X + DATA_X_PAD, r1_y, FS_MAIN,
+         max_w=HDR_AMPM_X - HDR_ORDER_NO_X - DATA_X_PAD)
 
+    # 発行日セルは納品書/受領書ではマスクされるため issue_date は描画しない。
     r2_y = FORM_HDR_BOT + HDR_DATA_Y_INNER
-    _str(c, data.get("delivery_date", ""), 90.0 + DATA_X_PAD, r2_y, FS_VAL)
-    _str(c, data.get("voucher_no", ""), 145.0 + DATA_X_PAD, r2_y, FS_VAL)
-    _str(c, data.get("trade_type", ""), 197.0 + DATA_X_PAD, r2_y, FS_VAL)
-    _str(c, data.get("ship_type", ""), 245.0 + DATA_X_PAD, r2_y, FS_VAL)
-    _str(c, data.get("operator", ""), 284.0 + DATA_X_PAD, r2_y, FS_VAL, max_w=80.0)
+    _str(c, data.get("delivery_date", ""), HDR_DELIVERY_X + DATA_X_PAD, r2_y, HEADER_NOUHIN_VALUE_FONT_SIZE,
+         max_w=HDR_DELIVERY_RIGHT - HDR_DELIVERY_X - DATA_X_PAD)
+    _str(c, data.get("voucher_no", ""), HDR_DELIVERY_RIGHT + DATA_X_PAD, r2_y, FS_MAIN,
+         max_w=HDR_VOUCHER_RIGHT - HDR_DELIVERY_RIGHT - DATA_X_PAD)
+    _str(c, data.get("trade_type", ""), HDR_VOUCHER_RIGHT + DATA_X_PAD, r2_y,
+         HEADER_TRADE_VALUE_FONT_SIZE, max_w=HDR_TRADE_RIGHT - HDR_VOUCHER_RIGHT - DATA_X_PAD)
+    _str(c, data.get("ship_type", ""), HDR_TRADE_RIGHT + DATA_X_PAD, r2_y,
+         HEADER_SHIPPING_VALUE_FONT_SIZE, max_w=HDR_OPERATOR_X - HDR_TRADE_RIGHT - DATA_X_PAD)
+    _str(c, data.get("operator", ""), HDR_OPERATOR_X + DATA_X_PAD, r2_y, FS_MAIN, max_w=HDR_AMPM_X - HDR_OPERATOR_X - DATA_X_PAD)
 
 
 def _draw_delivery_details_07(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
-    FS_VAL = 7.8
-    FS_DIM = 7.0
+    FS_VAL = DATA_FONT_SIZE
+    FS_DIM = DETAIL_DATA_FONT_SIZE
     unit_rx = TBL_COLS[4] - DATA_X_PAD
     amt_rx = TBL_COLS[5] - DATA_X_PAD
     details = data.get("details", [])[:FORM_DETAIL_ROWS]
@@ -1797,35 +2211,38 @@ def _draw_delivery_details_07(c: rl_canvas.Canvas, data: dict[str, Any]) -> None
         row_top = FORM_TBL_HDR_BOT - i * FORM_DETAIL_ROW_H
         yu = row_top - DET_UPPER_OFFSET
         yl = row_top - DET_LOWER_OFFSET
-        is_star = row.get("name", "") == "*"
-        _str(c, row.get("name", ""), TBL_X_NAME, yu, FS_VAL, max_w=TBL_MAX_NAME)
-        _rstr(c, row.get("dims", ""), DET_NAME_RX - DIM_SHIFT_LEFT, yl, FS_DIM_LARGE, max_w=TBL_MAX_NAME)
+        is_star = _is_star_row(row)
+        _str_name(c, row.get("name", ""), TBL_X_NAME, yu, DETAIL_NAME_FONT_SIZE, max_w=TBL_MAX_NAME)
+        _rstr(c, row.get("dims", ""), DET_NAME_RX - DIM_SHIFT_LEFT, yl, DETAIL_DIM_FONT_SIZE, max_w=TBL_MAX_NAME)
         if is_star:
             continue
         _str(c, row.get("qty_spec", ""), TBL_X_QTY, yu, FS_VAL, max_w=TBL_MAX_QTY)
-        _rstr(c, row.get("qty", ""), DET_QTY_RX, yl, FS_VAL, max_w=TBL_MAX_QTY)
-        _rstr(c, row.get("unit_price", ""), unit_rx, yu, FS_VAL, max_w=TBL_MAX_UNIT)
-        _rstr(c, row.get("amount", ""), amt_rx, yu, FS_VAL, max_w=TBL_MAX_AMT)
+        # 数量2段目はセル中央あたりへ寄せる（要件3）。
+        _rstr(c, row.get("qty", ""), DET_QTY_RX, row_top - DET_QTY_LOWER_OFFSET,
+              DETAIL_QTY_VALUE_FONT_SIZE, max_w=TBL_MAX_QTY)
+        _rstr(c, row.get("unit_price", ""), unit_rx, yu, DETAIL_UNIT_PRICE_FONT_SIZE, max_w=TBL_MAX_UNIT)
+        _rstr(c, row.get("amount", ""), amt_rx, yu, DETAIL_AMOUNT_FONT_SIZE, max_w=TBL_MAX_AMT)
 
 
 def _draw_delivery_details_08(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
-    FS_VAL = 7.8
+    FS_VAL = DATA_FONT_SIZE
     details = data.get("details", [])[:FORM_DETAIL_ROWS]
     for i, row in enumerate(details):
         row_top = FORM_TBL_HDR_BOT - i * FORM_DETAIL_ROW_H
         yu = row_top - DET_UPPER_OFFSET
         yl = row_top - DET_LOWER_OFFSET
-        is_star = row.get("name", "") == "*"
-        _str(c, row.get("name", ""), TBL_X_NAME, yu, FS_VAL, max_w=TBL_MAX_NAME)
-        _rstr(c, row.get("dims", ""), DET_NAME_RX - DIM_SHIFT_LEFT, yl, FS_DIM_LARGE, max_w=TBL_MAX_NAME)
+        is_star = _is_star_row(row)
+        _str_name(c, row.get("name", ""), TBL_X_NAME, yu, DETAIL_NAME_FONT_SIZE, max_w=TBL_MAX_NAME)
+        _rstr(c, row.get("dims", ""), DET_NAME_RX - DIM_SHIFT_LEFT, yl, DETAIL_DIM_FONT_SIZE, max_w=TBL_MAX_NAME)
         if is_star:
             continue
         _str(c, row.get("qty_spec", ""), TBL_X_QTY, yu, FS_VAL, max_w=TBL_MAX_QTY)
-        _rstr(c, row.get("qty", ""), DET_QTY_RX, yl, FS_VAL, max_w=TBL_MAX_QTY)
+        # 数量2段目はセル中央あたりへ寄せる（要件3）。
+        _rstr(c, row.get("qty", ""), DET_QTY_RX, row_top - DET_QTY_LOWER_OFFSET,
+              DETAIL_QTY_VALUE_FONT_SIZE, max_w=TBL_MAX_QTY)
 
 
 def _draw_summary_rows(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
-    FS_DIM = 7.0
     note_line_x = FORM_HDR_LEFT + FORM_SUBROW_LBL_W + 18.0
     c.setLineWidth(0.5)
     c.setFont(_FONT_NAME, 7.0)
@@ -1833,14 +2250,14 @@ def _draw_summary_rows(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
     c.line(note_line_x, FORM_SUM_BOT, FORM_SUM_RIGHT, FORM_SUM_BOT)
     c.drawString(FORM_HDR_LEFT + 18.0, FORM_BKNO_BOT + 3.0, "物件No")
     c.line(note_line_x, FORM_BKNO_BOT, FORM_SUM_RIGHT, FORM_BKNO_BOT)
-    _draw_summary_lines(c, data, FS_DIM)
+    # 摘要・物件Noデータは他伝票（01〜06）と同じ専用フォントを使う（要件3/4）。
+    # 摘要上段の上方向シフトも _draw_summary_lines / _summary_line_y 経由で共通適用される。
+    _draw_summary_lines(c, data, SUMMARY_VALUE_FONT_SIZE)
+    _draw_staff_values(c, data)
     for index, line in enumerate([line for line in data.get("property_lines", []) if line][:1]):
-        _str(c, str(line), note_line_x, FORM_BKNO_BOT + 3.0 + index * 9.0, FS_DIM,
-             max_w=FORM_SUM_RIGHT - note_line_x)
-    sales_rep = str(data.get("sales_rep", "") or "")
-    _str(c, f"営業担当：{sales_rep}", SUM_STAFF_X, FORM_SUM_BOT + 6.0, FS_DIM)
-    construction_rep = str(data.get("construction_rep", "") or "")
-    _str(c, f"工事担当：{construction_rep}", SUM_STAFF_X, FORM_BKNO_BOT + 4.0, FS_DIM)
+        _str(c, str(line), note_line_x, FORM_BKNO_BOT + 3.0 + index * 9.0, PROPERTY_VALUE_FONT_SIZE,
+             max_w=SUMMARY_TEXT_RIGHT - note_line_x)
+    _draw_customer_order_no(c, data)
 
 
 def _draw_form_07(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
@@ -1850,6 +2267,11 @@ def _draw_form_07(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
     _draw_delivery_details_07(c, data)
     _draw_summary_rows(c, data)
     _draw_special_notes_section(c)
+    # 移動伝票(取引区分8)専用表示（納品書）。8以外は何も描画しない。受領書(08)には反映しない。
+    unit_rx = TBL_COLS[4] - DATA_X_PAD
+    amt_rx = TBL_COLS[5] - DATA_X_PAD
+    _draw_move_slip_columns(c, data, unit_rx, amt_rx)
+    _draw_move_slip_label(c, data)
 
 
 def _draw_form_08(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
@@ -1860,9 +2282,12 @@ def _draw_form_08(c: rl_canvas.Canvas, data: dict[str, Any]) -> None:
     _draw_summary_rows(c, data)
     _draw_delivery_stamp_boxes(c)
     _draw_special_notes_section(c)
+    # 移動伝票(取引区分8)ラベル（受領書）。単価列・金額列の下段表示は対象外。
+    _draw_move_slip_label(c, data)
 
 
-def _build_scratch_delivery(data: dict[str, Any], voucher_id: str) -> bytes:
+def _build_scratch_delivery(data: dict[str, Any], voucher_id: str,
+                            edit_objects: list[dict[str, Any]] | None = None) -> bytes:
     _ensure_font()
     buf = io.BytesIO()
     c = rl_canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
@@ -1870,6 +2295,7 @@ def _build_scratch_delivery(data: dict[str, Any], voucher_id: str) -> bytes:
         _draw_form_07(c, data)
     else:
         _draw_form_08(c, data)
+    _draw_edit_objects(c, edit_objects)
     c.save()
     return buf.getvalue()
 
@@ -1933,7 +2359,7 @@ def _draw_details_overlay(c: rl_canvas.Canvas, details: list[dict[str, Any]]) ->
         row_top = DETAIL_ROW1_TOP - i * DETAIL_ROW_H
         yu = row_top - DETAIL_UPPER_OFFSET
         yl = row_top - DETAIL_LOWER_OFFSET
-        _str(c, row.get("name", ""), COL_NAME_X, yu, FS_DETAIL, max_w=MAX_W_NAME)
+        _str_name(c, row.get("name", ""), COL_NAME_X, yu, FS_DETAIL, max_w=MAX_W_NAME)
         _str(c, row.get("dims", ""), COL_NAME_X, yl, FS_DIMS,   max_w=MAX_W_NAME)
         _str(c, row.get("qty_spec", ""), COL_QTY_X, yu, FS_DETAIL, max_w=MAX_W_QTY)
         _str(c, row.get("qty", ""),      COL_QTY_X, yl, FS_DETAIL, max_w=MAX_W_QTY)
@@ -1988,38 +2414,41 @@ def _assemble_pdf_bytes(
     """指定された伝票種別のページを結合した PDF を bytes で返す。ファイル保存しない。"""
     writer = pypdf.PdfWriter()
     for page_data in _normalize_pages_data(print_data):
-        # 指図書(1)/指図書(2)/梱包明細書 に重ねる編集オブジェクトを受注Noで解決する。
+        # 編集オブジェクトを受注Noで解決し、各伝票では target_vouchers に当該伝票が
+        # 含まれるものだけを重ね描きする（要件3・7）。
         edit_objects = _resolve_edit_objects(page_data)
         for vid in voucher_ids:
+            objs = _filter_edit_objects(edit_objects, vid)
             if vid == "01":
-                page_bytes = _build_scratch_01(page_data)
+                page_bytes = _build_scratch_01(page_data, edit_objects=objs)
                 page_reader = pypdf.PdfReader(io.BytesIO(page_bytes))
                 writer.add_page(page_reader.pages[0])
             elif vid == "02":
-                page_bytes = _build_scratch_01(page_data, title="工　場　控")
+                page_bytes = _build_scratch_01(page_data, title="工　場　控", edit_objects=objs)
                 page_reader = pypdf.PdfReader(io.BytesIO(page_bytes))
                 writer.add_page(page_reader.pages[0])
             elif vid == "03":
                 page_bytes = _build_scratch_shizu(page_data, title="指　図　書　(1)", stamp_title="工場印",
-                                                  edit_objects=edit_objects)
+                                                  edit_objects=objs)
                 page_reader = pypdf.PdfReader(io.BytesIO(page_bytes))
                 writer.add_page(page_reader.pages[0])
             elif vid == "04":
                 page_bytes = _build_scratch_shizu(page_data, title="指　図　書　(2)", stamp_title="商品課印",
-                                                  edit_objects=edit_objects)
+                                                  edit_objects=objs)
                 page_reader = pypdf.PdfReader(io.BytesIO(page_bytes))
                 writer.add_page(page_reader.pages[0])
             elif vid == "05":
                 page_bytes = _build_scratch_shizu(page_data, title="梱　包　明　細　書", stamp_title="配送者印",
-                                                  edit_objects=edit_objects)
+                                                  edit_objects=objs)
                 page_reader = pypdf.PdfReader(io.BytesIO(page_bytes))
                 writer.add_page(page_reader.pages[0])
             elif vid == "06":
-                page_bytes = _build_scratch_shizu(page_data, title="配　送　指　示　書", stamp_title="配送者印")
+                page_bytes = _build_scratch_shizu(page_data, title="配　送　指　示　書", stamp_title="配送者印",
+                                                  edit_objects=objs)
                 page_reader = pypdf.PdfReader(io.BytesIO(page_bytes))
                 writer.add_page(page_reader.pages[0])
             elif vid in ("07", "08"):
-                page_bytes = _build_scratch_delivery(page_data, vid)
+                page_bytes = _build_scratch_delivery(page_data, vid, edit_objects=objs)
                 page_reader = pypdf.PdfReader(io.BytesIO(page_bytes))
                 writer.add_page(page_reader.pages[0])
             else:
@@ -2174,7 +2603,7 @@ def _build_output_pdf_path(output_dir: Path, token: str) -> Path:
     path = output_dir / f"{timestamp}_{safe_token}.pdf"
     if not path.exists():
         return path
-    index = 1
+    index = 2
     while True:
         candidate = output_dir / f"{timestamp}_{safe_token}_{index}.pdf"
         if not candidate.exists():
@@ -2189,14 +2618,14 @@ def _filename_token_from_print_data(print_data: dict[str, Any]) -> str:
         first_page = pages[0]
         if isinstance(first_page, dict):
             candidates.extend([
+                first_page.get("order_no"),
                 first_page.get("voucher_no"),
                 first_page.get("delivery_no"),
-                first_page.get("order_no"),
             ])
     candidates.extend([
+        print_data.get("order_no"),
         print_data.get("voucher_no"),
         print_data.get("delivery_no"),
-        print_data.get("order_no"),
     ])
     for value in candidates:
         text = str(value or "").strip()

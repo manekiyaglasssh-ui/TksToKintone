@@ -1,0 +1,28 @@
+ｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰ
+■リクエスト
+PUT /c/OLAP%E3%83%87%E3%83%BC%E3%82%BF HTTP/1.1
+Accept: application/json
+Content-Type: application/json; charset=utf-8
+Host: www.ap.tkscloud8.aga-sys.com
+Cookie: ASP.NET_SessionId=qyyjvzehuzlpj3imsfwdzajm; .ASPXAUTH=F75F5578DDC46ED329C33325B4F4CCD79F54F6249212D502C3F57F7FDB558B147FC37B342C464B527764FE0282F02CB48DE85206D6677BC9D273D22655A2EEE2B625D615E0D900F2D746DBE3C91F86C7F01F277D964F7E457DA5F868959C06EB2A8749FB6A3C0EF08615F6EDB57DAA82F69E661CABF65192029755F41F27AE47
+Content-Length: 2216
+Expect: 100-continue
+Connection: keep-alive
+
+{"OLAP出力レイアウト":"0","OLAP対象データ":"OLAP_M05-01 得意先マスタ","R1List":[{"OLAP表示No":1,"OLAP表示名":"得意先コード","OLAPデータ区分":"1","エンティティ論理名":"OLAP_M05-01 得意先マスタ","フィールド論理名":"得意先コード","OLAP表示幅":7,"OLAPフォントサイズ２":"0","OLAP空白値表示":"-","OLAP日付のフォーマットフラグ":"1","OLAP数値の3桁区切りフラグ":"1","OLAP桁数":0,"OLAP小数":0,"OLAP丸め":"0","OLAP出力順序No":null,"OLAP出力順":"2","OLAP空白値を先頭表示フラグ":"0","OLAP集計方法":"0","OLAP合計表示フラグ":"0","OLAP合計ラベル":"計","OLAP合計ラベルのみ表示フラグ":null,"OLAP重複を除くフラグ":"0","OLAP演算式":null,"OLAP演算式表記":"","OLAPドメイン分類":"0","XupperRoutingItems":[]},{"OLAP表示No":2,"OLAP表示名":"取引区分","OLAPデータ区分":"1","エンティティ論理名":"OLAP_M05-01 得意先マスタ","フィールド論理名":"取引区分","OLAP表示幅":3,"OLAPフォントサイズ２":"0","OLAP空白値表示":"-","OLAP日付のフォーマットフラグ":"1","OLAP数値の3桁区切りフラグ":"1","OLAP桁数":0,"OLAP小数":0,"OLAP丸め":"0","OLAP出力順序No":null,"OLAP出力順":"2","OLAP空白値を先頭表示フラグ":"0","OLAP集計方法":"0","OLAP合計表示フラグ":"0","OLAP合計ラベル":"計","OLAP合計ラベルのみ表示フラグ":null,"OLAP重複を除くフラグ":"0","OLAP演算式":null,"OLAP演算式表記":"","OLAPドメイン分類":"3","XupperRoutingItems":[]}],"R2List":[{"OLAP表示No":1,"OLAP一致指定フラグ":"1","OLAP一致指定":"0","OLAP除外指定フラグ":"0","OLAP値":"9991173","OLAP範囲指定フラグ":"0","OLAP範囲_Fromフラグ":"1","OLAP範囲Val_From":"","OLAP範囲Sel_From":"0","OLAP範囲_Toフラグ":"1","OLAP範囲Val_To":"","OLAP範囲Sel_To":"0","OLAP月度指定フラグ":"0","OLAP月度指定":"0","OLAP条件グループ":"0","OLAP空白":"1","OLAPドメイン分類":"0","エンティティ論理名":"OLAP_M05-01 得意先マスタ","フィールド論理名":"得意先コード","XupperRoutingItems":[]}],"ScreenName":0}
+ｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰ
+ｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰ
+■レスポンス
+HTTP/2 200 OK
+Date: Fri, 26 Jun 2026 01:01:30 GMT
+Content-Type: application/json; charset=utf-8
+Content-Length: 303
+Cache-Control: no-cache
+Pragma: no-cache
+Expires: -1
+Server: Microsoft-IIS/10.0
+X-Aspnet-Version: 4.0.30319
+X-Powered-By: ASP.NET
+
+{"PropertyStatuses":[],"ResultStatus":{"OutputLog":{"LogType":0,"MessageFirst":{"Items":[]},"MessageMiddle":{"Items":[]},"MessageLast":{"Items":[]}},"DesignGroup":null,"Index":0,"RData":null,"PropertyName":"","MessageName":0,"MessageParams":null},"ResponseData":{"R1List":{"1":{"1":"9991173","2":"8"}}}}
+ｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰｰ

@@ -104,8 +104,13 @@ class FieldMappingSupplementTest(unittest.TestCase):
 
     def test_supplement_standalone_no_change_when_key_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            import json
+
+            from app.kintone_client import DEFAULT_FIELD_MAPPING_SUPPLEMENTS
+
             mapping_path = Path(temp_dir) / "field_mapping.json"
-            mapping_path.write_text('{"加工名":"existing"}', encoding="utf-8-sig")
+            existing = {key: f"existing_{key}" for key in DEFAULT_FIELD_MAPPING_SUPPLEMENTS}
+            mapping_path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8-sig")
             mtime_before = mapping_path.stat().st_mtime
 
             supplement_field_mapping(mapping_path)
@@ -179,6 +184,45 @@ class KintoneFieldExclusionTest(unittest.TestCase):
             client = _client_with_total_weight(Path(temp_dir))
             record = client._to_upsert_record({"検索キー": "key-1", "総重量": "2.12"}, 0)
             self.assertEqual(record["record"]["総重量"], {"value": "2.12"})
+
+
+class KintoneKakouTypeCustomerTest(unittest.TestCase):
+    """加工種類・得意先選択がkintone送信recordに含まれることを検証。"""
+
+    def _client(self, tmp_path: Path) -> KintoneClient:
+        mapping = tmp_path / "field_mapping.json"
+        mapping.write_text(
+            '{"検索キー":"検索キー","加工種類":"加工種類","得意先選択":"得意先選択"}',
+            encoding="utf-8",
+        )
+        return _make_client(tmp_path, mapping)
+
+    def test_kakou_type_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = self._client(Path(temp_dir))
+            record = client._to_upsert_record({"検索キー": "key-1", "加工種類": "3"}, 0)
+            self.assertEqual(record["record"]["加工種類"], {"value": "3"})
+
+    def test_customer_selection_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = self._client(Path(temp_dir))
+            record = client._to_upsert_record({"検索キー": "key-1", "得意先選択": "得意先2"}, 0)
+            self.assertEqual(record["record"]["得意先選択"], {"value": "得意先2"})
+
+    def test_empty_values_not_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = self._client(Path(temp_dir))
+            record = client._to_upsert_record({"検索キー": "key-1", "加工種類": "", "得意先選択": ""}, 0)
+            self.assertNotIn("加工種類", record["record"])
+            self.assertNotIn("得意先選択", record["record"])
+
+    def test_supplement_adds_kakou_type_and_customer_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mapping_path = Path(temp_dir) / "field_mapping.json"
+            mapping_path.write_text('{"検索キー":"検索キー"}', encoding="utf-8-sig")
+            client = _make_client(Path(temp_dir), mapping_path)
+            self.assertEqual(client.mapping["加工種類"], "加工種類")
+            self.assertEqual(client.mapping["得意先選択"], "得意先選択")
 
 
 def _client(tmp_path: Path) -> KintoneClient:

@@ -14,6 +14,7 @@ from app.voucher_data_mapper import (
     first_r1_row_keys,
     format_date_yy_mm_dd,
     has_result_status_row,
+    is_missing_voucher_no,
     parse_denpyo_numbers,
     r1_list_type_name,
     resolve_unit_and_amount_values,
@@ -32,6 +33,15 @@ class VoucherDataMapperTest(unittest.TestCase):
             parse_denpyo_numbers(" 1405113\n\n1405114, 1405113\r\n1405115 "),
             ["1405113", "1405114", "1405115"],
         )
+
+    def test_is_missing_voucher_no(self) -> None:
+        missing_values = [None, "", " ", 0, "0", "0000000"]
+        for value in missing_values:
+            with self.subTest(value=value):
+                self.assertTrue(is_missing_voucher_no(value))
+        for value in ("1234567", "Z739291"):
+            with self.subTest(value=value):
+                self.assertFalse(is_missing_voucher_no(value))
 
     def test_format_date_yy_mm_dd(self) -> None:
         self.assertEqual(format_date_yy_mm_dd("2026/06/19"), "26/06/19")
@@ -133,6 +143,168 @@ class VoucherDataMapperTest(unittest.TestCase):
     def test_qr_code_image_is_created(self) -> None:
         buf = build_qr_code_image("1405113")
         self.assertGreater(len(buf.getvalue()), 0)
+
+    # ── 品名列の表示はトリムしない（タスク3）──────────────────────────────────
+    def test_product_name_keeps_fullwidth_space(self) -> None:
+        """11. 商品名称『5ミリ　切断』の全角スペースが保持される。"""
+        d = mapper._detail_row({"product_name": "5ミリ　切断"})
+        self.assertEqual(d["name"], "5ミリ　切断")
+
+    def test_product_name_keeps_consecutive_spaces(self) -> None:
+        """12. 商品名称内の連続スペースが保持される。"""
+        d = mapper._detail_row({"product_name": "5ミリ　小口加工　　磨き  ４方"})
+        self.assertEqual(d["name"], "5ミリ　小口加工　　磨き  ４方")
+
+    def test_product_name_keeps_leading_trailing_spaces(self) -> None:
+        """13. 商品名称の先頭・末尾スペースを表示用データではトリムしない。"""
+        d = mapper._detail_row({"product_name": "  前後空白  "})
+        self.assertEqual(d["name"], "  前後空白  ")
+        # 判定用の name_key は正規化（トリム）される。
+        self.assertEqual(d["name_key"], "前後空白")
+
+    def test_star_judgment_not_broken(self) -> None:
+        """14. name == "*" などの既存判定は壊れない。"""
+        from app.voucher_service import _is_star_row
+
+        # 純粋な "*" は対象外行。
+        d = mapper._detail_row({"product_name": "*"})
+        self.assertTrue(_is_star_row(d))
+        # 前後に空白がある "*" でも判定用キーで対象外行と判定できる。
+        d2 = mapper._detail_row({"product_name": " * "})
+        self.assertTrue(_is_star_row(d2))
+        # 通常の品名は対象外行ではない。
+        d3 = mapper._detail_row({"product_name": " 5ミリ　切断 "})
+        self.assertFalse(_is_star_row(d3))
+
+    def test_product_name_blanks_preserved_all_vouchers(self) -> None:
+        """15. 01〜08すべての伝票で品名列のブランクが保持される（PDF描画値を確認）。"""
+        from app import voucher_service
+        from app.voucher_templates import VOUCHER_IDS
+
+        raw_name = " 5ミリ　小口加工　磨き　４方 "
+        # 全伝票の品名描画は row.get("name") を使う。トリムせず描画されることを確認する。
+        captured: list[str] = []
+
+        class _FakeCanvas:
+            def setFont(self, *a):
+                pass
+
+            def stringWidth(self, *a, **k):
+                return 0.0  # クリップしない
+
+            def drawString(self, x, y, text):
+                captured.append(text)
+
+            def drawRightString(self, *a):
+                pass
+
+            def drawCentredString(self, *a):
+                pass
+
+        row = {"name": raw_name, "name_key": raw_name.strip()}
+        for _vid in VOUCHER_IDS:
+            captured.clear()
+            voucher_service._str(_FakeCanvas(), row.get("name", ""), 0.0, 0.0, 8.0)
+            self.assertIn(raw_name, captured)
+
+    # ── OLAP取得経路（表示Noキー16→エイリアス）でのブランク保持（再修正）──────
+    @staticmethod
+    def _olap_row(product_name: str) -> dict[str, str]:
+        """商品名称をキー16に持つ現行レイアウトのOLAP行を、エイリアス付与済みで返す。
+
+        `_with_display_name_aliases` は product_name エイリアスに strip 済み値を入れる。
+        この経路を通しても表示用 `name` が生値を保つことを確認するためのヘルパー。
+        """
+        # キー36の存在で現行レイアウト判定になる。
+        raw = {"16": product_name, "36": ""}
+        return mapper._with_display_name_aliases({k: str(v) for k, v in raw.items()})
+
+    def test_olap_path_keeps_leading_fullwidth_space(self) -> None:
+        """1. OLAP取得値の先頭に全角スペースがある場合、name に保持される。"""
+        d = mapper._detail_row(self._olap_row("　5ミリ　切断"))
+        self.assertEqual(d["name"], "　5ミリ　切断")
+
+    def test_olap_path_keeps_leading_halfwidth_space(self) -> None:
+        """2. OLAP取得値の先頭に半角スペースがある場合、name に保持される。"""
+        d = mapper._detail_row(self._olap_row(" 5ミリ 切断"))
+        self.assertEqual(d["name"], " 5ミリ 切断")
+
+    def test_olap_path_keeps_consecutive_spaces(self) -> None:
+        """3. OLAP取得値内の連続スペースが name に保持される。"""
+        d = mapper._detail_row(self._olap_row("5ミリ　　小口加工  磨き"))
+        self.assertEqual(d["name"], "5ミリ　　小口加工  磨き")
+
+    def test_olap_path_keeps_trailing_space(self) -> None:
+        """4. OLAP取得値の末尾スペースが表示用 name では保持される。"""
+        d = mapper._detail_row(self._olap_row("5ミリ　切断　"))
+        self.assertEqual(d["name"], "5ミリ　切断　")
+
+    def test_olap_path_name_key_is_stripped(self) -> None:
+        """5. name_key は従来どおり strip 済みで、* 行判定が壊れない。"""
+        from app.voucher_service import _is_star_row
+
+        d = mapper._detail_row(self._olap_row("　5ミリ　切断　"))
+        self.assertEqual(d["name_key"], "5ミリ　切断")
+        self.assertFalse(_is_star_row(d))
+        # 前後空白付きの "*" でも対象外行と判定される。
+        d_star = mapper._detail_row(self._olap_row("　*　"))
+        self.assertEqual(d_star["name_key"], "*")
+        self.assertTrue(_is_star_row(d_star))
+
+    def test_build_pages_name_keeps_leading_space(self) -> None:
+        """6. build_voucher_pages（name_lines相当の組み立て）後も先頭スペースが消えない。"""
+        rows = extract_r1_rows({
+            "ResponseData": {"R1List": [
+                {"6": "X001", "9": "V001", "7": "1", "16": "　5ミリ　切断", "36": ""},
+            ]}
+        })
+        pages = build_voucher_pages(rows, today=date(2026, 6, 5))
+        self.assertEqual(pages[0]["details"][0]["name"], "　5ミリ　切断")
+
+    def test_pdf_draw_keeps_leading_space_all_vouchers(self) -> None:
+        """7・8. 01〜08すべての伝票で、PDF描画直前の品名に先頭スペースが残る。"""
+        import logging
+        import os
+
+        from app import voucher_service
+        from app.voucher_templates import VOUCHER_IDS
+
+        raw_name = "　5ミリ　小口加工　磨き　４方"
+        rows = extract_r1_rows({
+            "ResponseData": {"R1List": [
+                {"6": "X001", "9": "V001", "7": "1", "16": raw_name,
+                 "19": "1", "21": "枚", "40": "0", "36": ""},
+            ]}
+        })
+        pages = build_voucher_pages(rows, today=date(2026, 6, 5))
+        print_data = {"pages": pages}
+
+        captured: list[str] = []
+
+        class _Handler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                if record.getMessage().startswith("product_name_display"):
+                    captured.append(record.args[0])
+
+        logger = logging.getLogger("tks_to_kintone_app")
+        handler = _Handler()
+        logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
+        os.environ["VOUCHER_NAME_DEBUG"] = "1"
+        try:
+            for vid in VOUCHER_IDS:
+                captured.clear()
+                voucher_service._assemble_pdf_bytes([vid], print_data, None)
+                self.assertTrue(
+                    captured, f"伝票{vid}で品名描画ログが出ていない")
+                self.assertIn(
+                    raw_name, captured,
+                    f"伝票{vid}でPDF描画直前の品名から先頭スペースが消えた: {captured!r}")
+        finally:
+            os.environ.pop("VOUCHER_NAME_DEBUG", None)
+            logger.setLevel(old_level)
+            logger.removeHandler(handler)
 
     def test_sales_rep_mapped_from_key33(self) -> None:
         """営業担当者名称(key33)が sales_rep にマッピングされること。"""

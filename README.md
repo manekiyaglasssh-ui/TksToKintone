@@ -1,6 +1,6 @@
 # TksToKintone
 
-TKS OLAPから加工CSV・素板CSVを取得し、既存Excel VBA相当の加工を行って `outputTksToKintone.csv` を作成し、必要に応じてkintoneへ登録するWindows向けGUIアプリです。現在のバージョンネームは `1.0.1`、バージョンコードは `2` です。
+TKS OLAPから加工CSV・素板CSVを取得し、既存Excel VBA相当の加工を行って `outputTksToKintone.csv` を作成し、必要に応じてkintoneへ登録するWindows向けGUIアプリです。現在のバージョンネームは `1.4.13`、バージョンコードは `23` です。
 
 ユーザー向けの操作手順は [docs/ユーザー向け簡易マニュアル.md](docs/ユーザー向け簡易マニュアル.md) を参照してください。
 
@@ -71,9 +71,18 @@ DRY_RUNがONの場合、TKS取得とCSV作成後に登録前確認画面を表�
 
 設定画面の `高度な設定を開く` から、ログ保存日数、加工抽出ロジックと素板抽出ロジックの `R2List` 抽出条件を確認・変更できます。ログ保存日数は既定で30日です。アプリ起動時に `logs` 配下の `tks_to_kintone_*.log` から、設定日数より古いログを自動削除します。抽出条件の初期値は `config.env` で指定したOLAPリクエストテンプレートの現在値です。変更できるのは抽出条件の値で、`受注No` 条件は実行時に画面入力された伝票番号へ差し替えるため編集不可です。`初期値に戻す` を押すと保存済みの変更を破棄し、テンプレートの値に戻します。
 
-設定画面の `更新確認` から、アプリ配布管理のkintoneアプリに登録された `TksToKintone` の最新バージョンを確認できます。現在のバージョンコードより大きい配布レコードがある場合のみ更新確認ダイアログを表示し、そのまま更新ファイルをダウンロードして自動更新します。アプリ起動時にも自動確認しますが、最新の場合はダイアログを表示しません。
+更新確認は、機能選択画面（起動直後に表示される画面）が表示されたタイミングでバックグラウンドスレッドにより1回だけ自動実行します。アプリ配布管理のkintoneアプリに登録された `TksToKintone` の最新バージョンを確認し、現在のバージョンコードより大きい配布レコードがある場合のみ更新確認ダイアログを表示します。最新の場合は何も表示しません。更新確認に失敗しても致命エラーにはせず、機能選択画面はそのまま使用できます。設定画面の `更新確認` からも手動で確認できます。更新は、ユーザーが更新確認ダイアログで「はい」を選んだ場合だけ開始します。
 
-配布管理に登録する更新ファイルは、署名済みのインストーラ `tks-to-kintone-setup.exe` とします。DeepInstinctの誤検知を避けるため、アプリ本体プロセスではインストーラをダウンロードしません。更新確認後にアプリを終了し、外部更新スクリプトがユーザー領域へ非exe拡張子の更新ペイロードとして保存してから、インストーラで自動更新してアプリを再起動します。起動中exeを一時BATで直接差し替える方式は、セキュリティ製品に検知されやすいため使用しません。
+### PowerShell を使わない更新方式
+
+以前は更新時に `run_update.ps1` を生成し PowerShell（`ExecutionPolicy Bypass`）で実行していましたが、DeepInstinct に PowerShell 実行がブロックされるため廃止しました。現在は PowerShell・一時スクリプト・`ExecutionPolicy Bypass` を一切使わず、通常のファイル操作とプロセス起動だけで更新します。
+
+1. アプリ本体（Python/EXE）が、署名済みインストーラ `tks-to-kintone-setup.exe` を `updates` フォルダへダウンロードします（認証トークンは本体側だけで使用し、コマンドラインには渡しません）。
+2. アプリ本体からインストーラを `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-` と `/LOG=...\update_installer.log` 付きで直接起動します。
+3. インストーラ起動に成功したら、アプリ本体を速やかに終了します。
+4. Inno Setup の Restart Manager / CloseApplications により既存プロセスの終了を待ち、既存インストール先へ上書き更新します。管理者権限が必要な場合の昇格はインストーラ側が行います。
+
+配布管理に登録する更新ファイルは、署名済みのインストーラ `tks-to-kintone-setup.exe` とします。`tks_update_helper.exe` は廃止済みで、通常ビルドではビルド・同梱しません。
 
 ## 出力とログ
 
@@ -115,7 +124,18 @@ set SIGNTOOL_PATH=C:\Program Files (x86)\Windows Kits\10\bin\x64\signtool.exe
 build_exe.bat
 ```
 
-Inno Setupで作成した `tks-to-kintone-setup.exe` も同じ証明書で署名してください。
+正式配布用インストーラは `normal` で作成します。`all` は正式配布用と no-update 検証用を順番に作成します。
+
+```bat
+build_exe.bat normal
+build_exe.bat no-update
+build_exe.bat with-helper
+build_exe.bat all
+```
+
+出力ファイル名は `installer\tks-to-kintone-setup.exe`、`installer\tks-to-kintone-setup-no-update.exe`、`installer\tks-to-kintone-setup-with-helper.exe` です。`normal` は helper なし自動更新版、`no-update` は更新確認と更新モジュール同梱を無効化した版、`with-helper` は過去方式の検証用です。
+
+Inno Setupで作成したインストーラも同じ証明書で署名してください。
 
 ## mockモード確認手順
 

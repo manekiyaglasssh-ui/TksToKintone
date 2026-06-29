@@ -63,6 +63,8 @@ class VoucherOlapService:
         self._session = requests.Session() if requests is not None else None
         self._logged_in = False
         self.last_response_r1_count = 0
+        # 得意先コード単位の取引区分キャッシュ（要件7: 同一コードの重複問い合わせ防止）。
+        self._transaction_type_cache: dict[str, str] = {}
 
     def login_if_needed(self, login_id: str, password: str) -> None:
         if self.config.tks_client_mode == "mock":
@@ -187,7 +189,64 @@ class VoucherOlapService:
         rows: list[dict[str, str]] = []
         for order_no in order_nos:
             rows.extend(self.fetch_voucher_rows(order_no))
+        self._enrich_transaction_types(rows)
         return rows
+
+    def _enrich_transaction_types(self, rows: list[dict[str, str]]) -> None:
+        """各行の得意先コードから取引区分を取得し row['transaction_type'] に保持する。
+
+        得意先コードが空の場合や取得失敗時は空扱い（既存の伝票作成は止めない）。
+        得意先コード単位でキャッシュし、同一コードの問い合わせを繰り返さない（要件7）。
+        """
+        for row in rows:
+            customer_code = (row.get("customer_code") or row.get("4") or "").strip()
+            row["transaction_type"] = self.fetch_transaction_type_by_customer_code(customer_code)
+
+    def fetch_transaction_type_by_customer_code(self, customer_code: str) -> str:
+        """得意先コードに紐づく取引区分を別テーブル（得意先マスタ）から取得する。
+
+        得意先コードが空なら空文字を返す。取得できなかった場合も空扱いとし、
+        例外は送出せずログに原因を残す（要件5/6）。同一コードはキャッシュする（要件7）。
+        """
+        code = (customer_code or "").strip()
+        if not code:
+            return ""
+        if code in self._transaction_type_cache:
+            return self._transaction_type_cache[code]
+
+        value = ""
+        try:
+            if self.config.tks_client_mode == "mock":
+                value = ""
+            elif self._session is None:
+                self.logger.warning("取引区分OLAP取得スキップ: requests未導入のためsession無し customer_code=%s", code)
+                value = ""
+            else:
+                payload = build_transaction_type_payload(code)
+                url = self._endpoint(OLAP_DATA_PATH)
+                self.logger.info("取引区分OLAP取得リクエスト実行: customer_code=%s", code)
+                response = self._session.put(
+                    url,
+                    data=_json_bytes(payload),
+                    headers=OLAP_HEADERS,
+                    timeout=60,
+                )
+                response.raise_for_status()
+                data = response.json()
+                value = parse_transaction_type(data)
+                self.logger.info(
+                    "取引区分OLAP取得完了: customer_code=%s transaction_type=%s",
+                    code,
+                    value or "(なし)",
+                )
+        except Exception:
+            self.logger.exception(
+                "取引区分OLAP取得に失敗しました（伝票作成は継続します）: customer_code=%s", code
+            )
+            value = ""
+
+        self._transaction_type_cache[code] = value
+        return value
 
     def _log_request_diagnostics(
         self,
@@ -319,12 +378,190 @@ def _build_voucher_payload(
         if isinstance(condition, dict) and condition.get("フィールド論理名") == "有効区分":
             condition["OLAP値"] = "1"
     _remove_blank_sales_month_condition(payload)
+    _ensure_customer_order_no_column(payload)
     if enabled_op_fields:
         _keep_only_enabled_op_columns(payload, enabled_op_fields)
     elif _disable_op_fields_for_debug(default=bool(disable_op_fields)):
         _remove_op_related_columns(payload)
     _remove_calc_op_columns(payload)
     return payload, path
+
+
+CUSTOMER_ORDER_NO_FIELD = "客先注文No_10桁"
+
+# 取引区分取得用（別テーブル: 得意先マスタ）。
+TRANSACTION_TYPE_TARGET = "OLAP_M05-01 得意先マスタ"
+TRANSACTION_TYPE_CUSTOMER_CODE_FIELD = "得意先コード"
+TRANSACTION_TYPE_FIELD = "取引区分"
+
+
+def _transaction_type_column(
+    display_no: int, field_name: str, width: int, domain: str
+) -> "OrderedDict[str, Any]":
+    return OrderedDict(
+        [
+            ("OLAP表示No", display_no),
+            ("OLAP表示名", field_name),
+            ("OLAPデータ区分", "1"),
+            ("エンティティ論理名", TRANSACTION_TYPE_TARGET),
+            ("フィールド論理名", field_name),
+            ("OLAP表示幅", width),
+            ("OLAPフォントサイズ２", "0"),
+            ("OLAP空白値表示", "-"),
+            ("OLAP日付のフォーマットフラグ", "1"),
+            ("OLAP数値の3桁区切りフラグ", "1"),
+            ("OLAP桁数", 0),
+            ("OLAP小数", 0),
+            ("OLAP丸め", "0"),
+            ("OLAP出力順序No", None),
+            ("OLAP出力順", "2"),
+            ("OLAP空白値を先頭表示フラグ", "0"),
+            ("OLAP集計方法", "0"),
+            ("OLAP合計表示フラグ", "0"),
+            ("OLAP合計ラベル", "計"),
+            ("OLAP合計ラベルのみ表示フラグ", None),
+            ("OLAP重複を除くフラグ", "0"),
+            ("OLAP演算式", None),
+            ("OLAP演算式表記", ""),
+            ("OLAPドメイン分類", domain),
+            ("XupperRoutingItems", []),
+        ]
+    )
+
+
+def build_transaction_type_payload(customer_code: str) -> "OrderedDict[str, Any]":
+    """得意先コードを条件に取引区分を取得するOLAPリクエストを構築する。
+
+    別テーブル（得意先マスタ）に対し、得意先コード一致条件で取引区分を取得する。
+    docs/OLAPリクエストレスポンス_取引区分/得意先コード_取引区分.txt のサンプル準拠。
+    """
+    return OrderedDict(
+        [
+            ("OLAP出力レイアウト", "0"),
+            ("OLAP対象データ", TRANSACTION_TYPE_TARGET),
+            (
+                "R1List",
+                [
+                    _transaction_type_column(1, TRANSACTION_TYPE_CUSTOMER_CODE_FIELD, 7, "0"),
+                    _transaction_type_column(2, TRANSACTION_TYPE_FIELD, 3, "3"),
+                ],
+            ),
+            (
+                "R2List",
+                [
+                    OrderedDict(
+                        [
+                            ("OLAP表示No", 1),
+                            ("OLAP一致指定フラグ", "1"),
+                            ("OLAP一致指定", "0"),
+                            ("OLAP除外指定フラグ", "0"),
+                            ("OLAP値", str(customer_code or "").strip()),
+                            ("OLAP範囲指定フラグ", "0"),
+                            ("OLAP範囲_Fromフラグ", "1"),
+                            ("OLAP範囲Val_From", ""),
+                            ("OLAP範囲Sel_From", "0"),
+                            ("OLAP範囲_Toフラグ", "1"),
+                            ("OLAP範囲Val_To", ""),
+                            ("OLAP範囲Sel_To", "0"),
+                            ("OLAP月度指定フラグ", "0"),
+                            ("OLAP月度指定", "0"),
+                            ("OLAP条件グループ", "0"),
+                            ("OLAP空白", "1"),
+                            ("OLAPドメイン分類", "0"),
+                            ("エンティティ論理名", TRANSACTION_TYPE_TARGET),
+                            ("フィールド論理名", TRANSACTION_TYPE_CUSTOMER_CODE_FIELD),
+                            ("XupperRoutingItems", []),
+                        ]
+                    )
+                ],
+            ),
+            ("ScreenName", 0),
+        ]
+    )
+
+
+def parse_transaction_type(data: object) -> str:
+    """取引区分レスポンスから取引区分の値（表示No=2）を取り出す。
+
+    取得できなければ空文字を返す。R1List は dict / list いずれの形でも対応する。
+    """
+    if not isinstance(data, dict):
+        return ""
+    response_data = data.get("ResponseData")
+    if not isinstance(response_data, dict):
+        return ""
+    r1_list = response_data.get("R1List")
+    rows: list[object] = []
+    if isinstance(r1_list, dict):
+        rows = [r1_list[key] for key in sorted(r1_list)]
+    elif isinstance(r1_list, list):
+        rows = list(r1_list)
+    for row in rows:
+        if isinstance(row, dict):
+            value = row.get("2")
+            if value not in (None, ""):
+                return str(value).strip()
+    return ""
+
+
+def _ensure_customer_order_no_column(payload: dict[str, Any]) -> None:
+    """OLAP送信直前の補完処理。
+
+    古いテンプレートに「客先注文No_10桁」列が無い場合でも、送信直前にR1Listへ
+    追加してOLAPレスポンスに必ず含まれるようにする。
+    """
+    columns = payload.get("R1List")
+    if not isinstance(columns, list):
+        return
+    for column in columns:
+        if isinstance(column, dict) and (
+            column.get("フィールド論理名") == CUSTOMER_ORDER_NO_FIELD
+            or column.get("OLAP表示名") == CUSTOMER_ORDER_NO_FIELD
+        ):
+            return
+
+    entity = ""
+    for column in columns:
+        if isinstance(column, dict) and column.get("フィールド論理名") == "受注No":
+            entity = column.get("エンティティ論理名") or ""
+            break
+    if not entity:
+        entity = str(payload.get("OLAP対象データ") or "")
+
+    nos = [
+        column.get("OLAP表示No")
+        for column in columns
+        if isinstance(column, dict) and isinstance(column.get("OLAP表示No"), int)
+    ]
+    new_no = (max(nos) + 1) if nos else 1
+
+    columns.append(OrderedDict([
+        ("OLAP表示No", new_no),
+        ("OLAP表示名", CUSTOMER_ORDER_NO_FIELD),
+        ("OLAPデータ区分", "1"),
+        ("エンティティ論理名", entity),
+        ("フィールド論理名", CUSTOMER_ORDER_NO_FIELD),
+        ("OLAP表示幅", 10),
+        ("OLAPフォントサイズ２", "0"),
+        ("OLAP空白値表示", "-"),
+        ("OLAP日付のフォーマットフラグ", "1"),
+        ("OLAP数値の3桁区切りフラグ", "1"),
+        ("OLAP桁数", 0),
+        ("OLAP小数", 0),
+        ("OLAP丸め", "0"),
+        ("OLAP出力順序No", None),
+        ("OLAP出力順", "2"),
+        ("OLAP空白値を先頭表示フラグ", "0"),
+        ("OLAP集計方法", "0"),
+        ("OLAP合計表示フラグ", "0"),
+        ("OLAP合計ラベル", "計"),
+        ("OLAP合計ラベルのみ表示フラグ", ""),
+        ("OLAP重複を除くフラグ", "0"),
+        ("OLAP演算式", ""),
+        ("OLAP演算式表記", ""),
+        ("OLAPドメイン分類", "0"),
+        ("XupperRoutingItems", []),
+    ]))
 
 
 def _extract_voucher_rows_or_raise(data: object, *, logger: logging.Logger | None = None) -> list[dict[str, str]]:

@@ -22,10 +22,14 @@ class GuiFlowStaticTest(unittest.TestCase):
         register_source = _slice("class KintoneRegisterWorkerThread", "class TksDebugWorkerThread")
         self.assertIn("KintoneClient(self.config, logger).register_rows(self.rows)", register_source)
 
-    def test_print_button_is_not_guarded_by_debug_visible(self) -> None:
+    def test_preview_print_button_is_guarded_by_debug_visible(self) -> None:
         preview_source = _slice("class RegistrationPreviewDialog", "class AdvancedSettingsDialog")
         self.assertIn('QPushButton("印刷")', preview_source)
-        self.assertNotIn("if debug_visible", preview_source)
+        self.assertIn("if debug_visible", preview_source)
+
+    def test_preview_receives_debug_visible_setting_from_main_window(self) -> None:
+        pending_source = _slice("def on_pending_registration", "def _collect_input")
+        self.assertIn("debug_visible=_settings_bool(self.settings, SETTINGS_DEBUG_VISIBLE, False)", pending_source)
 
     def test_theme_and_version_settings_live_on_launcher(self) -> None:
         launcher_settings = _slice_source(
@@ -60,6 +64,27 @@ class GuiFlowStaticTest(unittest.TestCase):
             layout_source.index("root.addLayout(settings_top_row)"),
             layout_source.index("root.addWidget(input_group)"),
         )
+
+    def test_kintone_screen_excludes_olap_account_inputs(self) -> None:
+        layout_source = _slice("def _build_layout", "def closeEvent")
+        for label in ("契約会社コード", "OLAPログインID", "OLAPパスワード"):
+            self.assertNotIn(label, layout_source)
+        for attr in ("self.company_code", "self.login_id", "self.password"):
+            self.assertNotIn(attr, layout_source)
+
+    def test_kintone_input_validation_does_not_require_olap_fields(self) -> None:
+        collect_source = _slice("def _collect_input", "def get_order_numbers")
+        self.assertNotIn("OLAPログインIDを入力してください。", collect_source)
+        self.assertNotIn("OLAPパスワードを入力してください。", collect_source)
+        self.assertIn("受注Noを1件以上入力してください。", collect_source)
+        self.assertIn("olap_login_id=self._olap_login_id", collect_source)
+        self.assertIn("olap_password=self._olap_password", collect_source)
+
+    def test_kintone_screen_does_not_save_olap_credentials(self) -> None:
+        main_source = _slice("class MainWindow", "def quit_app_for_update")
+        self.assertNotIn("def _save_credentials", main_source)
+        self.assertNotIn("SETTINGS_LOGIN_ID", main_source)
+        self.assertNotIn("SETTINGS_PASSWORD", main_source)
 
     def test_folder_buttons_exist_in_launcher(self) -> None:
         self.assertIn('QPushButton("設定フォルダを開く")', LAUNCHER_SOURCE)
@@ -184,6 +209,133 @@ class GuiFlowStaticTest(unittest.TestCase):
     def test_ui_font_size_is_larger_than_default(self) -> None:
         # 年配の方でも見やすいよう標準フォントを12ptへ拡大（要件4）。
         self.assertIn("font-size: 12pt", GUI_SOURCE)
+
+
+    def test_update_check_runs_after_launcher_shown_once(self) -> None:
+        show_source = _slice_source(LAUNCHER_SOURCE, "def showEvent", "def _check_update_once_after_show")
+        self.assertIn("_check_update_once_after_show()", show_source)
+        once_source = _slice_source(
+            LAUNCHER_SOURCE,
+            "def _check_update_once_after_show",
+            "def check_update_on_launcher_start",
+        )
+        # 一度だけ実行するためのガードと、画面表示後に開始する QTimer.singleShot。
+        self.assertIn("self._update_checked", once_source)
+        self.assertIn("QTimer.singleShot(0, self.check_update_on_launcher_start)", once_source)
+
+    def test_launcher_update_check_runs_in_background_thread(self) -> None:
+        self.assertIn("class _UpdateCheckThread(QThread)", LAUNCHER_SOURCE)
+        start_source = _slice_source(
+            LAUNCHER_SOURCE,
+            "def check_update_on_launcher_start",
+            "def _on_launch_update_check_succeeded",
+        )
+        self.assertIn("_UpdateCheckThread(self)", start_source)
+        self.assertIn(".start()", start_source)
+
+    def test_launcher_no_update_when_latest(self) -> None:
+        succeeded_source = _slice_source(
+            LAUNCHER_SOURCE,
+            "def _on_launch_update_check_succeeded",
+            "def _on_launch_update_check_failed",
+        )
+        # info is None の場合は通知せずログのみ。
+        self.assertIn("if info is None", succeeded_source)
+        self.assertNotIn("QMessageBox", succeeded_source)
+
+    def test_launcher_update_check_failure_is_not_fatal(self) -> None:
+        failed_source = _slice_source(
+            LAUNCHER_SOURCE,
+            "def _on_launch_update_check_failed",
+            "def _prompt_and_start_update",
+        )
+        # 失敗時はログのみで、機能選択画面を閉じない（quit/close しない）。
+        self.assertIn("_LOGGER.warning", failed_source)
+        self.assertNotIn("QApplication.quit", failed_source)
+        self.assertNotIn("self.close", failed_source)
+
+    def test_launcher_starts_update_only_when_user_accepts(self) -> None:
+        prompt_source = _slice_source(
+            LAUNCHER_SOURCE,
+            "def _prompt_and_start_update",
+            "def _apply_saved_theme",
+        )
+        self.assertIn("QMessageBox.question", prompt_source)
+        self.assertIn("if answer != QMessageBox.StandardButton.Yes", prompt_source)
+        # 更新を承諾したときだけ更新インストーラを開始する。
+        self.assertIn("launch_external_update", prompt_source)
+        accept_index = prompt_source.index("if answer != QMessageBox.StandardButton.Yes")
+        launch_index = prompt_source.index("launch_external_update")
+        self.assertLess(accept_index, launch_index)
+
+    def test_mainwindow_does_not_auto_check_update_on_launch(self) -> None:
+        # 起動直後の自動更新確認タイマーは廃止済み。
+        self.assertNotIn("_auto_update_timer", GUI_SOURCE)
+        self.assertNotIn("start_auto_update_check", GUI_SOURCE)
+
+    def test_no_powershell_in_update_related_sources(self) -> None:
+        for forbidden in ("powershell", "ExecutionPolicy", "run_update.ps1", ".ps1"):
+            self.assertNotIn(forbidden, GUI_SOURCE)
+            self.assertNotIn(forbidden, LAUNCHER_SOURCE)
+
+    def test_gui_has_quit_app_for_update_installer(self) -> None:
+        quit_source = _slice("def quit_app_for_update", "def run_gui")
+        # quit() だけでなく全ウィンドウを閉じてから終了する。
+        self.assertIn("topLevelWidgets()", quit_source)
+        self.assertIn(".close()", quit_source)
+        self.assertIn("app.quit()", quit_source)
+
+    def test_launcher_quits_only_after_installer_launch_succeeds(self) -> None:
+        prompt_source = _slice_source(
+            LAUNCHER_SOURCE,
+            "def _prompt_and_start_update",
+            "def _apply_saved_theme",
+        )
+        # 戻り値を受け取り、失敗時はエラー表示して終了しない、成功時のみ終了する。
+        self.assertIn("started = launch_external_update", prompt_source)
+        self.assertIn("if not started", prompt_source)
+        self.assertIn("update_installer.log", prompt_source)
+        self.assertIn("quit_app_for_update", prompt_source)
+        # エラー分岐（return）が quit より前にあること。
+        self.assertLess(
+            prompt_source.index("if not started"),
+            prompt_source.index("quit_app_for_update"),
+        )
+
+    def test_launcher_settings_dialog_quits_only_after_installer_success(self) -> None:
+        dialog_source = _slice_source(LAUNCHER_SOURCE, "def check_update", "def showEvent")
+        self.assertIn("started = launch_external_update", dialog_source)
+        self.assertIn("if not started", dialog_source)
+        self.assertIn("quit_app_for_update", dialog_source)
+
+    def test_worker_fetches_existing_kintone_records_before_pending(self) -> None:
+        worker_source = _slice("class WorkerThread", "class KintoneRegisterWorkerThread")
+        self.assertIn("fetch_existing_records_by_order_numbers", worker_source)
+        self.assertIn("existing_kintone_records=existing_records", worker_source)
+        # 通信失敗でも落とさず警告に回す（例外を握ってerrorに格納）。
+        self.assertIn("existing_fetch_error", worker_source)
+        fetch_index = worker_source.index("fetch_existing_records_by_order_numbers")
+        emit_index = worker_source.index("self.pending_registration.emit")
+        self.assertLess(fetch_index, emit_index)
+
+    def test_pending_registration_warns_on_fetch_error_and_merges(self) -> None:
+        pending_source = _slice("def on_pending_registration", "def _collect_input")
+        # 検索失敗時は画面を開く前に続行/中止を確認する。
+        self.assertIn("existing_fetch_error", pending_source)
+        self.assertIn("QMessageBox.question", pending_source)
+        self.assertIn("merge_existing_kintone_records_into_preview_rows", pending_source)
+        self.assertIn("kintone_existing_by_row=existing_by_row", pending_source)
+        # 中止（Yes以外）は画面を開かず return する。
+        question_index = pending_source.index("QMessageBox.question")
+        merge_index = pending_source.index("merge_existing_kintone_records_into_preview_rows")
+        self.assertLess(question_index, merge_index)
+
+    def test_gui_start_update_download_checks_installer_result(self) -> None:
+        download_source = _slice("def start_update_download", "def _message_parent")
+        self.assertIn("started = launch_external_update", download_source)
+        self.assertIn("if not started", download_source)
+        self.assertIn("update_installer.log", download_source)
+        self.assertIn("quit_app_for_update()", download_source)
 
 
 def _slice(start: str, end: str) -> str:

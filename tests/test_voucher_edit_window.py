@@ -403,19 +403,138 @@ class TestVoucherEditWindow(unittest.TestCase):
     def test_tool_highlight_switches(self) -> None:
         """選択中ツールのボタンだけがハイライト（チェック）される（要件11）。"""
         from app.voucher_edit_window import (
+            TOOL_ELLIPSE,
+            TOOL_LINE,
             TOOL_RECT,
             TOOL_SELECT,
+            TOOL_TEXT,
             VoucherEditWindow,
         )
 
         win = VoucherEditWindow(order_no="th1", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
-        win.set_tool(TOOL_SELECT)
-        self.assertTrue(win._tool_actions[TOOL_SELECT].isChecked())
-        self.assertFalse(win._tool_actions[TOOL_RECT].isChecked())
-        win.set_tool(TOOL_RECT)
-        self.assertTrue(win._tool_actions[TOOL_RECT].isChecked())
-        self.assertFalse(win._tool_actions[TOOL_SELECT].isChecked())
+        tools = (TOOL_TEXT, TOOL_LINE, TOOL_RECT, TOOL_ELLIPSE, TOOL_SELECT)
+        for selected_tool in tools:
+            win.set_tool(selected_tool)
+            checked = [
+                tool for tool, action in win._tool_actions.items()
+                if action.isChecked()
+            ]
+            self.assertEqual(checked, [selected_tool])
+
+    def test_edit_tool_buttons_use_selected_button_style(self) -> None:
+        """編集ツールだけに、反映先と同じ選択色の限定スタイルを適用する。"""
+        from PySide6.QtWidgets import QToolBar, QToolButton
+
+        from app.voucher_edit_window import (
+            EDIT_TOOLBAR_STYLE,
+            TOOL_TEXT,
+            VoucherEditWindow,
+        )
+
+        win = VoucherEditWindow(order_no="ths1", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        bar = win.findChildren(QToolBar)[0]
+        text_button = bar.widgetForAction(win._tool_actions[TOOL_TEXT])
+        self.assertIsInstance(text_button, QToolButton)
+        self.assertTrue(text_button.property("editToolButton"))
+        self.assertTrue(win._tool_actions[TOOL_TEXT].isChecked())
+        self.assertIn('QToolButton[editToolButton="true"]:checked', EDIT_TOOLBAR_STYLE)
+        self.assertIn("background-color: #0d6efd", EDIT_TOOLBAR_STYLE)
+        self.assertIn("color: #ffffff", EDIT_TOOLBAR_STYLE)
+        self.assertIn("border: 2px solid #66b2ff", EDIT_TOOLBAR_STYLE)
+        self.assertIn(":checked:disabled", EDIT_TOOLBAR_STYLE)
+
+    def test_reflect_target_highlight_switches_exclusively(self) -> None:
+        """反映先を切り替えると青背景が1ボタンだけへ移る。"""
+        from app.voucher_edit_window import VoucherEditWindow
+
+        with mock.patch(
+            "app.voucher_edit_window.current_title_bar_is_dark",
+            return_value=True,
+        ):
+            win = VoucherEditWindow(order_no="rth1", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        names = list(win._template_actions)
+        self.assertGreaterEqual(len(names), 2)
+        for button in win._template_actions.values():
+            self.assertTrue(button.property("reflectTargetButton"))
+
+        for selected_name in names[:2]:
+            win._on_template_selected(win._template_by_name(selected_name))
+            selected = [
+                name for name, button in win._template_actions.items()
+                if button.isChecked()
+                and button.property("reflectTargetSelected") is True
+            ]
+            self.assertEqual(selected, [selected_name])
+            for name, button in win._template_actions.items():
+                self.assertEqual(button.isChecked(), name == selected_name)
+                self.assertEqual(
+                    button.property("reflectTargetSelected"),
+                    name == selected_name,
+                )
+                if name == selected_name:
+                    self.assertIn(
+                        "background-color: #0d6efd",
+                        button.styleSheet(),
+                    )
+                else:
+                    self.assertNotIn(
+                        "background-color: #0d6efd",
+                        button.styleSheet(),
+                    )
+
+    def test_reflect_target_selected_style_is_blue_in_light_and_dark_modes(self) -> None:
+        """ライト/ダークとも選択中は直接指定の青背景になる。"""
+        from app.voucher_edit_window import VoucherEditWindow
+
+        for is_dark in (False, True):
+            with self.subTest(is_dark=is_dark), mock.patch(
+                "app.voucher_edit_window.current_title_bar_is_dark",
+                return_value=is_dark,
+            ):
+                win = VoucherEditWindow(
+                    order_no=f"rth-theme-{is_dark}",
+                    background_pdf_bytes=b"",
+                )
+                self.addCleanup(win.deleteLater)
+                selected = [
+                    button for button in win._template_actions.values()
+                    if button.isChecked()
+                ]
+                self.assertEqual(len(selected), 1)
+                self.assertIn(
+                    "background-color: #0d6efd",
+                    selected[0].styleSheet(),
+                )
+                for button in win._template_actions.values():
+                    if button is not selected[0]:
+                        self.assertNotIn(
+                            "background-color: #0d6efd",
+                            button.styleSheet(),
+                        )
+
+    def test_locked_reflect_target_buttons_have_style_properties(self) -> None:
+        """ロックアイコン付き固定テンプレートにも直接スタイルが設定される。"""
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="rth2", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        locked_buttons = [
+            button for button in win._template_actions.values()
+            if button.text().startswith("🔒 ")
+        ]
+        self.assertTrue(locked_buttons)
+        for button in locked_buttons:
+            self.assertTrue(button.property("reflectTargetButton"))
+            self.assertTrue(button.styleSheet().strip())
+        selected_locked = [button for button in locked_buttons if button.isChecked()]
+        self.assertEqual(len(selected_locked), 1)
+        self.assertIn(
+            "background-color: #0d6efd",
+            selected_locked[0].styleSheet(),
+        )
 
     def test_continuous_insert_keeps_tool(self) -> None:
         """オブジェクト作成後もツールが選択へ戻らない（要件12）。"""

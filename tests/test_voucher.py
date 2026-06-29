@@ -102,7 +102,7 @@ class TestVoucherService(unittest.TestCase):
             self.assertEqual(out.parent, output_dir)
             self.assertTrue(out.exists())
 
-    def test_pdf_filename_uses_timestamp_and_voucher_no(self) -> None:
+    def test_pdf_filename_uses_timestamp_and_order_no(self) -> None:
         import re
         import tempfile
         from app.voucher_service import create_vouchers_pdf
@@ -117,7 +117,7 @@ class TestVoucherService(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             out = create_vouchers_pdf(["01"], data=data, output_dir=Path(tmpdir), base_dir=PROJECT_ROOT)
-            self.assertRegex(out.name, r"^\d{8}_\d{6}_Z740506\.pdf$")
+            self.assertRegex(out.name, r"^\d{8}_\d{6}_5218869\.pdf$")
 
     def test_pdf_filename_falls_back_to_order_no(self) -> None:
         import tempfile
@@ -143,6 +143,21 @@ class TestVoucherService(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = save_pdf_bytes(b"%PDF", output_dir=Path(tmpdir), filename_token="multi")
             self.assertRegex(out.name, r"^\d{8}_\d{6}_multi\.pdf$")
+
+    def test_pdf_filename_collision_uses_number_from_two(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        from app import voucher_service
+        from app.voucher_service import save_pdf_bytes
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                mock.patch.object(voucher_service, "datetime") as dt:
+            dt.now.return_value.strftime.return_value = "20260622_093015"
+            first = save_pdf_bytes(b"%PDF", output_dir=Path(tmpdir), filename_token="1405113")
+            second = save_pdf_bytes(b"%PDF", output_dir=Path(tmpdir), filename_token="1405113")
+            self.assertEqual(first.name, "20260622_093015_1405113.pdf")
+            self.assertEqual(second.name, "20260622_093015_1405113_2.pdf")
 
     def test_pdf_filename_sanitizes_invalid_characters(self) -> None:
         import tempfile
@@ -250,15 +265,15 @@ class TestVoucherServiceSource(unittest.TestCase):
         self.assertIn("摘　要", self._SOURCE)
         self.assertIn("物件No", self._SOURCE)
 
-    def test_tax_notice_exists(self) -> None:
-        """消費税文言定数が使われていること。"""
-        self.assertIn("TAX_NOTICE", self._SOURCE)
+    def test_tax_notice_removed(self) -> None:
+        """固定の消費税文言は全廃され、描画コードに残っていないこと。"""
+        self.assertNotIn("TAX_NOTICE", self._SOURCE)
+        self.assertNotIn("（本伝票には消費税は含まれておりません。）", self._SOURCE)
 
-    def test_tax_notice_has_asterisk_prefix(self) -> None:
-        """消費税文言がサンプル紙伝票と同じ全角カッコ表記であること。"""
-        templates_src = (PROJECT_ROOT / "app" / "voucher_templates.py").read_text(encoding="utf-8")
-        self.assertIn("（本伝票には消費税は含まれておりません。）", templates_src)
-        self.assertNotIn("※本伝票には消費税は含まれておりません", templates_src)
+    def test_customer_order_no_drawn(self) -> None:
+        """お客様注文Noの描画ヘルパが使われていること。"""
+        self.assertIn("_draw_customer_order_no", self._SOURCE)
+        self.assertIn("CUSTOMER_ORDER_NO_LABEL", self._SOURCE)
 
     def test_lower_vertical_list_exists(self) -> None:
         """下部チェック欄が縦リスト形式で描画されること。"""
@@ -509,9 +524,10 @@ class TestVoucherWindowStatic(unittest.TestCase):
         self.assertIn("process_checks", self._SOURCE)
         self.assertIn("voucher_checks", self._SOURCE)
 
-    def test_pdf_print_back_buttons_present(self) -> None:
-        for label in ("PDF作成", "印刷", "戻る"):
+    def test_pdf_and_print_buttons_present_without_back(self) -> None:
+        for label in ("PDF作成", "印刷"):
             self.assertIn(label, self._SOURCE)
+        self.assertNotIn('QPushButton("戻る")', self._SOURCE)
 
     def test_no_selection_error_message(self) -> None:
         self.assertIn("印刷する伝票を1つ以上選択してください", self._SOURCE)
@@ -519,9 +535,10 @@ class TestVoucherWindowStatic(unittest.TestCase):
     def test_order_no_required_error_message(self) -> None:
         self.assertIn("受注Noを入力してください", self._SOURCE)
 
-    def test_row_add_remove_buttons_present(self) -> None:
-        for label in ("行追加", "選択削除", "選択PDF作成", "選択印刷"):
+    def test_row_action_buttons_present_with_delete(self) -> None:
+        for label in ("行追加", "選択PDF作成", "選択印刷", "選択削除"):
             self.assertIn(label, self._SOURCE)
+        self.assertIn('QPushButton("選択削除")', self._SOURCE)
 
     def test_process_and_finish_date_widgets_present(self) -> None:
         # AM/PM はコンボボックスからラジオボタンへ変更（要件3）。
@@ -726,17 +743,17 @@ class TestVoucher01Regression(unittest.TestCase):
         self.assertEqual(_split_note_rows("0 / 378 東大阪"), [("0", ""), ("378", "東大阪")])
         self.assertEqual(_split_note_rows("1,580 加"), [("1,580", "加")])
 
-    def test_note_totals_computed_from_details(self) -> None:
-        """摘要集計が明細行 note_lines から正しく計算されること。"""
-        from app.voucher_service import _extract_note_number
+    def test_unit_price_totals_computed_from_details(self) -> None:
+        """合計欄が売上単価/仕入単価×受注数量から正しく計算されること。"""
+        from app.voucher_service import calculate_unit_price_totals
         details = [
-            {"note_lines": ["1,580 加", "7,594 倉庫ま"]},
-            {"note_lines": ["800 東大阪", "3,846 倉庫ま"]},
+            {"name": "A", "sales_unit_price": "430", "purchase_unit_price": "316", "ordered_quantity": "1"},
+            {"name": "B", "sales_unit_price": "250", "purchase_unit_price": "224", "ordered_quantity": "1"},
+            {"name": "C", "sales_unit_price": "40", "purchase_unit_price": "34", "ordered_quantity": "1"},
         ]
-        upper = sum(_extract_note_number(r["note_lines"][0]) for r in details)
-        lower = sum(_extract_note_number(r["note_lines"][1]) for r in details)
-        self.assertAlmostEqual(upper, 2380.0)
-        self.assertAlmostEqual(lower, 11440.0)
+        sales_total, purchase_total = calculate_unit_price_totals(details)
+        self.assertAlmostEqual(sales_total, 720.0)
+        self.assertAlmostEqual(purchase_total, 574.0)
 
     def test_row7_separator_line_in_source(self) -> None:
         """No列7行目と合計行の区切り線が右側列（金額・摘要）にも描画されること。"""
@@ -781,8 +798,8 @@ class TestVoucher01Regression3(unittest.TestCase):
 
     # ── 3. 品名/数量の1段目・2段目アライメントがソースに反映されている ────────
     def test_name_first_row_uses_str_left_align(self) -> None:
-        """品名1段目が_str（左寄せ）で描画されること。"""
-        self.assertIn("_str(c, row.get(\"name\"", self._SVC_SRC)
+        """品名1段目が_str_name（左寄せ・トリムなし）で描画されること。"""
+        self.assertIn("_str_name(c, row.get(\"name\"", self._SVC_SRC)
 
     def test_dims_second_row_uses_rstr_right_align(self) -> None:
         """寸法2段目が_rstr（右寄せ）でDET_NAME_RXを使うこと。"""
@@ -816,21 +833,24 @@ class TestVoucher01Regression3(unittest.TestCase):
         """note_rxが受注No/伝票No表示に使われること。"""
         self.assertIn("note_rx", self._SVC_SRC)
 
-    # ── 6. 加工名リストに空白3行が追加されている ─────────────────────────────
+    # ── 6. 加工名リストに名称12行＋空白1行が並ぶ ─────────────────────────────
     def test_proc_labels_has_blank_rows(self) -> None:
         from app.voucher_templates import PROC_LABELS
         named = [lbl for lbl in PROC_LABELS if lbl]
         blank = [lbl for lbl in PROC_LABELS if not lbl]
-        self.assertEqual(len(named), 10)
-        self.assertEqual(len(blank), 3)
+        # フィルム貼・Rとり を追加して名称12・空白1（合計13は据え置き）。
+        self.assertEqual(len(named), 12)
+        self.assertEqual(len(blank), 1)
+        self.assertIn("フィルム貼", named)
+        self.assertIn("Rとり", named)
 
-    # ── 7. 営業担当・工事担当が表示される ────────────────────────────────────
-    def test_sales_rep_display_in_source(self) -> None:
-        self.assertIn("営業担当：", self._SVC_SRC)
+    # ── 7. 担当者ラベルは廃止し、担当者データは維持する ───────────────────────
+    def test_staff_labels_removed_but_values_remain(self) -> None:
+        self.assertNotIn("営業担当：", self._SVC_SRC)
+        self.assertNotIn("工事担当：", self._SVC_SRC)
         self.assertIn("SUM_STAFF_X", self._SVC_SRC)
-
-    def test_construction_rep_display_in_source(self) -> None:
-        self.assertIn("工事担当：", self._SVC_SRC)
+        self.assertIn('data.get("sales_rep"', self._SVC_SRC)
+        self.assertIn('data.get("construction_rep"', self._SVC_SRC)
 
     # ── 8. 下部エリアが上へ拡張されている ────────────────────────────────────
     def test_lower_section_top_moved_up(self) -> None:
@@ -997,26 +1017,21 @@ class TestVoucher01Regression7(unittest.TestCase):
 
 
 class TestVoucher01Regression6(unittest.TestCase):
-    """営業担当/工事担当常時表示 + 工場控タイトルの回帰テスト。"""
+    """中央担当者ラベル削除・データ維持 + 工場控タイトルの回帰テスト。"""
 
     def _svc_src(self) -> str:
         import pathlib
         return (pathlib.Path(__file__).resolve().parents[1] / "app" / "voucher_service.py").read_text(encoding="utf-8")
 
-    def test_sales_rep_label_always_drawn(self) -> None:
-        """営業担当ラベルは if 条件なしで常時 _str 呼び出しされること。"""
+    def test_sales_rep_label_is_not_drawn(self) -> None:
         src = self._svc_src()
-        self.assertIn('_str(c, f"営業担当：{sales_rep}"', src)
-        self.assertNotIn('if sales_rep:\n        _str(c, f"営業担当', src)
+        self.assertNotIn("営業担当：", src)
 
-    def test_construction_rep_label_always_drawn(self) -> None:
-        """工事担当ラベルは if 条件なしで常時 _str 呼び出しされること。"""
+    def test_construction_rep_label_is_not_drawn(self) -> None:
         src = self._svc_src()
-        self.assertIn('_str(c, f"工事担当：{construction_rep}"', src)
-        self.assertNotIn('if construction_rep:\n        _str(c, f"工事担当', src)
+        self.assertNotIn("工事担当：", src)
 
-    def test_sales_rep_empty_data_renders_label(self) -> None:
-        """sales_rep が空でも PDF 生成が成功し、ラベルが含まれること。"""
+    def test_empty_staff_data_still_builds_pdf(self) -> None:
         from app.voucher_service import build_vouchers_pdf_bytes
         from app.voucher_templates import DUMMY_DATA
         data = {**DUMMY_DATA, "sales_rep": "", "construction_rep": ""}
@@ -1045,12 +1060,12 @@ class TestVoucher01Regression5(unittest.TestCase):
     """TAX_Y オーバーラップ修正の回帰テスト。"""
 
     def test_tax_y_below_bkno_line_with_margin(self) -> None:
-        """消費税文言(7.5pt)が物件No下線と重ならないこと。"""
-        from app.voucher_templates import TAX_Y, FORM_BKNO_BOT
-        self.assertLess(TAX_Y + 7.5, FORM_BKNO_BOT)
+        """お客様注文No表示(1.2倍)が物件No下線と重ならないこと。"""
+        from app.voucher_templates import TAX_Y, FORM_BKNO_BOT, CUSTOMER_ORDER_NO_FONT_SIZE
+        self.assertLess(TAX_Y + CUSTOMER_ORDER_NO_FONT_SIZE, FORM_BKNO_BOT)
 
     def test_lwr_top_below_tax_y(self) -> None:
-        """下部枠の上端が消費税文言より下にあること。"""
+        """下部枠の上端がお客様注文No表示位置より下にあること。"""
         from app.voucher_templates import FORM_LWR_TOP, TAX_Y
         self.assertLess(FORM_LWR_TOP, TAX_Y)
 
@@ -1114,17 +1129,18 @@ class TestVoucherLowerShiftAndDimShift(unittest.TestCase):
         from app.voucher_templates import FORM_SUM_TOP, FORM_DETAIL_BOT, FORM_SUM_GAP
         self.assertAlmostEqual(FORM_SUM_TOP, FORM_DETAIL_BOT - FORM_SUM_GAP, places=2)
 
-    def test_dim_shift_left_is_about_1cm(self) -> None:
-        """品名WH表示の左移動量は 1.0cm = 約28.35pt。"""
+    def test_dim_shift_left_is_zero_after_right_move(self) -> None:
+        """WH表示を1cm右へ移動したため、左移動量は 0pt（品名列右端基準）。"""
         from app.voucher_templates import DIM_SHIFT_LEFT
-        self.assertAlmostEqual(DIM_SHIFT_LEFT, 28.35, places=2)
+        self.assertAlmostEqual(DIM_SHIFT_LEFT, 0.0, places=2)
 
     def test_dims_drawn_with_left_shift_in_source(self) -> None:
         """寸法(WH)描画が DET_NAME_RX - DIM_SHIFT_LEFT を使い、商品名は移動しないこと。"""
         src = (PROJECT_ROOT / "app" / "voucher_service.py").read_text(encoding="utf-8")
         self.assertIn("DET_NAME_RX - DIM_SHIFT_LEFT", src)
-        # 品名1段目は TBL_X_NAME 左寄せのまま（移動しない）
-        self.assertIn("_str(c, row.get(\"name\", \"\"), TBL_X_NAME", src)
+        # 品名1段目は TBL_X_NAME 左寄せのまま（移動しない）。
+        # 品名描画は先頭スペース保持のため _str_name 経由（トリムしない）。
+        self.assertIn("_str_name(c, row.get(\"name\", \"\"), TBL_X_NAME", src)
 
 
 class TestVoucherLayoutRegression8(unittest.TestCase):
@@ -1216,9 +1232,9 @@ class TestVoucherLayoutRegression8(unittest.TestCase):
         self.assertGreater(GEN_CIRCLE_X, 30.0)
 
     def test_noki_line_x_at_code_no_right(self) -> None:
-        """NOKI_LINE_X がコードNo枠右端（90pt）以上であること。"""
-        from app.voucher_templates import NOKI_LINE_X
-        self.assertGreaterEqual(NOKI_LINE_X, 90.0)
+        """NOKI_LINE_X がコードNo枠右端（HDR_ROW1_DIVS[0]）以上であること。"""
+        from app.voucher_templates import NOKI_LINE_X, HDR_ROW1_DIVS
+        self.assertGreaterEqual(NOKI_LINE_X, HDR_ROW1_DIVS[0])
 
     def test_noki_line_uses_noki_line_x(self) -> None:
         """_draw_noki_line が NOKI_LINE_X を使うこと。"""
@@ -1377,13 +1393,11 @@ class TestDeliveryReceiptLayout(unittest.TestCase):
             table_src.index("_draw_delivery_07_outline"),
         )
 
-    def test_delivery_summary_draws_staff_lines(self) -> None:
+    def test_delivery_summary_draws_staff_values_without_labels(self) -> None:
         src = self._func_src("_draw_summary_rows")
-        self.assertIn("sales_rep", src)
-        self.assertIn("construction_rep", src)
-        self.assertIn("営業担当：", src)
-        self.assertIn("工事担当：", src)
-        self.assertIn("SUM_STAFF_X", src)
+        self.assertIn("_draw_staff_values", src)
+        self.assertNotIn("営業担当：", src)
+        self.assertNotIn("工事担当：", src)
 
     def test_receipt_stamp_column_has_no_internal_horizontal_lines(self) -> None:
         src = self._func_src("_draw_receipt_table_08")
@@ -1467,23 +1481,61 @@ class TestRowSettingsRendering(unittest.TestCase):
         self.assertNotIn("12", drawn)
         self.assertNotIn("25", drawn)
 
-    def test_finish_date_shifted_left(self) -> None:
-        """仕上日（月・日）の数値描画位置が、以前の位置より左へ移動していること。"""
+    def test_finish_date_not_overlapping_month_day_labels(self) -> None:
+        """仕上日データ（月/日の数値）が「月」「日」ラベルと重ならないこと（要件3）。"""
         from datetime import date
+        from reportlab.pdfbase import pdfmetrics
         from app import voucher_service
-        from app.voucher_templates import FORM_HDR_RIGHT
+        from app.voucher_templates import (
+            HDR_SHIAGE_LABEL_FS,
+            HDR_SHIAGE_DAY_LABEL_RX, HDR_SHIAGE_MONTH_LABEL_CX,
+            HDR_SHIAGE_MONTH_DATA_RX, HDR_SHIAGE_DAY_DATA_RX,
+            HDR_ROW1_DIVS, FORM_HDR_RIGHT,
+        )
+
+        font = voucher_service._FONT_NAME
+        # 実際の描画フォント（1.2倍。要件1）・2桁の月日（最大幅）で検証する。
+        data_fs = voucher_service.HEADER_FINISH_DATE_VALUE_FONT_SIZE
+        month_w = pdfmetrics.stringWidth("12", font, data_fs)
+        day_w = pdfmetrics.stringWidth("31", font, data_fs)
+        getsu_w = pdfmetrics.stringWidth("月", font, HDR_SHIAGE_LABEL_FS)
+        nichi_w = pdfmetrics.stringWidth("日", font, HDR_SHIAGE_LABEL_FS)
+
+        # 各要素の左右端（X区間）を算出。
+        month_data = (HDR_SHIAGE_MONTH_DATA_RX - month_w, HDR_SHIAGE_MONTH_DATA_RX)
+        getsu = (HDR_SHIAGE_MONTH_LABEL_CX - getsu_w / 2, HDR_SHIAGE_MONTH_LABEL_CX + getsu_w / 2)
+        day_data = (HDR_SHIAGE_DAY_DATA_RX - day_w, HDR_SHIAGE_DAY_DATA_RX)
+        nichi = (HDR_SHIAGE_DAY_LABEL_RX - nichi_w, HDR_SHIAGE_DAY_LABEL_RX)
+
+        # 左から 月データ < 月 < 日データ < 日 の順で重ならないこと。
+        self.assertLessEqual(month_data[1], getsu[0])
+        self.assertLessEqual(getsu[1], day_data[0])
+        self.assertLessEqual(day_data[1], nichi[0])
+        # セル(371〜420)内に収まること。
+        self.assertGreaterEqual(month_data[0], HDR_ROW1_DIVS[-1])
+        self.assertLessEqual(nichi[1], FORM_HDR_RIGHT)
+
+    def test_finish_date_data_larger_than_labels(self) -> None:
+        """仕上日データのフォントが月日ラベルより大きいこと（要件3 できるだけ大きめ）。"""
+        from app.voucher_templates import HDR_SHIAGE_DATA_FS, HDR_SHIAGE_LABEL_FS
+
+        self.assertGreater(HDR_SHIAGE_DATA_FS, HDR_SHIAGE_LABEL_FS)
+
+    def test_month_label_centered_day_label_right(self) -> None:
+        """「月」は中央寄せ、「日」は右寄せで描画されること（要件3）。"""
+        from app import voucher_service
+        from app.voucher_templates import (
+            HDR_SHIAGE_MONTH_LABEL_CX, HDR_SHIAGE_DAY_LABEL_RX,
+        )
 
         c = self._canvas()
-        xs: list[float] = []
-        c.drawRightString = lambda x, y, t: xs.append(x)  # type: ignore[assignment]
-        voucher_service._draw_header_finish_date(c, date(2026, 6, 10))
-        # 以前は 月=FORM_HDR_RIGHT-30 / 日=FORM_HDR_RIGHT-8 に描画していた。
-        self.assertEqual(len(xs), 2)
-        self.assertLess(xs[0], FORM_HDR_RIGHT - 30.0)
-        self.assertLess(xs[1], FORM_HDR_RIGHT - 8.0)
-        # 左シフト量は概ね 2〜4mm（約6〜11pt）の範囲。
-        self.assertGreaterEqual(voucher_service.FINISH_DATE_SHIFT, 5.0)
-        self.assertLessEqual(voucher_service.FINISH_DATE_SHIFT, 12.0)
+        centred: list[tuple[float, str]] = []
+        right: list[tuple[float, str]] = []
+        c.drawCentredString = lambda x, y, t: centred.append((x, t))  # type: ignore[assignment]
+        c.drawRightString = lambda x, y, t: right.append((x, t))  # type: ignore[assignment]
+        voucher_service._draw_shiage_month_day_labels(c)
+        self.assertIn((HDR_SHIAGE_MONTH_LABEL_CX, "月"), centred)
+        self.assertIn((HDR_SHIAGE_DAY_LABEL_RX, "日"), right)
 
     def test_am_circle_left_of_pm_circle(self) -> None:
         """AM選択時はAM側、PM選択時はPM側に丸が描画されること。"""
@@ -1567,6 +1619,32 @@ class TestRowSettingsRendering(unittest.TestCase):
         )
         self.assertEqual(marks, [])
 
+    def test_process_mark_film_and_rtori_drawn_when_on(self) -> None:
+        """フィルム貼・Rとり がON時に「✔」が描画されること。"""
+        from app import voucher_service
+
+        c = self._canvas()
+        marks: list = []
+        c.lines = lambda linelist: marks.append(list(linelist))  # type: ignore[assignment]
+        voucher_service._draw_process_check_marks(
+            c, {"フィルム貼": True, "Rとり": True}
+        )
+        # フィルム貼・Rとり の2項目に「✔」が描かれる。
+        self.assertEqual(len(marks), 2)
+        self.assertTrue(all(len(segs) == 2 for segs in marks))
+
+    def test_process_mark_film_and_rtori_off_not_drawn(self) -> None:
+        """フィルム貼・Rとり がOFF時は「✔」が描画されないこと。"""
+        from app import voucher_service
+
+        c = self._canvas()
+        marks: list = []
+        c.lines = lambda linelist: marks.append(list(linelist))  # type: ignore[assignment]
+        voucher_service._draw_process_check_marks(
+            c, {"フィルム貼": False, "Rとり": False}
+        )
+        self.assertEqual(marks, [])
+
     def test_row_settings_skipped_for_delivery_vouchers(self) -> None:
         """納品書(07)・受領書(08)では行設定反映処理を呼ばないこと。"""
         from unittest.mock import patch
@@ -1587,6 +1665,192 @@ class TestRowSettingsRendering(unittest.TestCase):
             with patch.object(voucher_service, "_draw_row_settings") as m:
                 voucher_service.build_vouchers_pdf_bytes([vid], DUMMY_DATA, base_dir=PROJECT_ROOT)
             m.assert_called()
+
+
+class TestCustomerOrderNo(unittest.TestCase):
+    """客先注文No_10桁（お客様注文No）表示の追加仕様テスト。"""
+
+    _ALL_VOUCHER_IDS = ("01", "02", "03", "04", "05", "06", "07", "08")
+
+    def _page_text(self, voucher_id: str, data: dict) -> str:
+        import io
+        import pypdf
+        from app.voucher_service import build_vouchers_pdf_bytes
+
+        pdf = build_vouchers_pdf_bytes([voucher_id], data, base_dir=PROJECT_ROOT)
+        reader = pypdf.PdfReader(io.BytesIO(pdf))
+        return reader.pages[0].extract_text()
+
+    def test_olap_request_contains_customer_order_no(self) -> None:
+        """1. OLAPリクエスト(送信ペイロード)に「客先注文No_10桁」が含まれること。"""
+        from app.voucher_olap_service import _build_voucher_payload
+
+        payload, _ = _build_voucher_payload("5218869")
+        names = {
+            str(c.get("フィールド論理名"))
+            for c in payload.get("R1List", [])
+            if isinstance(c, dict)
+        }
+        self.assertIn("客先注文No_10桁", names)
+
+    def test_old_template_supplemented_before_send(self) -> None:
+        """2. 古いテンプレートに項目が無い場合、送信直前に補完されること。"""
+        from app.voucher_olap_service import _ensure_customer_order_no_column
+
+        payload = {
+            "OLAP対象データ": "OLAP_T01-03 受注入力明細データ",
+            "R1List": [
+                {"OLAP表示No": 6, "フィールド論理名": "受注No",
+                 "エンティティ論理名": "OLAP_T01-03 受注入力明細データ"},
+            ],
+        }
+        _ensure_customer_order_no_column(payload)
+        names = [c.get("フィールド論理名") for c in payload["R1List"]]
+        self.assertIn("客先注文No_10桁", names)
+        # 既存項目を壊さず末尾に1件だけ追加していること。
+        self.assertEqual(names.count("客先注文No_10桁"), 1)
+        added = payload["R1List"][-1]
+        self.assertEqual(added["OLAP表示No"], 7)
+        self.assertEqual(added["エンティティ論理名"], "OLAP_T01-03 受注入力明細データ")
+
+    def test_supplement_is_idempotent(self) -> None:
+        """補完処理は既に項目があれば二重追加しないこと。"""
+        from app.voucher_olap_service import _ensure_customer_order_no_column
+
+        payload = {
+            "R1List": [
+                {"OLAP表示No": 6, "フィールド論理名": "受注No"},
+                {"OLAP表示No": 45, "フィールド論理名": "客先注文No_10桁"},
+            ],
+        }
+        _ensure_customer_order_no_column(payload)
+        names = [c.get("フィールド論理名") for c in payload["R1List"]]
+        self.assertEqual(names.count("客先注文No_10桁"), 1)
+
+    def test_mapper_keeps_customer_order_no(self) -> None:
+        """3. voucher_data_mapper でPDF用データに保持されること。"""
+        from app.voucher_data_mapper import build_voucher_pages
+
+        rows = [{
+            "order_no": "5218869",
+            "customer_order_no_10": "ABCD123456",
+            "product_name": "品名",
+        }]
+        pages = build_voucher_pages(rows)
+        self.assertEqual(pages[0]["customer_order_no_10"], "ABCD123456")
+
+    def test_pdf_shows_customer_order_no(self) -> None:
+        """4. 値がある場合「お客様注文No. xxxx」が表示されること。"""
+        data = {"pages": [{
+            "order_no": "5218869",
+            "customer_order_no_10": "ABCD123456",
+            "details": [{"name": "品名"}],
+        }]}
+        text = self._page_text("01", data)
+        self.assertIn("お客様注文No. ABCD123456", text)
+
+    def test_pdf_hides_when_blank(self) -> None:
+        """5. 空欄/空白のみの場合は何も表示されないこと。"""
+        for blank in ("", "   ", "　", None):
+            data = {"pages": [{
+                "order_no": "5218869",
+                "customer_order_no_10": blank,
+                "details": [{"name": "品名"}],
+            }]}
+            text = self._page_text("01", data)
+            self.assertNotIn("お客様注文No", text)
+
+    def test_pdf_has_no_tax_notice(self) -> None:
+        """6. 消費税固定文言がPDFに出力されないこと。"""
+        data = {"pages": [{
+            "order_no": "5218869",
+            "customer_order_no_10": "ABCD123456",
+            "details": [{"name": "品名"}],
+        }]}
+        for vid in self._ALL_VOUCHER_IDS:
+            text = self._page_text(vid, data)
+            self.assertNotIn("消費税", text, f"伝票{vid}に消費税文言が残っている")
+            self.assertNotIn("本伝票には", text, f"伝票{vid}に消費税文言が残っている")
+
+    def test_all_vouchers_same_spec(self) -> None:
+        """7. 01〜08すべての伝票で同じ仕様（表示あり/空欄非表示）になること。"""
+        with_value = {"pages": [{
+            "order_no": "5218869",
+            "customer_order_no_10": "ABCD123456",
+            "details": [{"name": "品名"}],
+        }]}
+        without_value = {"pages": [{
+            "order_no": "5218869",
+            "customer_order_no_10": "",
+            "details": [{"name": "品名"}],
+        }]}
+        for vid in self._ALL_VOUCHER_IDS:
+            self.assertIn("お客様注文No. ABCD123456", self._page_text(vid, with_value),
+                          f"伝票{vid}でお客様注文Noが表示されていない")
+            self.assertNotIn("お客様注文No", self._page_text(vid, without_value),
+                             f"伝票{vid}で空欄時に表示されている")
+
+    def test_font_size_is_1_2x(self) -> None:
+        """8. 表示文字サイズが従来(7.5pt)比1.2倍であること。"""
+        from app.voucher_templates import (
+            CUSTOMER_ORDER_NO_FONT_SIZE,
+            CUSTOMER_ORDER_NO_BASE_FONT_SIZE,
+        )
+        self.assertEqual(CUSTOMER_ORDER_NO_BASE_FONT_SIZE, 7.5)
+        self.assertAlmostEqual(
+            CUSTOMER_ORDER_NO_FONT_SIZE, 7.5 * 1.2, places=6
+        )
+
+    def test_mapper_resolves_customer_order_no_from_response_key(self) -> None:
+        """OLAPレスポンスのキー45から customer_order_no_10 を取得できること。
+
+        現行レイアウト(OP列36-44あり)・非現行レイアウト(OP列無し)の双方で、
+        表示No=45 に入った客先注文Noが page data に保持されることを確認する。
+        商品名称の先頭スペース保持修正後も他項目の取得が壊れないことの回帰テスト。
+        """
+        from app.voucher_data_mapper import extract_r1_rows, build_voucher_pages
+
+        for label, extra_keys in (("current", {"40": "02"}), ("legacy", {})):
+            row = {str(i): f"v{i}" for i in (1, 5, 6, 7, 8, 9, 16)}
+            row.update(extra_keys)
+            row["45"] = "ABCD123456"
+            rows = extract_r1_rows({"ResponseData": {"R1List": [row]}})
+            self.assertEqual(
+                rows[0].get("customer_order_no_10"), "ABCD123456",
+                f"{label}: extract後にcustomer_order_no_10が消えている",
+            )
+            pages = build_voucher_pages(rows)
+            self.assertEqual(
+                pages[0]["customer_order_no_10"], "ABCD123456",
+                f"{label}: build_voucher_pages後に保持されていない",
+            )
+
+    def test_mapper_response_path_keeps_product_name_spaces(self) -> None:
+        """商品名称の前後空白保持と customer_order_no_10 取得が両立すること。"""
+        from app.voucher_data_mapper import extract_r1_rows, build_voucher_pages
+
+        row = {str(i): f"v{i}" for i in (1, 5, 6, 7, 8, 9, 40)}
+        row["16"] = "  品名スペース  "
+        row["45"] = "X1"
+        pages = build_voucher_pages(extract_r1_rows({"ResponseData": {"R1List": [row]}}))
+        self.assertEqual(pages[0]["details"][0]["name"], "  品名スペース  ")
+        self.assertEqual(pages[0]["customer_order_no_10"], "X1")
+
+    def test_bundled_templates_contain_field(self) -> None:
+        """同梱OLAPテンプレートに項目が反映されていること。"""
+        import json
+
+        for rel in (
+            "templates/voucher_olap_request.json",
+            "docs/olap/kakou_request_template.json",
+        ):
+            payload = json.loads((PROJECT_ROOT / rel).read_text(encoding="utf-8-sig"))
+            names = {
+                str(c.get("フィールド論理名"))
+                for c in payload.get("R1List", [])
+                if isinstance(c, dict)
+            }
+            self.assertIn("客先注文No_10桁", names, f"{rel} に項目が無い")
 
 
 if __name__ == "__main__":
