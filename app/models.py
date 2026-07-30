@@ -101,6 +101,8 @@ class PendingRegistration:
     existing_kintone_records: list[dict[str, str]] = field(default_factory=list)
     # Kintone既存データ検索に失敗した場合のエラーメッセージ（成功時は None）。
     existing_fetch_error: str | None = None
+    # worker内で読み込んだ加工名マスタ。GUIスレッドで再読込しない。
+    kakou_master: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass

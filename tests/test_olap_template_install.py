@@ -98,6 +98,17 @@ class EnsureOlapTemplatesInstalledTest(unittest.TestCase):
         data = json.loads(target.read_text(encoding="utf-8-sig"))
         self.assertEqual(data["R2List"][0]["marker"], "new")
 
+    def test_redeploys_soba_after_deleted(self) -> None:
+        # soba_request_template.json だけ消えても同梱側から再配置される。
+        ensure_olap_templates_installed(self.base_dir)
+        target = olap_template_dir(self.base_dir) / "soba_request_template.json"
+        target.unlink()
+        self.assertFalse(target.exists())
+        ensure_olap_templates_installed(self.base_dir)
+        self.assertTrue(target.exists())
+        data = json.loads(target.read_text(encoding="utf-8-sig"))
+        self.assertEqual(data["R2List"][0]["marker"], "bundled")
+
     def test_missing_source_logs_all_candidates(self) -> None:
         # コピー元が見つからない場合、候補パスがすべてログに出る。
         self._patcher.stop()
@@ -170,6 +181,22 @@ class OlapFetchSelfRepairTest(unittest.TestCase):
         self.assertIn("R1List", payload)
         self.assertTrue(missing.exists())
 
+    def test_self_repair_when_soba_template_missing(self) -> None:
+        # soba 側テンプレートが ProgramData に無くても自己復旧して payload を構築できる。
+        missing = olap_template_dir(self.base_dir) / "soba_request_template.json"
+        self.assertFalse(missing.exists())
+        # kakou/soba とも同じ未存在パスを設定し、soba 取得で復旧されることを確認する。
+        config = self._config(missing)
+        client = HttpTksClient(config, self.logger)
+
+        with mock.patch.object(
+            app_config, "olap_template_source_dirs", return_value=[self.bundle_dir]
+        ), mock.patch.object(app_config, "default_base_dir", return_value=self.base_dir):
+            payload = client._build_olap_payload("soba", ["1386655"])
+
+        self.assertIn("R1List", payload)
+        self.assertTrue(missing.exists())
+
     def test_clear_error_when_source_missing(self) -> None:
         # コピー元テンプレートが無い場合、探したパスとログ場所を含むエラー。
         missing = olap_template_dir(self.base_dir) / "kakou_request_template.json"
@@ -209,6 +236,36 @@ class OlapFetchSelfRepairTest(unittest.TestCase):
         self.assertTrue(target.exists())
         data = json.loads(target.read_text(encoding="utf-8-sig"))
         self.assertEqual(data["R2List"][0]["marker"], "internal")
+
+
+class OlapTemplateSourceDirsTest(unittest.TestCase):
+    """同梱テンプレート探索パスの堅牢性（重複除去・PyInstaller想定）テスト。"""
+
+    def test_no_duplicate_paths(self) -> None:
+        # 探索パスに重複（例: _internal\_internal 由来の同一パス）が無いこと。
+        dirs = [str(p) for p in app_config.olap_template_source_dirs()]
+        self.assertEqual(len(dirs), len(set(dirs)), dirs)
+
+    def test_includes_exe_relative_internal_dir(self) -> None:
+        # 配布時の実体パス（EXEの隣の _internal\docs\olap）が候補に含まれること。
+        fake_exe = Path("/fake/install/TksToKintone.exe")
+        with mock.patch.object(app_config.sys, "executable", str(fake_exe)):
+            dirs = [str(p) for p in app_config.olap_template_source_dirs()]
+        expected = str((fake_exe.resolve().parent / "_internal" / "docs" / "olap"))
+        self.assertIn(expected, dirs)
+
+    def test_resource_path_resolves_docs_olap_under_meipass(self) -> None:
+        # PyInstaller配布想定: _MEIPASS 配下の docs/olap を resource_path で解決できる。
+        with TemporaryDirectory() as tmp:
+            meipass = Path(tmp)
+            olap = meipass / "docs" / "olap"
+            for name in TEMPLATE_NAMES:
+                _write_template(olap / name, marker="meipass")
+            with mock.patch.object(app_config.sys, "_MEIPASS", str(meipass), create=True):
+                resolved = app_config.resource_path("docs/olap")
+                self.assertEqual(resolved, olap)
+                for name in TEMPLATE_NAMES:
+                    self.assertTrue((resolved / name).exists())
 
 
 if __name__ == "__main__":

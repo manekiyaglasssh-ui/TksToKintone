@@ -81,6 +81,21 @@ class TestSemanticButtonStyles(unittest.TestCase):
                 stylesheet.rfind("QPushButton:disabled, QToolButton:disabled"),
             )
 
+    def test_press_animation_applies_to_all_buttons(self) -> None:
+        """全画面共通の押下表示（:pressed）がライト/ダーク両テーマで定義される。"""
+        for stylesheet in (LIGHT_STYLESHEET, DARK_STYLESHEET):
+            self.assertIn("QPushButton:pressed, QToolButton:pressed", stylesheet)
+            self.assertIn(
+                "QPushButton:checked:pressed, QToolButton:checked:pressed", stylesheet
+            )
+
+    def test_press_animation_applies_to_role_buttons(self) -> None:
+        """用途別ボタンにも :pressed の押下表示が定義される（無効ボタンは押せない）。"""
+        self.assertIn('buttonRole="primary"]:pressed', SEMANTIC_BUTTON_STYLESHEET)
+        self.assertIn('buttonRole="success"]:pressed', SEMANTIC_BUTTON_STYLESHEET)
+        self.assertIn('buttonRole="secondary"]:pressed', SEMANTIC_BUTTON_STYLESHEET)
+        self.assertIn('buttonRole="danger"]:pressed', SEMANTIC_BUTTON_STYLESHEET)
+
     def test_reflect_target_direct_styles_keep_selected_state_blue(self) -> None:
         self.assertIn("background-color: #0d6efd", REFLECT_TARGET_SELECTED_STYLE)
         self.assertIn("color: #ffffff", REFLECT_TARGET_SELECTED_STYLE)

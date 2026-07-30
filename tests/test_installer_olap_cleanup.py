@@ -50,6 +50,21 @@ class InstallerOlapCleanupTest(unittest.TestCase):
         self.assertIn("ignoreversion", line)
         self.assertIn("recursesubdirs", line)
 
+    def test_files_section_explicitly_installs_templates(self) -> None:
+        # PyInstaller バンドル漏れに備え、リポジトリ docs/olap から
+        # {app}\_internal\docs\olap へ各テンプレートを明示コピーする行があること。
+        for name in ("kakou_request_template.json", "soba_request_template.json"):
+            pattern = (
+                r'Source:\s*"\.\.\\docs\\olap\\'
+                + re.escape(name)
+                + r'";\s*DestDir:\s*"\{app\}\\_internal\\docs\\olap";[^\n]*ignoreversion'
+            )
+            self.assertRegex(
+                self.source,
+                pattern,
+                f"{name} を _internal\\docs\\olap へ明示コピーする[Files]行が無い",
+            )
+
 
 class BundledTemplateContentTest(unittest.TestCase):
     """更新後に配置されるテンプレートに OP区分 が含まれること。"""

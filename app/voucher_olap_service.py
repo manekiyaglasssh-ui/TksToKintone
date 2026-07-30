@@ -65,6 +65,9 @@ class VoucherOlapService:
         self.last_response_r1_count = 0
         # 得意先コード単位の取引区分キャッシュ（要件7: 同一コードの重複問い合わせ防止）。
         self._transaction_type_cache: dict[str, str] = {}
+        # 得意先マスタ（納品書単価・金額上段/下段（硝子））のキャッシュ。取引区分と同一の
+        # OLAPリクエストで取得するため、コード単位で dict をまとめて保持する。
+        self._customer_master_cache: dict[str, dict[str, str]] = {}
 
     def login_if_needed(self, login_id: str, password: str) -> None:
         if self.config.tks_client_mode == "mock":
@@ -113,8 +116,13 @@ class VoucherOlapService:
     def fetch_voucher_rows(self, order_no: str) -> list[dict[str, str]]:
         if self.config.tks_client_mode == "mock":
             data = _load_mock_response()
+            payload, _ = _build_voucher_payload(order_no)
             self._log_response_diagnostics(order_no, data, request_executed=True)
-            rows = extract_r1_rows(data, logger=self.logger)
+            rows = extract_r1_rows(
+                data,
+                logger=self.logger,
+                request_columns=_request_columns(payload),
+            )
             filtered = [row for row in rows if (row.get("order_no") or row.get("6") or "").strip() == order_no]
             self.last_response_r1_count += len(filtered)
             return filtered
@@ -155,11 +163,31 @@ class VoucherOlapService:
             str(isinstance(data, dict) and "ResponseData" in data).lower(),
             _message_name(data),
         )
-        rows = _extract_voucher_rows_or_raise(data, logger=self.logger)
+        rows = _extract_voucher_rows_or_raise(
+            data,
+            logger=self.logger,
+            request_columns=_request_columns(payload),
+        )
         if not rows:
             raise OlapNoDataError()
         self.last_response_r1_count += len(rows)
         self.logger.info("売上伝票OLAP取得完了: order_no=%s rows=%s", order_no, len(rows))
+        if rows:
+            unit_codes = [str(row.get("quantity_unit_code") or "").strip() for row in rows]
+            self.logger.info(
+                "voucher_olap_quantity_unit_code_parsed: order_no=%s codes=%s hidden19=%s",
+                order_no,
+                [code for code in unit_codes if code][:20],
+                sum(1 for code in unit_codes if code == "19"),
+            )
+            course_codes = [str(row.get("delivery_course_code") or "").strip() for row in rows]
+            course_names = [str(row.get("delivery_course_name") or "").strip() for row in rows]
+            self.logger.info(
+                "voucher_delivery_course_parsed: order_no=%s codes=%s names=%s",
+                order_no,
+                [value for value in course_codes if value][:20],
+                [value for value in course_names if value][:20],
+            )
         if rows:
             first = rows[0]
             unit_price, amount = resolve_unit_and_amount_values(first, logger=self.logger)
@@ -193,14 +221,29 @@ class VoucherOlapService:
         return rows
 
     def _enrich_transaction_types(self, rows: list[dict[str, str]]) -> None:
-        """各行の得意先コードから取引区分を取得し row['transaction_type'] に保持する。
+        """各行の得意先コードから得意先マスタ項目を取得して行に保持する。
 
+        取得するのは取引区分（移動伝票=8 判定用）と
+        「納品書単価・金額上段（硝子）」「納品書単価・金額下段（硝子）」。
         得意先コードが空の場合や取得失敗時は空扱い（既存の伝票作成は止めない）。
         得意先コード単位でキャッシュし、同一コードの問い合わせを繰り返さない（要件7）。
         """
         for row in rows:
             customer_code = (row.get("customer_code") or row.get("4") or "").strip()
-            row["transaction_type"] = self.fetch_transaction_type_by_customer_code(customer_code)
+            master = self.fetch_customer_master_by_customer_code(customer_code)
+            row["transaction_type"] = master.get("transaction_type", "")
+            row["invoice_price_amount_upper_glass"] = master.get(
+                "invoice_price_amount_upper_glass", ""
+            )
+            row["invoice_price_amount_upper_glass_raw"] = master.get(
+                "invoice_price_amount_upper_glass", ""
+            )
+            row["invoice_price_amount_lower_glass"] = master.get(
+                "invoice_price_amount_lower_glass", ""
+            )
+            row["invoice_price_amount_lower_glass_raw"] = master.get(
+                "invoice_price_amount_lower_glass", ""
+            )
 
     def fetch_transaction_type_by_customer_code(self, customer_code: str) -> str:
         """得意先コードに紐づく取引区分を別テーブル（得意先マスタ）から取得する。
@@ -208,23 +251,43 @@ class VoucherOlapService:
         得意先コードが空なら空文字を返す。取得できなかった場合も空扱いとし、
         例外は送出せずログに原因を残す（要件5/6）。同一コードはキャッシュする（要件7）。
         """
-        code = (customer_code or "").strip()
-        if not code:
-            return ""
-        if code in self._transaction_type_cache:
-            return self._transaction_type_cache[code]
+        return self.fetch_customer_master_by_customer_code(customer_code).get(
+            "transaction_type", ""
+        )
 
-        value = ""
+    def fetch_customer_master_by_customer_code(self, customer_code: str) -> dict[str, str]:
+        """得意先コードに紐づく得意先マスタ項目をまとめて取得する。
+
+        取引区分と「納品書単価・金額上段（硝子）」「納品書単価・金額下段（硝子）」を
+        1回のOLAPリクエストで取得する。
+        得意先コードが空なら空値のdictを返す。取得失敗時も空扱いとし、例外は送出せず
+        ログに原因を残す（要件5/6）。同一コードはキャッシュする（要件7）。
+        """
+        code = (customer_code or "").strip()
+        empty = {
+            "transaction_type": "",
+            "invoice_price_amount_upper_glass": "",
+            "invoice_price_amount_lower_glass": "",
+        }
+        if not code:
+            return dict(empty)
+        if code in self._customer_master_cache:
+            return dict(self._customer_master_cache[code])
+
+        result = dict(empty)
+        self.logger.info("customer_master_fetch_started: customer_code=%s", code)
         try:
             if self.config.tks_client_mode == "mock":
-                value = ""
+                pass
             elif self._session is None:
-                self.logger.warning("取引区分OLAP取得スキップ: requests未導入のためsession無し customer_code=%s", code)
-                value = ""
+                self.logger.warning(
+                    "得意先マスタOLAP取得スキップ: requests未導入のためsession無し customer_code=%s",
+                    code,
+                )
             else:
                 payload = build_transaction_type_payload(code)
                 url = self._endpoint(OLAP_DATA_PATH)
-                self.logger.info("取引区分OLAP取得リクエスト実行: customer_code=%s", code)
+                self.logger.info("得意先マスタOLAP取得リクエスト実行: customer_code=%s", code)
                 response = self._session.put(
                     url,
                     data=_json_bytes(payload),
@@ -233,20 +296,36 @@ class VoucherOlapService:
                 )
                 response.raise_for_status()
                 data = response.json()
-                value = parse_transaction_type(data)
+                result["transaction_type"] = parse_transaction_type(data)
+                result["invoice_price_amount_upper_glass"] = (
+                    parse_invoice_price_amount_upper_glass(data)
+                )
+                result["invoice_price_amount_lower_glass"] = (
+                    parse_invoice_price_amount_lower_glass(data)
+                )
                 self.logger.info(
                     "取引区分OLAP取得完了: customer_code=%s transaction_type=%s",
                     code,
-                    value or "(なし)",
+                    result["transaction_type"] or "(なし)",
+                )
+                self.logger.info(
+                    "customer_master_field_loaded: customer_code=%s "
+                    "invoice_price_amount_upper_glass=%s "
+                    "invoice_price_amount_lower_glass=%s",
+                    code,
+                    result["invoice_price_amount_upper_glass"] or "(なし)",
+                    result["invoice_price_amount_lower_glass"] or "(なし)",
                 )
         except Exception:
             self.logger.exception(
-                "取引区分OLAP取得に失敗しました（伝票作成は継続します）: customer_code=%s", code
+                "customer_master_fetch_failed（伝票作成は継続します）: customer_code=%s", code
             )
-            value = ""
+            result = dict(empty)
 
-        self._transaction_type_cache[code] = value
-        return value
+        self._customer_master_cache[code] = dict(result)
+        # 取引区分キャッシュも整合させておく（後方互換のため保持する）。
+        self._transaction_type_cache[code] = result["transaction_type"]
+        return dict(result)
 
     def _log_request_diagnostics(
         self,
@@ -271,6 +350,19 @@ class VoucherOlapService:
             order_no,
             _format_json_for_log(_request_conditions(payload)),
         )
+        for course_column in _delivery_course_request_columns(payload):
+            self.logger.info(
+                "voucher_delivery_course_request_column "
+                "order_no=%s voucher_no=%s display_no=%s display_name=%s "
+                "logical_name=%s entity=%s routing_field=%s",
+                order_no,
+                "(response_pending)",
+                course_column.get("OLAP表示No", "(not_found)"),
+                course_column.get("OLAP表示名", "(not_found)"),
+                course_column.get("フィールド論理名", "(not_found)"),
+                course_column.get("エンティティ論理名", "(not_found)"),
+                _course_routing_field(course_column) or "(not_found)",
+            )
 
     def _log_response_diagnostics(
         self,
@@ -379,6 +471,9 @@ def _build_voucher_payload(
             condition["OLAP値"] = "1"
     _remove_blank_sales_month_condition(payload)
     _ensure_customer_order_no_column(payload)
+    _ensure_delivery_address2_column(payload)
+    _ensure_quantity_unit_code_column(payload)
+    _ensure_delivery_course_columns(payload)
     if enabled_op_fields:
         _keep_only_enabled_op_columns(payload, enabled_op_fields)
     elif _disable_op_fields_for_debug(default=bool(disable_op_fields)):
@@ -388,11 +483,23 @@ def _build_voucher_payload(
 
 
 CUSTOMER_ORDER_NO_FIELD = "客先注文No_10桁"
+DELIVERY_ADDRESS2_FIELD = "納入先住所2"
+QUANTITY_UNIT_CODE_FIELD = "数量単位コード"
+DELIVERY_COURSE_ENTITY = "OLAP_M01-19 営業所別配送コースマスタ"
+DELIVERY_COURSE_CODE_DISPLAY_NAME = "配送コース"
+DELIVERY_COURSE_CODE_FIELD = "配送コース"
+DELIVERY_COURSE_NAME_DISPLAY_NAME = "配送コース名称"
+DELIVERY_COURSE_NAME_FIELD = "配送コース名称"
+DELIVERY_COURSE_ROUTING_FIELD = "営業所配送コース"
 
 # 取引区分取得用（別テーブル: 得意先マスタ）。
 TRANSACTION_TYPE_TARGET = "OLAP_M05-01 得意先マスタ"
 TRANSACTION_TYPE_CUSTOMER_CODE_FIELD = "得意先コード"
 TRANSACTION_TYPE_FIELD = "取引区分"
+# 得意先マスタの「納品書単価・金額上段/下段（硝子）」フィールド。
+# 下段表示判定に使うのは下段フィールドのみ。上段フィールドは取得・ログ用に保持する。
+INVOICE_PRICE_AMOUNT_UPPER_GLASS_FIELD = "納品書単価・金額上段（硝子）"
+INVOICE_PRICE_AMOUNT_LOWER_GLASS_FIELD = "納品書単価・金額下段（硝子）"
 
 
 def _transaction_type_column(
@@ -444,6 +551,12 @@ def build_transaction_type_payload(customer_code: str) -> "OrderedDict[str, Any]
                 [
                     _transaction_type_column(1, TRANSACTION_TYPE_CUSTOMER_CODE_FIELD, 7, "0"),
                     _transaction_type_column(2, TRANSACTION_TYPE_FIELD, 3, "3"),
+                    _transaction_type_column(
+                        3, INVOICE_PRICE_AMOUNT_UPPER_GLASS_FIELD, 3, "3"
+                    ),
+                    _transaction_type_column(
+                        4, INVOICE_PRICE_AMOUNT_LOWER_GLASS_FIELD, 3, "3"
+                    ),
                 ],
             ),
             (
@@ -499,6 +612,54 @@ def parse_transaction_type(data: object) -> str:
     for row in rows:
         if isinstance(row, dict):
             value = row.get("2")
+            if value not in (None, ""):
+                return str(value).strip()
+    return ""
+
+
+def parse_invoice_price_amount_upper_glass(data: object) -> str:
+    """得意先マスタレスポンスから「納品書単価・金額上段（硝子）」（表示No=3）を取り出す。
+
+    取得できなければ空文字を返す。R1List は dict / list いずれの形でも対応する。
+    """
+    if not isinstance(data, dict):
+        return ""
+    response_data = data.get("ResponseData")
+    if not isinstance(response_data, dict):
+        return ""
+    r1_list = response_data.get("R1List")
+    rows: list[object] = []
+    if isinstance(r1_list, dict):
+        rows = [r1_list[key] for key in sorted(r1_list)]
+    elif isinstance(r1_list, list):
+        rows = list(r1_list)
+    for row in rows:
+        if isinstance(row, dict):
+            value = row.get("3")
+            if value not in (None, ""):
+                return str(value).strip()
+    return ""
+
+
+def parse_invoice_price_amount_lower_glass(data: object) -> str:
+    """得意先マスタレスポンスから「納品書単価・金額下段（硝子）」（表示No=4）を取り出す。
+
+    取得できなければ空文字を返す。R1List は dict / list いずれの形でも対応する。
+    """
+    if not isinstance(data, dict):
+        return ""
+    response_data = data.get("ResponseData")
+    if not isinstance(response_data, dict):
+        return ""
+    r1_list = response_data.get("R1List")
+    rows: list[object] = []
+    if isinstance(r1_list, dict):
+        rows = [r1_list[key] for key in sorted(r1_list)]
+    elif isinstance(r1_list, list):
+        rows = list(r1_list)
+    for row in rows:
+        if isinstance(row, dict):
+            value = row.get("4")
             if value not in (None, ""):
                 return str(value).strip()
     return ""
@@ -564,7 +725,224 @@ def _ensure_customer_order_no_column(payload: dict[str, Any]) -> None:
     ]))
 
 
-def _extract_voucher_rows_or_raise(data: object, *, logger: logging.Logger | None = None) -> list[dict[str, str]]:
+def _ensure_delivery_address2_column(payload: dict[str, Any]) -> None:
+    """OLAP送信直前の補完処理。
+
+    古いテンプレートに「納入先住所2」列が無い場合でも、送信直前にR1Listへ
+    追加してOLAPレスポンスに必ず含まれるようにする。
+    既存の「納入先住所1」と同じエンティティ・命名に合わせる。
+    """
+    columns = payload.get("R1List")
+    if not isinstance(columns, list):
+        return
+    for column in columns:
+        if isinstance(column, dict) and (
+            column.get("フィールド論理名") == DELIVERY_ADDRESS2_FIELD
+            or column.get("OLAP表示名") == DELIVERY_ADDRESS2_FIELD
+        ):
+            return
+
+    # エンティティ論理名は既存の「納入先住所1」列に合わせる。無ければ対象データを使う。
+    entity = ""
+    for column in columns:
+        if isinstance(column, dict) and column.get("フィールド論理名") == "納入先住所1":
+            entity = column.get("エンティティ論理名") or ""
+            break
+    if not entity:
+        entity = str(payload.get("OLAP対象データ") or "")
+
+    nos = [
+        column.get("OLAP表示No")
+        for column in columns
+        if isinstance(column, dict) and isinstance(column.get("OLAP表示No"), int)
+    ]
+    new_no = (max(nos) + 1) if nos else 1
+
+    columns.append(OrderedDict([
+        ("OLAP表示No", new_no),
+        ("OLAP表示名", DELIVERY_ADDRESS2_FIELD),
+        ("OLAPデータ区分", "1"),
+        ("エンティティ論理名", entity),
+        ("フィールド論理名", DELIVERY_ADDRESS2_FIELD),
+        ("OLAP表示幅", 40),
+        ("OLAPフォントサイズ２", "0"),
+        ("OLAP空白値表示", "-"),
+        ("OLAP日付のフォーマットフラグ", "1"),
+        ("OLAP数値の3桁区切りフラグ", "1"),
+        ("OLAP桁数", 0),
+        ("OLAP小数", 0),
+        ("OLAP丸め", "0"),
+        ("OLAP出力順序No", None),
+        ("OLAP出力順", "2"),
+        ("OLAP空白値を先頭表示フラグ", "0"),
+        ("OLAP集計方法", "0"),
+        ("OLAP合計表示フラグ", "0"),
+        ("OLAP合計ラベル", "計"),
+        ("OLAP合計ラベルのみ表示フラグ", ""),
+        ("OLAP重複を除くフラグ", "0"),
+        ("OLAP演算式", ""),
+        ("OLAP演算式表記", ""),
+        ("OLAPドメイン分類", "0"),
+        ("XupperRoutingItems", []),
+    ]))
+
+
+def _ensure_quantity_unit_code_column(payload: dict[str, Any]) -> None:
+    """OLAP送信直前の補完処理。
+
+    古いテンプレートに「数量単位コード」列が無い場合でも、送信直前にR1Listへ
+    追加してOLAPレスポンスに必ず含まれるようにする。数量単位コード="19" の明細で
+    数量列を空欄にする判定に使う。エンティティは受注入力明細データに合わせる。
+    """
+    columns = payload.get("R1List")
+    if not isinstance(columns, list):
+        return
+    for column in columns:
+        if isinstance(column, dict) and (
+            column.get("フィールド論理名") == QUANTITY_UNIT_CODE_FIELD
+            or column.get("OLAP表示名") == QUANTITY_UNIT_CODE_FIELD
+        ):
+            return
+
+    # エンティティ論理名は既存の「受注No」列（受注入力明細データ）に合わせる。
+    entity = ""
+    for column in columns:
+        if isinstance(column, dict) and column.get("フィールド論理名") == "受注No":
+            entity = column.get("エンティティ論理名") or ""
+            break
+    if not entity:
+        entity = str(payload.get("OLAP対象データ") or "")
+
+    nos = [
+        column.get("OLAP表示No")
+        for column in columns
+        if isinstance(column, dict) and isinstance(column.get("OLAP表示No"), int)
+    ]
+    new_no = (max(nos) + 1) if nos else 1
+
+    columns.append(OrderedDict([
+        ("OLAP表示No", new_no),
+        ("OLAP表示名", QUANTITY_UNIT_CODE_FIELD),
+        ("OLAPデータ区分", "1"),
+        ("エンティティ論理名", entity),
+        ("フィールド論理名", QUANTITY_UNIT_CODE_FIELD),
+        ("OLAP表示幅", 3),
+        ("OLAPフォントサイズ２", "0"),
+        ("OLAP空白値表示", "-"),
+        ("OLAP日付のフォーマットフラグ", "1"),
+        ("OLAP数値の3桁区切りフラグ", "1"),
+        ("OLAP桁数", 0),
+        ("OLAP小数", 0),
+        ("OLAP丸め", "0"),
+        ("OLAP出力順序No", None),
+        ("OLAP出力順", "2"),
+        ("OLAP空白値を先頭表示フラグ", "0"),
+        ("OLAP集計方法", "0"),
+        ("OLAP合計表示フラグ", "0"),
+        ("OLAP合計ラベル", "計"),
+        ("OLAP合計ラベルのみ表示フラグ", ""),
+        ("OLAP重複を除くフラグ", "0"),
+        ("OLAP演算式", ""),
+        ("OLAP演算式表記", ""),
+        ("OLAPドメイン分類", "0"),
+        ("XupperRoutingItems", []),
+    ]))
+    logging.getLogger(__name__).info(
+        "voucher_olap_quantity_unit_code_field_added: OLAP表示No=%s entity=%s",
+        new_no,
+        entity,
+    )
+
+
+def _ensure_delivery_course_columns(payload: dict[str, Any]) -> None:
+    """配送コースのコード列と名称列を正しいマスタ参照定義で補完する。"""
+    columns = payload.get("R1List")
+    if not isinstance(columns, list):
+        return
+    # 旧誤定義（受注明細.配送コースを名称扱い）は削除する。正しいマスタ列は
+    # エンティティ＋論理名で識別し、コードと名称を混同しない。
+    columns[:] = [
+        column for column in columns
+        if not (
+            isinstance(column, dict)
+            and column.get("エンティティ論理名") == "OLAP_T01-03 受注入力明細データ"
+            and column.get("フィールド論理名") == DELIVERY_COURSE_CODE_FIELD
+        )
+    ]
+    for display_name, field_name, width in (
+        (DELIVERY_COURSE_CODE_DISPLAY_NAME, DELIVERY_COURSE_CODE_FIELD, 6),
+        (DELIVERY_COURSE_NAME_DISPLAY_NAME, DELIVERY_COURSE_NAME_FIELD, 30),
+    ):
+        if any(
+            isinstance(column, dict)
+            and column.get("エンティティ論理名") == DELIVERY_COURSE_ENTITY
+            and column.get("フィールド論理名") == field_name
+            for column in columns
+        ):
+            continue
+        nos = [
+            column.get("OLAP表示No") for column in columns
+            if isinstance(column, dict) and isinstance(column.get("OLAP表示No"), int)
+        ]
+        new_no = (max(nos) + 1) if nos else 1
+        columns.append(_delivery_course_column(new_no, display_name, field_name, width))
+        logging.getLogger(__name__).info(
+            "voucher_olap_delivery_course_field_added: display_no=%s "
+            "display_name=%s entity=%s logical_name=%s routing_field=%s",
+            new_no, display_name, DELIVERY_COURSE_ENTITY, field_name,
+            DELIVERY_COURSE_ROUTING_FIELD,
+        )
+
+
+def _ensure_delivery_course_name_column(payload: dict[str, Any]) -> None:
+    """旧内部API互換。コード列と名称列の両方を補完する。"""
+    _ensure_delivery_course_columns(payload)
+
+
+def _delivery_course_column(
+    display_no: int, display_name: str, field_name: str, width: int
+) -> OrderedDict[str, Any]:
+    return OrderedDict({
+        "OLAP表示No": display_no,
+        "OLAP表示名": display_name,
+        "OLAPデータ区分": "1",
+        "エンティティ論理名": DELIVERY_COURSE_ENTITY,
+        "フィールド論理名": field_name,
+        "OLAP表示幅": width,
+        "OLAPフォントサイズ２": "0",
+        "OLAP空白値表示": "-",
+        "OLAP日付のフォーマットフラグ": "1",
+        "OLAP数値の3桁区切りフラグ": "1",
+        "OLAP桁数": 0,
+        "OLAP小数": 0,
+        "OLAP丸め": "0",
+        "OLAP出力順序No": None,
+        "OLAP出力順": "2",
+        "OLAP空白値を先頭表示フラグ": "0",
+        "OLAP集計方法": "0",
+        "OLAP合計表示フラグ": "0",
+        "OLAP合計ラベル": "計",
+        "OLAP合計ラベルのみ表示フラグ": "",
+        "OLAP重複を除くフラグ": "0",
+        "OLAP演算式": "",
+        "OLAP演算式表記": "",
+        "OLAPドメイン分類": "0",
+        "XupperRoutingItems": [OrderedDict({
+            "参照順": 1,
+            "エンティティ論理名": "OLAP_T01-03 受注入力明細データ",
+            "エンティティ表示名": "受注入力明細データ",
+            "フィールド論理名": DELIVERY_COURSE_ROUTING_FIELD,
+            "フィールド表示名": DELIVERY_COURSE_ROUTING_FIELD,
+        })],
+    })
+
+
+def _extract_voucher_rows_or_raise(
+    data: object,
+    *,
+    logger: logging.Logger | None = None,
+    request_columns: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
     if not isinstance(data, dict):
         raise OlapFetchError("OLAPレスポンスがJSONオブジェクトではありません")
     if "ResponseData" not in data:
@@ -577,7 +955,44 @@ def _extract_voucher_rows_or_raise(data: object, *, logger: logging.Logger | Non
     olap_message = _olap_error_message(data)
     if olap_message:
         raise OlapFetchError(olap_message)
-    return extract_r1_rows(data, logger=logger)
+    return extract_r1_rows(
+        data, logger=logger, request_columns=request_columns
+    )
+
+
+def _request_columns(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    columns = payload.get("R1List")
+    if not isinstance(columns, list):
+        return []
+    return [column for column in columns if isinstance(column, dict)]
+
+
+def _delivery_course_request_columns(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    result = []
+    for column in _request_columns(payload):
+        if column.get("エンティティ論理名") == DELIVERY_COURSE_ENTITY and (
+            column.get("フィールド論理名") in {
+                DELIVERY_COURSE_CODE_FIELD, DELIVERY_COURSE_NAME_FIELD,
+            }
+        ):
+            result.append(column)
+    return result
+
+
+def _delivery_course_request_column(payload: dict[str, Any]) -> dict[str, Any]:
+    """旧内部API互換: 名称列を返す。"""
+    return next((c for c in _delivery_course_request_columns(payload)
+                 if c.get("フィールド論理名") == DELIVERY_COURSE_NAME_FIELD), {})
+
+
+def _course_routing_field(column: dict[str, Any]) -> str:
+    routing = column.get("XupperRoutingItems")
+    if not isinstance(routing, list):
+        return ""
+    for item in routing:
+        if isinstance(item, dict):
+            return str(item.get("フィールド論理名") or "")
+    return ""
 
 
 def _olap_error_message(data: dict[str, Any]) -> str:

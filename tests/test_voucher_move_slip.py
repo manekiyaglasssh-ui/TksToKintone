@@ -1,7 +1,7 @@
 """取引区分8（移動伝票）対応のテスト。
 
 得意先コードに紐づく取引区分のOLAP取得と、取引区分8の場合の
-売上伝票(01)・工場控(02)・納品書(07)へのPDF表示変更を検証する。
+全伝票(01〜08)への移動伝票ラベル表示を検証する。
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class _RecordingCanvas:
 
 # ── フェイクOLAPセッション ────────────────────────────────────────────────────
 _TRANSACTION_SAMPLE = {
-    "ResponseData": {"R1List": {"1": {"1": "9991173", "2": "8"}}}
+    "ResponseData": {"R1List": {"1": {"1": "9991173", "2": "8", "3": "0", "4": "0"}}}
 }
 
 
@@ -120,7 +120,7 @@ def _service(session) -> VoucherOlapService:
     return service
 
 
-def _move_page(transaction_type="8"):
+def _move_page(transaction_type="8", glass_raw="0", upper_glass_raw="0"):
     """移動伝票表示テスト用ページ。上段表示は下段と衝突しない固定文字列にする。"""
     return {
         "code_no": "9991173",
@@ -128,6 +128,8 @@ def _move_page(transaction_type="8"):
         "order_no": "",  # QR を発火させない
         "construction_rep": "工事担当太郎",
         "transaction_type": transaction_type,
+        "invoice_price_amount_upper_glass": upper_glass_raw,
+        "invoice_price_amount_lower_glass": glass_raw,
         "details": [
             {"name": "品A", "unit_price": "UA", "amount": "AA",
              "sales_unit_price": "430", "ordered_quantity": "120"},
@@ -148,7 +150,10 @@ class TransactionTypeFetchTest(unittest.TestCase):
         payload = build_transaction_type_payload("9991173")
         self.assertEqual(payload["OLAP対象データ"], "OLAP_M05-01 得意先マスタ")
         r1_names = [c["OLAP表示名"] for c in payload["R1List"]]
-        self.assertEqual(r1_names, ["得意先コード", "取引区分"])
+        self.assertEqual(
+            r1_names,
+            ["得意先コード", "取引区分", "納品書単価・金額上段（硝子）", "納品書単価・金額下段（硝子）"],
+        )
         condition = payload["R2List"][0]
         self.assertEqual(condition["フィールド論理名"], "得意先コード")
         self.assertEqual(condition["OLAP値"], "9991173")
@@ -252,42 +257,49 @@ class MoveSlipDisplayTest(unittest.TestCase):
         self.assertFalse(vs.is_move_slip_transaction_type(""))
 
     def test_unit_price_lower_displayed(self) -> None:
-        """テスト8: 取引区分8で単価列下段に売上単価が表示される。"""
-        texts = self._draw_form(_move_page("8"), "01")
+        """硝子=1で単価列下段に売上単価が表示される（取引区分とは独立）。"""
+        texts = self._draw_form(_move_page("8", glass_raw="1"), "01")
         self.assertIn("430", texts)
         self.assertIn("250", texts)
         self.assertIn("40", texts)
 
     def test_amount_lower_displayed(self) -> None:
-        """テスト9: 取引区分8で金額列下段に 売上単価×受注数量 が表示される。"""
-        texts = self._draw_form(_move_page("8"), "01")
+        """硝子=1で金額列下段に 売上単価×受注数量 が表示される（取引区分とは独立）。"""
+        texts = self._draw_form(_move_page("8", glass_raw="1"), "01")
         self.assertIn("51,600", texts)   # 430 * 120
         self.assertIn("30,000", texts)   # 250 * 120
         self.assertIn("19,200", texts)   # 40 * 480
 
     def test_amount_total_lower_displayed(self) -> None:
-        """テスト10: 取引区分8で金額列合計行下段に Σ(売上単価×受注数量) が表示される。"""
-        texts = self._draw_form(_move_page("8"), "01")
+        """硝子=1で金額列合計行下段に Σ(売上単価×受注数量) が表示される。"""
+        texts = self._draw_form(_move_page("8", glass_raw="1"), "01")
         # 100,800 = 51,600 + 30,000 + 19,200。既存の右下合計欄(摘要列)にも同値が出るため、
-        # 金額列合計行下段の追加分を含め2回出現することで移動伝票分の描画を確認する。
+        # 金額列合計行下段の追加分を含め2回出現することで描画を確認する。
         self.assertGreaterEqual(texts.count("100,800"), 2)
 
     def test_columns_only_on_sales_factory_delivery(self) -> None:
-        """テスト10: 単価列・金額列の下段表示は売上伝票・工場控・納品書のみ。
+        """単価列・金額列の下段表示は売上伝票・工場控・納品書のみ。
 
-        51,600 は移動伝票の金額列下段（行単位）でのみ描画されるため、
+        51,600 は金額列下段（行単位）でのみ描画されるため、
         指図書系(03〜06)・受領書(08)には現れないことを確認する。
         """
         for voucher in ("03", "04", "05", "06", "08"):
             with self.subTest(voucher=voucher):
-                texts = self._draw_form(_move_page("8"), voucher)
+                texts = self._draw_form(_move_page("8", glass_raw="1"), voucher)
                 # ラベルは表示される（全伝票対象）が、列下段は表示されない。
                 self.assertIn("移動伝票", texts)
                 self.assertNotIn("51,600", texts)
         # 対象3伝票では金額列下段が表示される。
         for voucher in ("01", "02", "07"):
             with self.subTest(voucher=voucher):
-                self.assertIn("51,600", self._draw_form(_move_page("8"), voucher))
+                self.assertIn("51,600", self._draw_form(_move_page("8", glass_raw="1"), voucher))
+
+    def test_transaction_type_8_without_glass_hides_lower_columns(self) -> None:
+        """取引区分8でも硝子=1でなければ単価・金額下段は表示されない。"""
+        texts = self._draw_form(_move_page("8", glass_raw="0"), "01")
+        self.assertIn("移動伝票", texts)
+        self.assertNotIn("430", texts)
+        self.assertNotIn("51,600", texts)
 
 
 class MoveSlipTotalCalcTest(unittest.TestCase):

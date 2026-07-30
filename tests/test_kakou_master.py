@@ -175,8 +175,12 @@ class KakouMasterDialogLayoutTest(unittest.TestCase):
             dialog = KakouMasterDialog(master_path, backup_dir)
             self.addCleanup(dialog.deleteLater)
 
-            self.assertGreaterEqual(dialog.width(), 1500)
-            self.assertGreaterEqual(dialog.minimumWidth(), 1320)
+            screen = dialog.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                self.assertLessEqual(dialog.width(), available.width())
+                self.assertLessEqual(dialog.minimumWidth(), available.width())
+            self.assertGreaterEqual(dialog.minimumWidth(), min(760, dialog.width()))
             self.assertTrue(dialog.windowFlags() & Qt.WindowType.WindowMaximizeButtonHint)
             idx = KAKOU_MASTER_HEADERS.index("得意先4")
             self.assertGreaterEqual(dialog.table.columnWidth(idx), 120)

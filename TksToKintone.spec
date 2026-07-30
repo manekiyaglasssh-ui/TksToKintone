@@ -1,16 +1,61 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
+
+build_variant = os.environ.get('TKS_BUILD_VARIANT', 'normal').strip().lower()
+if build_variant not in {'normal', 'no-update', 'no-helper', 'with-helper'}:
+    build_variant = 'normal'
+
+variant_dir = Path('build') / 'variant'
+variant_dir.mkdir(parents=True, exist_ok=True)
+variant_file = variant_dir / 'build_variant.txt'
+variant_file.write_text(build_variant + '\n', encoding='utf-8')
+
+extra_hiddenimports = []
+excludes = []
+
+# 受注No取得helper（別プロセス化）。frozen環境では本体exeを
+# `TksToKintone.exe --tks-order-capture-helper` として呼び直すため、helperモジュールと
+# その依存（UIA/COM取得の tks_cloud_capture）を確実に同梱する。lazy import なので明示する。
+extra_hiddenimports += [
+    'app.tks_order_capture_helper',
+    'app.tks_cloud_capture',
+    'app.captured_orders',
+]
+
+# TKS受注No取込の UI Automation 経路（app/tks_cloud_capture.py）は comtypes を使う。
+# TKSCloud8 は WPF（HwndWrapper 配下）で Win32 子ウィンドウ列挙では子が空になるため、
+# UIA 経路が必須。comtypes は実行時に comtypes.gen へ COM ラッパを生成する（凍結時は
+# gen_dir=None でメモリ生成にしている）ため、サブモジュールを漏れなく同梱する。
+try:
+    extra_hiddenimports += collect_submodules('comtypes')
+except Exception as exc:
+    # Windows 以外のビルド環境では comtypes 未導入のことがある（その環境では UIA は使わない）。
+    print(f"WARNING: comtypes submodules not collected: {exc}")
+if build_variant == 'no-update':
+    excludes.extend(['app.update_client', 'app.update_helper'])
+else:
+    extra_hiddenimports.append('app.update_client')
+
+extra_binaries = []
+extra_datas = [('templates', 'templates'), ('docs', 'docs'), ('assets', 'assets'), (str(variant_file), '.')]
+
+# SumatraPDF本体はPyInstallerへ同梱しない。固定版の公式installerは
+# build_exe.batで検証し、Inno SetupがセットアップEXE内へ直接同梱する。
 a = Analysis(
-    ['app\\main.py'],
+    ['app/main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('templates', 'templates'), ('docs\\olap', 'docs\\olap'), ('assets', 'assets'), ('C:\\Users\\U021\\work\\TksToKintone\\build\\variant\\build_variant.txt', '.')],
-    hiddenimports=['app.update_client'],
+    binaries=extra_binaries,
+    datas=extra_datas,
+    hiddenimports=extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     noarchive=False,
     optimize=0,
 )
@@ -32,12 +77,49 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['assets\\app_icon.ico'],
+    icon=['assets/app_icon.ico'],
+    version='installer/version_info.txt',
 )
+
+collect_items = [exe, a.binaries, a.datas]
+if build_variant == 'with-helper':
+    # 更新補助プロセス（PowerShell を使わずに更新するための EXE）。
+    # 本体と同じフォルダ（dist/TksToKintone/tks_update_helper.exe）へ同梱する。
+    helper_a = Analysis(
+        ['app/update_helper.py'],
+        pathex=[],
+        binaries=[],
+        datas=[],
+        hiddenimports=[],
+        hookspath=[],
+        hooksconfig={},
+        runtime_hooks=[],
+        excludes=[],
+        noarchive=False,
+        optimize=0,
+    )
+    helper_pyz = PYZ(helper_a.pure)
+    helper_exe = EXE(
+        helper_pyz,
+        helper_a.scripts,
+        [],
+        exclude_binaries=True,
+        name='tks_update_helper',
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=True,
+        console=True,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+    collect_items.extend([helper_exe, helper_a.binaries, helper_a.datas])
+
 coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
+    *collect_items,
     strip=False,
     upx=True,
     upx_exclude=[],

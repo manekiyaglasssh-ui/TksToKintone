@@ -4,13 +4,37 @@ import io
 import json
 import logging
 import re
+import unicodedata
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, localcontext
 from itertools import groupby
 from pathlib import Path
 from typing import Any
 
 from app.voucher_templates import FORM_DETAIL_ROWS
+
+_logger = logging.getLogger(__name__)
+
+UPPER_AREA_OP_CATEGORIES = frozenset({"00", "01", "02"})
+
+
+def normalize_op_category(value: object) -> str:
+    """OP区分を先頭ゼロを保った文字列として正規化する。"""
+    return unicodedata.normalize("NFKC", str(value or "")).strip()
+
+
+def op_category_value(row: dict[str, Any]) -> str:
+    """新旧フィールド名からOP区分を取得する（数値への変換は行わない）。"""
+    for key in ("op_category", "op_category_raw", "op_type"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return normalize_op_category(value)
+    return ""
+
+
+def should_draw_upper_area_by_op_category(row: dict[str, Any]) -> bool:
+    """単価・金額列上段の㎡を表示できるOP区分か返す。"""
+    return op_category_value(row) in UPPER_AREA_OP_CATEGORIES
 
 
 _DISPLAY_NAME_ALIASES = {
@@ -37,6 +61,7 @@ _DISPLAY_NAME_ALIASES = {
     "窓記号": "window_symbol",
     "受注数量": "ordered_quantity",
     "数量単位名称": "quantity_unit_name",
+    "数量単位コード": "quantity_unit_code",
     "統計数量": "stat_quantity",
     "受注統計数量": "ordered_stat_quantity",
     "売上単価": "sales_unit_price",
@@ -45,6 +70,10 @@ _DISPLAY_NAME_ALIASES = {
     "納品書発行略称": "delivery_short_name",
     "加工仕上日": "finish_date",
     "納入先住所1": "delivery_address1",
+    "納入先住所2": "delivery_address2",
+    "配送コース": "delivery_course_code",
+    "配送コースコード": "delivery_course_code",
+    "配送コース名称": "delivery_course_name",
     "受注見出摘要": "order_summary",
     "客先注文No_10桁": "customer_order_no_10",
     "物件No": "property_no",
@@ -100,6 +129,15 @@ _FALLBACK_DISPLAY_KEYS = {
     # _is_current_olap_layout が False になり alias 解決をすり抜けるため、
     # 表示No=45 を明示的なフォールバックキーとして常に解決できるようにする。
     "customer_order_no_10": ("45",),
+    # 納入先住所2（OLAP表示No=46）。古いテンプレート/レスポンスに無くても
+    # 表示Noキーで解決できるよう明示する。値が無ければ単に空欄になる。
+    "delivery_address2": ("46",),
+    # 数量単位コード（OLAP表示No=47）。数量単位コード="19" の明細で数量列を
+    # 空欄にするための判定に使う。古いテンプレート/レスポンスに無くても表示Noキーで
+    # 解決でき、値が無ければ空欄扱い（既存の数量表示を維持する）。
+    "quantity_unit_code": ("47",),
+    "delivery_course_code": ("48",),
+    "delivery_course_name": ("49",),
     "sales_rep": ("34", "33"),
     "construction_rep": ("36", "35"),
     "op_type": ("40",),
@@ -169,19 +207,93 @@ def is_missing_voucher_no(value: object) -> bool:
     return text.isdigit() and int(text) == 0
 
 
-def extract_r1_rows(response_data: object, *, logger: logging.Logger | None = None) -> list[dict[str, str]]:
+def extract_r1_rows(
+    response_data: object,
+    *,
+    logger: logging.Logger | None = None,
+    request_columns: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    """OLAP R1明細をアプリ内キーへ正規化する。
+
+    ``request_columns`` に実際に送信した R1List を渡すことで、古い
+    テンプレートの送信直前補完で表示Noが48以外になっても、その実Noで
+    解析できる。引数省略時は同梱テンプレートと旧固定Noの互換動作を保つ。
+    """
     raw_rows = _raw_r1_rows(response_data)
+    request_alias_keys = _display_alias_keys_from_columns(request_columns or [])
 
     rows: list[dict[str, str]] = []
     for raw in raw_rows:
         if not isinstance(raw, dict) or _is_result_status_row(raw):
             continue
-        row = _with_display_name_aliases(
-            {str(key): "" if value is None else str(value) for key, value in raw.items()},
-            logger=logger,
+        string_row = {str(key): "" if value is None else str(value) for key, value in raw.items()}
+        course_code_source_key = _alias_source_key(
+            string_row, "delivery_course_code", request_alias_keys
         )
+        course_name_source_key = _alias_source_key(
+            string_row, "delivery_course_name", request_alias_keys
+        )
+        row = _with_display_name_aliases(
+            string_row,
+            logger=logger,
+            request_alias_keys=request_alias_keys,
+        )
+        for alias, source_key in (
+            ("delivery_course_code", course_code_source_key),
+            ("delivery_course_name", course_name_source_key),
+        ):
+            if not source_key:
+                continue
+            row[f"{alias}_raw"] = _blank_if_dash(_s_raw(string_row, source_key))
+            row[f"{alias}_response_key"] = source_key
+            requested = request_alias_keys.get(alias)
+            row[f"{alias}_display_no"] = (
+                requested[1] if requested
+                else (source_key if source_key.isdigit() else "")
+            )
+            metadata = _request_column_for_alias(request_columns or [], alias)
+            row[f"{alias}_logical_name"] = str(
+                metadata.get("フィールド論理名") or ""
+            )
+            if alias == "delivery_course_name":
+                # 既存キャッシュ／呼び出し側との互換。値は名称列由来に限定する。
+                row["delivery_course_response_key"] = source_key
+                row["delivery_course_display_no"] = row[f"{alias}_display_no"]
         _compute_op_calculated_fields(row, logger=logger)
         rows.append(row)
+        if logger:
+            course_code = _blank_if_dash(row.get("delivery_course_code"))
+            course_name = _blank_if_dash(row.get("delivery_course_name"))
+            logger.info(
+                "voucher_delivery_course_code_parsed "
+                "order_no=%s voucher_no=%s course_code=%r response_key=%s "
+                "display_no=%s logical_name=%s",
+                _v(row, "order_no"),
+                _v(row, "voucher_no"),
+                course_code,
+                course_code_source_key or "(not_found)",
+                row.get("delivery_course_code_display_no", ""),
+                row.get("delivery_course_code_logical_name", "配送コース"),
+            )
+            logger.info(
+                "voucher_delivery_course_name_parsed "
+                "order_no=%s voucher_no=%s course_code=%r course_name=%r "
+                "response_key=%s display_no=%s logical_name=%s",
+                _v(row, "order_no"),
+                _v(row, "voucher_no"),
+                course_code,
+                course_name,
+                course_name_source_key or "(not_found)",
+                row.get("delivery_course_name_display_no", ""),
+                row.get("delivery_course_name_logical_name", "配送コース名称"),
+            )
+    codes = [quantity_unit_code_value(row) for row in rows]
+    if any(codes):
+        (logger or _logger).info(
+            "voucher_mapper_quantity_unit_code_mapped: rows=%s hidden19=%s",
+            len(rows),
+            sum(1 for code in codes if code == "19"),
+        )
     return rows
 
 
@@ -230,12 +342,121 @@ def build_voucher_pages(rows: list[dict[str, str]], *, today: date | None = None
     if not rows:
         return []
     today = today or date.today()
-    sorted_rows = sorted(rows, key=lambda row: (_s(row, "9"), _s(row, "6"), _int(row.get("7"))))
+    sorted_rows = sorted(
+        rows,
+        key=lambda row: (
+            _v(row, "voucher_no"),
+            _v(row, "order_no"),
+            _int(_v(row, "order_line_no")),
+        ),
+    )
     pages: list[dict[str, Any]] = []
-    for _, voucher_rows in groupby(sorted_rows, key=lambda row: (_s(row, "9"), _s(row, "6"))):
-        for group in _chunks(list(voucher_rows), FORM_DETAIL_ROWS):
-            pages.append(_build_page(group, today))
+    for _, voucher_rows in groupby(
+        sorted_rows, key=lambda row: _v(row, "voucher_no")
+    ):
+        voucher_group = list(voucher_rows)
+        delivery_course_code = first_non_blank_delivery_course_code(voucher_group)
+        delivery_course_name = first_non_blank_delivery_course(voucher_group)
+        course_source_row = _first_non_blank_delivery_course_row(voucher_group)
+        course_response_key = str(
+            course_source_row.get("delivery_course_name_response_key") or ""
+        )
+        course_display_no = str(
+            course_source_row.get("delivery_course_name_display_no") or ""
+        )
+        distinct = list(dict.fromkeys(
+            value
+            for row in voucher_group
+            if (value := normalize_delivery_course_name(
+                row.get("delivery_course_name")
+                or row.get("delivery_course_name_raw")
+            ))
+        ))
+        first = voucher_group[0]
+        if len(distinct) > 1:
+            _logger.warning(
+                "voucher_delivery_course_conflict "
+                "order_no=%s voucher_no=%s values=%r adopted=%r rule=first_non_blank",
+                _v(first, "order_no"),
+                _v(first, "voucher_no"),
+                distinct,
+                delivery_course_name,
+            )
+        for group in _chunks(voucher_group, FORM_DETAIL_ROWS):
+            page = _build_page(
+                group,
+                today,
+                delivery_course_code=delivery_course_code,
+                delivery_course_name=delivery_course_name,
+                delivery_course_response_key=course_response_key,
+                delivery_course_display_no=course_display_no,
+            )
+            pages.append(page)
+            _logger.info(
+                "voucher_delivery_course_page_aggregated "
+                "order_no=%s voucher_no=%s response_key=%s display_no=%s "
+                "value=%r source_rows=%s rule=first_non_blank",
+                page.get("order_no", ""),
+                page.get("voucher_no", ""),
+                course_response_key or "(not_available)",
+                course_display_no,
+                delivery_course_name,
+                len(voucher_group),
+            )
+            _logger.info(
+                "voucher_delivery_course_name_selected "
+                "order_no=%s voucher_no=%s course_code=%r course_name=%r "
+                "response_key=%s display_no=%s logical_name=%s rule=first_non_blank",
+                page.get("order_no", ""), page.get("voucher_no", ""),
+                delivery_course_code, delivery_course_name,
+                course_response_key or "(not_available)", course_display_no,
+                course_source_row.get("delivery_course_name_logical_name", "配送コース名称"),
+            )
     return pages
+
+
+def normalize_delivery_course_name(value: object) -> str:
+    """配送コース名称を文字列のまま正規化する。"""
+    return _blank_if_dash(value)
+
+
+def normalize_delivery_course_code(value: object) -> str:
+    """配送コースコードを文字列のまま正規化する（数値化しない）。"""
+    return _blank_if_dash(value)
+
+
+def first_non_blank_delivery_course_code(rows: list[dict[str, Any]]) -> str:
+    for row in rows:
+        value = normalize_delivery_course_code(
+            row.get("delivery_course_code") or row.get("delivery_course_code_raw")
+        )
+        if value:
+            return value
+    return ""
+
+
+def first_non_blank_delivery_course(rows: list[dict[str, Any]]) -> str:
+    """明細順で最初の非空配送コース名称を返す。"""
+    for row in rows:
+        value = normalize_delivery_course_name(
+            row.get("delivery_course_name")
+            or row.get("delivery_course_name_raw")
+        )
+        if value:
+            return value
+    return ""
+
+
+def _first_non_blank_delivery_course_row(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    for row in rows:
+        if normalize_delivery_course_name(
+            row.get("delivery_course_name")
+            or row.get("delivery_course_name_raw")
+        ):
+            return row
+    return {}
 
 
 def format_date_yy_mm_dd(value: str) -> str:
@@ -269,6 +490,34 @@ def format_number(value: str, *, suffix: str = "", force_int: bool = False) -> s
     return f"{text}{suffix}"
 
 
+def format_quantity(value: object) -> str:
+    """数量を最大小数3桁で、末尾の不要なゼロを除いて表示する。
+
+    OLAPから受け取った文字列/Decimalの10進精度を保つ。floatも直接
+    ``Decimal`` へ渡さず、文字列表現を経由して二進浮動小数点の誤差を
+    表示へ持ち込まない。想定外に4桁以上ある入力は四捨五入せず切り捨てる。
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    numeric_text = text.replace(",", "")
+    try:
+        dec = Decimal(numeric_text)
+    except (InvalidOperation, ValueError):
+        return text
+    if not dec.is_finite():
+        return text
+    if dec == 0:
+        return "0"
+    with localcontext() as context:
+        context.prec = max(28, len(dec.as_tuple().digits) + abs(dec.adjusted()) + 4)
+        dec = dec.quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+    formatted = f"{dec:,.3f}"
+    return formatted.rstrip("0").rstrip(".")
+
+
 def build_qr_code_image(order_no: str) -> io.BytesIO:
     buf = io.BytesIO()
     try:
@@ -294,14 +543,59 @@ def build_qr_code_image(order_no: str) -> io.BytesIO:
     return buf
 
 
-def _build_page(rows: list[dict[str, str]], today: date) -> dict[str, Any]:
+def _build_page(
+    rows: list[dict[str, str]],
+    today: date,
+    *,
+    delivery_course_code: str | None = None,
+    delivery_course_name: str | None = None,
+    delivery_course_response_key: str = "",
+    delivery_course_display_no: str = "",
+) -> dict[str, Any]:
     first = rows[0]
     details = [_detail_row(row) for row in rows]
     non_star_rows = [row for row in rows if _v(row, "product_name") != "*"]
     upper_total = sum((_decimal(_v(row, "sales_unit_price")) or Decimal("0")) for row in non_star_rows)
     lower_total = sum((_decimal(_v(row, "purchase_unit_price")) or Decimal("0")) for row in non_star_rows)
-    summary_line1 = _blank_if_dash(_s(first, "delivery_address1"))
+    delivery_address1 = _blank_if_dash(_s(first, "delivery_address1"))
     summary_line2 = _s(first, "order_summary")
+    # 納入先住所2（伝票中央表示用）。空欄/None/空白のみ/"-" は空文字にする。
+    # 古いレスポンス/キャッシュに delivery_address2 が無くても _s が空文字を返すため
+    # エラーにならない。
+    delivery_address2 = _blank_if_dash(_s(first, "delivery_address2"))
+    delivery_address_combined = combine_delivery_address(
+        delivery_address1, delivery_address2
+    )
+    summary_line1 = delivery_address_combined
+    if delivery_course_code is None:
+        delivery_course_code = first_non_blank_delivery_course_code(rows)
+    if delivery_course_name is None:
+        delivery_course_name = first_non_blank_delivery_course(rows)
+        source_row = _first_non_blank_delivery_course_row(rows)
+        delivery_course_response_key = str(
+            source_row.get("delivery_course_name_response_key") or ""
+        )
+        delivery_course_display_no = str(
+            source_row.get("delivery_course_name_display_no") or ""
+        )
+    delivery_course_code = normalize_delivery_course_code(delivery_course_code)
+    delivery_course_name = normalize_delivery_course_name(delivery_course_name)
+    delivery_course_name_logical_name = str(
+        _first_non_blank_delivery_course_row(rows).get(
+            "delivery_course_name_logical_name"
+        ) or "配送コース名称"
+    )
+    _logger.info(
+        "voucher_delivery_course_mapped "
+        "order_no=%s voucher_no=%s response_key=%s display_no=%s "
+        "value=%r detail_rows=%s",
+        _v(first, "order_no"),
+        _v(first, "voucher_no"),
+        delivery_course_response_key or "(not_available)",
+        delivery_course_display_no,
+        delivery_course_name,
+        len(rows),
+    )
     return {
         "office_name": _v(first, "office_name"),
         "office_tel": _v(first, "office_tel"),
@@ -321,11 +615,23 @@ def _build_page(rows: list[dict[str, str]], today: date) -> dict[str, Any]:
         "operator": _v(first, "operator"),
         "operator_name": _v(first, "operator"),
         "sales_rep": _v(first, "sales_rep"),
+        "delivery_course_code": delivery_course_code,
+        "delivery_course_code_raw": delivery_course_code,
+        "delivery_course_name": delivery_course_name,
+        "delivery_course_name_raw": delivery_course_name,
+        "delivery_course_response_key": delivery_course_response_key,
+        "delivery_course_display_no": delivery_course_display_no,
+        "delivery_course_name_response_key": delivery_course_response_key,
+        "delivery_course_name_display_no": delivery_course_display_no,
+        "delivery_course_name_logical_name": delivery_course_name_logical_name,
         "construction_rep": _v(first, "construction_rep"),
         "details": details,
         "summary_line1": summary_line1,
         "summary_line2": summary_line2,
         "summary_lines": [summary_line1, summary_line2],
+        "delivery_address1": delivery_address1,
+        "delivery_address2": delivery_address2,
+        "delivery_address_combined": delivery_address_combined,
         "property_lines": [" ".join(
             part for part in (_s(first, "property_no"), _s(first, "property_name")) if part
         )],
@@ -334,20 +640,103 @@ def _build_page(rows: list[dict[str, str]], today: date) -> dict[str, Any]:
         "qr_order_no": _v(first, "order_no"),
         # 取引区分（移動伝票=8 のPDF表示制御用）。OLAP取得時に得意先コードから付与される。
         "transaction_type": _s(first, "transaction_type"),
+        # 得意先マスタ「納品書単価・金額上段（硝子）」は取得・ログ用に保持する。
+        "invoice_price_amount_upper_glass": _s(first, "invoice_price_amount_upper_glass"),
+        "invoice_price_amount_upper_glass_raw": _s(
+            first, "invoice_price_amount_upper_glass_raw"
+        ) or _s(first, "invoice_price_amount_upper_glass"),
+        "invoice_price_amount_upper_glass_enabled": normalize_invoice_price_amount_upper_glass(
+            _s(first, "invoice_price_amount_upper_glass_raw")
+            or _s(first, "invoice_price_amount_upper_glass")
+        ),
+        # 単価・金額列の下段（および合計行下段）の表示判定に使うのは下段フィールドのみ。
+        "invoice_price_amount_lower_glass": _s(first, "invoice_price_amount_lower_glass"),
+        "invoice_price_amount_lower_glass_raw": _s(
+            first, "invoice_price_amount_lower_glass_raw"
+        ) or _s(first, "invoice_price_amount_lower_glass"),
+        "invoice_price_amount_lower_glass_enabled": normalize_invoice_price_amount_lower_glass(
+            _s(first, "invoice_price_amount_lower_glass_raw")
+            or _s(first, "invoice_price_amount_lower_glass")
+        ),
     }
+
+
+def combine_delivery_address(address1: object, address2: object) -> str:
+    """PDF表示用に納入先住所1・2を空白なしで自然に連結する。
+
+    元の2フィールドは変更せず、前後の半角・全角空白と欠損記号だけを除く。
+    日本語住所の番地と建物名を想定し、データにない区切り文字は追加しない。
+    """
+    part1 = _blank_if_dash(address1)
+    part2 = _blank_if_dash(address2)
+    combined = f"{part1}{part2}" if part1 and part2 else part1 or part2
+    if combined:
+        _logger.info(
+            "voucher_delivery_address_combined: address1=%s address2=%s combined=%s",
+            part1,
+            part2,
+            combined,
+        )
+    return combined
+
+
+def quantity_unit_code_value(row: dict[str, str]) -> str:
+    """明細行の数量単位コードを文字列で取り出す（前後空白を除去する）。
+
+    quantity_unit_code を優先し、無ければ quantity_unit_code_raw を見る。
+    数値型 19 や " 19 " のような表記でも `str().strip()` で正規化する。
+    未取得・空欄なら空文字を返す（既存の数量表示を維持するための判定に使う）。
+    """
+    for alias in ("quantity_unit_code", "quantity_unit_code_raw"):
+        value = row.get(alias)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def is_quantity_hidden_by_unit_code(row: dict[str, str]) -> bool:
+    """数量単位コードが「19」の明細行かどうかを判定する。
+
+    True の場合、その明細行の数量列（受注数量＋数量単位名称）は空欄にする。
+    「19」以外・空欄・未取得は False（従来通り数量を表示する）。
+    """
+    return quantity_unit_code_value(row) == "19"
 
 
 def _detail_row(row: dict[str, str]) -> dict[str, Any]:
     is_star = _v(row, "product_name") == "*"
-    qty = "" if is_star else format_number(_v(row, "ordered_quantity"), force_int=True)
-    unit = "" if is_star else _v(row, "quantity_unit_name")
-    if is_star:
+    unit_code = quantity_unit_code_value(row)
+    hide_quantity = is_quantity_hidden_by_unit_code(row)
+    if hide_quantity:
+        _logger.info(
+            "voucher_quantity_hidden_by_unit_code_19: order_no=%s order_line_no=%s",
+            _v(row, "order_no"),
+            _v(row, "order_line_no"),
+        )
+    elif unit_code:
+        _logger.info(
+            "voucher_quantity_drawn_by_unit_code: order_no=%s quantity_unit_code=%s",
+            _v(row, "order_no"),
+            unit_code,
+        )
+    else:
+        _logger.debug("voucher_quantity_unit_code_missing_use_existing_behavior")
+    # 数量列（受注数量＋数量単位名称）は、数量単位コード="19" の明細行のみ空欄にする。
+    # 列そのもの・罫線・他列（品名/摘要/単価/金額/寸法）は従来通り出力する。
+    qty = "" if (is_star or hide_quantity) else format_quantity(row.get("ordered_quantity"))
+    unit = "" if (is_star or hide_quantity) else _v(row, "quantity_unit_name")
+    op_category = op_category_value(row)
+    if is_star or not should_draw_upper_area_by_op_category(row):
         unit_price_display = ""
         amount_display = ""
     else:
-        raw_unit_price, raw_amount = resolve_unit_and_amount_values(row)
-        unit_price_display = _format_unit_display(raw_unit_price)
-        amount_display = _format_unit_display(raw_amount)
+        raw_unit_price, _ = resolve_unit_and_amount_values(row)
+        # 金額列上段は単価列上段と同じ元データ・同じ丸め後の数値に受注数量を掛けて
+        # 算出する。W/H寸法からの再計算値（受注統計数量/02時総平米）は使わない。
+        unit_upper = _rounded_unit_value(raw_unit_price)
+        unit_price_display = _format_rounded_value(unit_upper)
+        amount_upper = _amount_upper_value(unit_upper, _v(row, "ordered_quantity"))
+        amount_display = _format_rounded_value(amount_upper)
     finish = format_month_day(_v(row, "finish_date"))
     upper_suffix = "加" if _v(row, "detail_instruction_type") == "2" else ""
     upper_note = " ".join(part for part in (format_number(_v(row, "sales_unit_price"), force_int=True), upper_suffix) if part)
@@ -373,18 +762,81 @@ def _detail_row(row: dict[str, str]) -> dict[str, Any]:
         "sales_unit_price": "" if is_star else _v(row, "sales_unit_price"),
         "purchase_unit_price": "" if is_star else _v(row, "purchase_unit_price"),
         "ordered_quantity": "" if is_star else _v(row, "ordered_quantity"),
+        # 数量単位コードは内部データとして保持する（数量列の表示制御の根拠）。
+        # Kintone登録・CSV出力には使わないが、あっても既存処理は壊れない。
+        "quantity_unit_code": unit_code,
+        # PDF上段㎡の表示判定用。元の op_type も変更せず保持し、数値化しない。
+        "op_category": op_category,
+        "op_category_raw": normalize_op_category(
+            row.get("op_category_raw") or row.get("op_category") or row.get("op_type")
+        ),
+        "delivery_course_code": normalize_delivery_course_code(
+            row.get("delivery_course_code")
+        ),
+        "delivery_course_code_raw": normalize_delivery_course_code(
+            row.get("delivery_course_code_raw") or row.get("delivery_course_code")
+        ),
+        "delivery_course_name": normalize_delivery_course_name(
+            row.get("delivery_course_name")
+        ),
+        "delivery_course_name_raw": normalize_delivery_course_name(
+            row.get("delivery_course_name_raw")
+            or row.get("delivery_course_name")
+        ),
+        "delivery_course_response_key": str(
+            row.get("delivery_course_name_response_key") or ""
+        ),
+        "delivery_course_display_no": str(
+            row.get("delivery_course_name_display_no") or ""
+        ),
+        "delivery_course_name_response_key": str(
+            row.get("delivery_course_name_response_key") or ""
+        ),
+        "delivery_course_name_display_no": str(
+            row.get("delivery_course_name_display_no") or ""
+        ),
     }
+
+
+def _rounded_unit_value(value: str) -> Decimal | None:
+    """単価/金額表示と同じ丸め(小数第3位四捨五入)を適用した数値を返す。
+
+    0または空（丸め結果が0を含む）の場合は None を返し、表示は空欄になる。
+    """
+    dec = _decimal(value)
+    if dec is None or dec == 0:
+        return None
+    rounded = dec.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    if rounded == 0:
+        return None
+    return rounded
+
+
+def _amount_upper_value(unit_value: Decimal | None, quantity: str) -> Decimal | None:
+    """金額列上段の数値 = 単価列上段(丸め後) × 受注数量。
+
+    単価列上段が空(None)、または受注数量が数値化できない場合は None（空欄）。
+    積も表示と同じ小数第3位丸めを適用し、丸め結果が0なら None を返す。
+    """
+    if unit_value is None:
+        return None
+    qty = _decimal(quantity)
+    if qty is None:
+        return None
+    product = (unit_value * qty).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    return product if product != 0 else None
+
+
+def _format_rounded_value(value: Decimal | None) -> str:
+    """丸め済みの数値を表示文字列(㎡付き)に整形する。None は空文字。"""
+    if value is None:
+        return ""
+    return format_number(str(value), suffix="㎡")
 
 
 def _format_unit_display(value: str) -> str:
     """単価/金額表示用: 小数第3位で四捨五入、0または空の場合は空文字を返す。"""
-    dec = _decimal(value)
-    if dec is None or dec == 0:
-        return ""
-    rounded = dec.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
-    if rounded == 0:
-        return ""
-    return format_number(str(rounded), suffix="㎡")
+    return _format_rounded_value(_rounded_unit_value(value))
 
 
 def resolve_unit_and_amount_values(
@@ -420,13 +872,31 @@ def resolve_unit_and_amount_values(
     return _v(row, "stat_quantity"), _v(row, "ordered_stat_quantity")
 
 
-def _with_display_name_aliases(row: dict[str, str], *, logger: logging.Logger | None = None) -> dict[str, str]:
+def _with_display_name_aliases(
+    row: dict[str, str],
+    *,
+    logger: logging.Logger | None = None,
+    request_alias_keys: dict[str, tuple[str, str]] | None = None,
+) -> dict[str, str]:
+    # レスポンスが表示名または論理名をそのままキーにする形式。
+    # 数値キーのレイアウト判定に依存せず最優先で拾う。
+    for source_name, alias in _DISPLAY_NAME_ALIASES.items():
+        value = _blank_if_dash(_s_raw(row, source_name))
+        if not _s(row, alias) and value:
+            row[alias] = value
+
+    # この通信で実際に送信した表示No。古いテンプレートへの
+    # 動的補完で 49 以降になった場合も、固定Noより先に使う。
+    for alias, (_, key) in (request_alias_keys or {}).items():
+        if alias not in row and _s(row, key):
+            row[alias] = _blank_if_dash(_s_raw(row, key))
+
     if _is_current_olap_layout(row):
         for alias, (_, key) in _r1_display_alias_keys().items():
-            if alias not in row:
+            if alias not in row and alias not in (request_alias_keys or {}):
                 row[alias] = _s(row, key)
     for alias, keys in _FALLBACK_DISPLAY_KEYS.items():
-        if alias not in row:
+        if alias not in row and alias not in (request_alias_keys or {}):
             fallback_key = next((key for key in _fallback_keys(row, alias) if _s(row, key)), "")
             if fallback_key:
                 value = _s(row, fallback_key)
@@ -441,6 +911,77 @@ def _with_display_name_aliases(row: dict[str, str], *, logger: logging.Logger | 
     if "operator" not in row:
         row["operator"] = _s(row, "15")
     return row
+
+
+def _display_alias_keys_from_columns(
+    columns: list[dict[str, Any]],
+) -> dict[str, tuple[str, str]]:
+    """実送信 R1List から alias -> (表示名, 表示No) を作る。"""
+    result: dict[str, tuple[str, str]] = {}
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        display_name = str(column.get("OLAP表示名") or "").strip()
+        logical_name = str(column.get("フィールド論理名") or "").strip()
+        display_no = column.get("OLAP表示No")
+        if display_no is None:
+            continue
+        key = str(display_no)
+        alias = (
+            _DISPLAY_NAME_ALIASES.get(display_name)
+            or _DISPLAY_NAME_ALIASES.get(logical_name)
+            or _DISPLAY_NO_ALIASES.get(key)
+        )
+        if alias:
+            result[alias] = (display_name or logical_name, key)
+    return result
+
+
+def _request_column_for_alias(
+    columns: list[dict[str, Any]], alias: str
+) -> dict[str, Any]:
+    """実送信列からaliasに対応する列定義を返す。コード／名称は別判定する。"""
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        display_name = str(column.get("OLAP表示名") or "").strip()
+        logical_name = str(column.get("フィールド論理名") or "").strip()
+        mapped = (
+            _DISPLAY_NAME_ALIASES.get(display_name)
+            or _DISPLAY_NAME_ALIASES.get(logical_name)
+        )
+        if mapped == alias:
+            return column
+    return {}
+
+
+def _alias_source_key(
+    row: dict[str, str],
+    alias: str,
+    request_alias_keys: dict[str, tuple[str, str]],
+) -> str:
+    """alias の実レスポンスキーを解析優先順で返す。"""
+    requested = request_alias_keys.get(alias)
+    candidates: list[str] = []
+    if requested:
+        candidates.append(requested[1])
+    candidates.extend(
+        name for name, mapped_alias in _DISPLAY_NAME_ALIASES.items()
+        if mapped_alias == alias
+    )
+    static = _r1_display_alias_keys().get(alias)
+    if static:
+        candidates.append(static[1])
+    candidates.extend(_FALLBACK_DISPLAY_KEYS.get(alias, ()))
+    unique_candidates = list(dict.fromkeys(candidates))
+    for key in unique_candidates:
+        if _blank_if_dash(row.get(key)):
+            return key
+    for key in unique_candidates:
+        if key in row:
+            # 空値でも「そのキーで返った」ことは診断価値がある。
+            return key
+    return ""
 
 
 def _r1_display_alias_keys() -> dict[str, tuple[str, str]]:
@@ -578,6 +1119,25 @@ def _blank_if_dash(value: object) -> str:
     if text in ("", "-", "－"):
         return ""
     return text
+
+
+def normalize_invoice_price_amount_upper_glass(value: object) -> bool:
+    """得意先マスタの「納品書単価・金額上段（硝子）」を bool へ正規化する。
+
+    「1」のときだけ True（int 1・str "1" を含む）。空・0・"0"・None・未取得・
+    "false"・"2"・その他はすべて False。bool(value) は使わない（"0" が True 扱いに
+    なる事故を防ぐ）。判定は文字列化して厳密比較する。
+    """
+    return str(value).strip() == "1"
+
+
+def normalize_invoice_price_amount_lower_glass(value: object) -> bool:
+    """得意先マスタの「納品書単価・金額下段（硝子）」を bool へ正規化する。
+
+    「1」のときだけ True（int 1・str "1" を含む）。空・0・"0"・9・"9"・None・
+    未取得・その他はすべて False。bool(value) は使わない。
+    """
+    return str(value).strip() == "1"
 
 
 def _decimal(value: str | None) -> Decimal | None:

@@ -6,14 +6,19 @@ QApplication を offscreen で起動し、画面が開くこと・オブジェ�
 from __future__ import annotations
 
 import os
+import hashlib
+import io
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
+
+import pypdf
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QPointF
+    from PySide6.QtCore import QPointF, Qt
     from PySide6.QtWidgets import QApplication
 
     PYSIDE_AVAILABLE = True
@@ -50,8 +55,34 @@ class TestVoucherEditWindow(unittest.TestCase):
         toolbars = win.findChildren(QToolBar)
         self.assertTrue(toolbars)
         actions = [a.text() for tb in toolbars for a in tb.actions()]
-        for label in ("選択", "テキスト", "線", "四角", "削除", "保存", "閉じる"):
+        # 図形6種は「図形」ボタン1つへまとめたため、個別ラベルはヘッダー直下に無い（要件5）。
+        for label in ("選択", "テキスト", "削除", "保存", "閉じる"):
             self.assertIn(label, actions)
+        for label in ("線", "四角", "丸", "矢印", "両矢印", "二重線"):
+            self.assertNotIn(label, actions)
+
+    def test_instruction_sheet_background_contains_delivery_course_name(self) -> None:
+        from app import voucher_service
+        from app.voucher_templates import DUMMY_DATA
+
+        page = {
+            **DUMMY_DATA,
+            "order_no": "1405113",
+            "voucher_no": "Z001",
+            "delivery_course_code": "01",
+            "delivery_course_name": "パレト",
+            "sales_rep": "大上",
+            "edit_objects": [],
+        }
+        background_pdf = voucher_service.build_vouchers_pdf_bytes(
+            ["03"], {"pages": [page]}
+        )
+        text = "\n".join(
+            pdf_page.extract_text() or ""
+            for pdf_page in pypdf.PdfReader(io.BytesIO(background_pdf)).pages
+        )
+        self.assertIn("パレト", text)
+        self.assertIn("大上", text)
 
     def test_add_text_and_save_then_reload(self) -> None:
         from app.voucher_edit_window import VoucherEditWindow
@@ -73,6 +104,492 @@ class TestVoucherEditWindow(unittest.TestCase):
         reloaded = win2.serialize_objects()
         self.assertEqual(len(reloaded), 1)
         self.assertEqual(reloaded[0]["text"], "テストメモ")
+
+    def test_save_emits_trace_hash_revision_with_same_object_id(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="TRACE-SAVE", background_pdf_bytes=b"",
+            voucher_nos=["V1"])
+        self.addCleanup(win.deleteLater)
+        win.add_text_at(
+            QPointF(100.0, 150.0), text="太字斜体テスト",
+            font_size=18.0)
+        item = win.edit_items()[0]
+        item.apply_text_style(bold=True, italic=True, underline=True)
+        object_id = item.obj_id
+        emitted: list[tuple] = []
+        win.voucherEditSaved.connect(lambda *args: emitted.append(args))
+        with mock.patch("app.voucher_edit_window.QMessageBox.information"):
+            win.save()
+        self.assertEqual(len(emitted), 1)
+        order_no, voucher_no, content_hash, trace_id, revision = emitted[0]
+        self.assertEqual(order_no, "TRACE-SAVE")
+        self.assertEqual(voucher_no, "V1")
+        self.assertEqual(len(content_hash), 64)
+        self.assertTrue(trace_id)
+        self.assertEqual(revision, 1)
+        win2 = VoucherEditWindow(
+            order_no="TRACE-SAVE", background_pdf_bytes=b"",
+            voucher_nos=["V1"])
+        self.addCleanup(win2.deleteLater)
+        restored = win2.serialize_objects()[0]
+        self.assertEqual(restored["id"], object_id)
+        self.assertTrue(restored["font_italic"])
+
+    def test_main_save_notification_invalidates_snapshot_generation_and_pixmap(self) -> None:
+        from app.voucher_window import VoucherWindow
+
+        worker = mock.Mock()
+        editor = SimpleNamespace(
+            _background_load_generation=4,
+            invalidate_preview_cache=mock.Mock(),
+        )
+        cached = {
+            "edit_objects": [{"id": "old"}],
+            "pages": [{
+                "edit_objects": [{"id": "old"}],
+                "_edit_objects_sha256": "old",
+                "_edit_data_revision": 1,
+            }],
+        }
+        row = SimpleNamespace(
+            order_input=SimpleNamespace(text=lambda: "TRACE"),
+            cached_olap=cached,
+        )
+        window = SimpleNamespace(
+            _edit_render_context_by_order={},
+            _editor_load_generation=9,
+            _editor_workers={9: (object(), worker)},
+            _rows=[row],
+            _editor_window=editor,
+        )
+        VoucherWindow._on_voucher_edit_saved(
+            window, "TRACE", "V1", "b" * 64, "trace-id", 8)
+        self.assertEqual(window._editor_load_generation, 10)
+        worker.cancel.assert_called_once_with()
+        self.assertNotIn("edit_objects", cached)
+        self.assertNotIn("edit_objects", cached["pages"][0])
+        self.assertEqual(editor._background_load_generation, 5)
+        editor.invalidate_preview_cache.assert_called_once_with("V1")
+        self.assertEqual(
+            window._edit_render_context_by_order["TRACE"]["trace_id"],
+            "trace-id")
+
+    def test_save_to_worker_pdf_preview_e2e_uses_latest_style_and_trace(self) -> None:
+        from app import voucher_service
+        from app.voucher_edit_window import VoucherEditWindow
+        from app.voucher_preview_window import VoucherPrintPreviewWindow
+
+        win = VoucherEditWindow(
+            order_no="TRACE-FULL-E2E", background_pdf_bytes=b"",
+            voucher_nos=["V1"])
+        self.addCleanup(win.deleteLater)
+        item = win.add_text_at(
+            QPointF(80.0, 80.0), text="TEST", font_size=18.0)
+        item.font_family = "Helvetica"
+        item.apply_text_style(bold=True, italic=True, underline=True)
+        object_id = item.obj_id
+        emitted: list[tuple] = []
+        win.voucherEditSaved.connect(lambda *args: emitted.append(args))
+        with mock.patch("app.voucher_edit_window.QMessageBox.information"):
+            win.save()
+        order_no, _voucher_no, content_hash, trace_id, revision = emitted[0]
+        stale = dict(win.serialize_objects()[0], font_italic=False, italic=False)
+        data = {"pages": [{
+            "order_no": order_no, "voucher_no": "V1",
+            "customer_name": "顧客", "details": [],
+            "edit_objects": [stale],
+        }]}
+        with self.assertLogs("tks_to_kintone_app", level="INFO") as captured:
+            pdf = voucher_service.build_vouchers_pdf_bytes(
+                ["03"], data, edit_render_trace_id=trace_id,
+                reload_edit_objects=True, bypass_preview_cache=True)
+        logs = "\n".join(captured.output)
+        self.assertIn(
+            f"event=voucher_pdf_worker_input trace_id={trace_id} "
+            f"object_id={object_id}", logs)
+        self.assertIn("italic=True", logs)
+        self.assertIn(
+            f"event=draw_styled_pdf_text trace_id={trace_id} "
+            f"object_id={object_id}", logs)
+        self.assertIn("font_italic=True", logs)
+        self.assertIn(f"edit_data_revision={revision}", logs)
+        self.assertIn(f"edit_objects_sha256={content_hash}", logs)
+        pdf_hash = hashlib.sha256(pdf).hexdigest()
+        with self.assertLogs(
+                "app.voucher_preview_window", level="INFO") as preview_logs:
+            preview = VoucherPrintPreviewWindow(
+                pdf, edit_render_trace_id=trace_id,
+                edit_objects_sha256=content_hash, preview_cache_hit=False)
+        self.addCleanup(preview.deleteLater)
+        self.assertEqual(preview.pdf_sha256, pdf_hash)
+        shown = "\n".join(preview_logs.output)
+        self.assertIn(
+            f"event=voucher_preview_pixmap_shown trace_id={trace_id} "
+            f"pdf_sha256={pdf_hash}", shown)
+        self.assertIn("cache_hit=False", shown)
+        stream = pypdf.PdfReader(
+            io.BytesIO(pdf)).pages[0].get_contents().get_data()
+        self.assertIn(b"1 0 .2 1", stream)
+
+    def test_switch_voucher_keeps_independent_unsaved_objects(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="MULTI", background_pdf_bytes=b"",
+            voucher_nos=[" 001 ", "A002", "001"])
+        self.addCleanup(win.deleteLater)
+        win._individual_voucher_radio.setChecked(True)
+        win.add_text_at(QPointF(10, 20), text="伝票A")
+        win.switch_voucher("A002")
+        self.assertEqual(win.serialize_objects(), [])
+        win.add_text_at(QPointF(30, 40), text="伝票B")
+        win.switch_voucher("001")
+        self.assertEqual([o["text"] for o in win.serialize_objects()], ["伝票A"])
+        self.assertEqual(win.voucher_nos, ["001", "A002"])
+
+    def test_edit_scope_defaults_to_common_and_combo_follows_mode(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="SCOPE-UI", background_pdf_bytes=b"",
+            voucher_nos=["Z001", "Z002"])
+        self.addCleanup(win.deleteLater)
+        self.assertTrue(win._all_vouchers_radio.isChecked())
+        self.assertFalse(win._voucher_combo.isEnabled())
+        self.assertIn("すべての伝票No", win._all_vouchers_radio.toolTip())
+        win._individual_voucher_radio.setChecked(True)
+        self.assertTrue(win._voucher_combo.isEnabled())
+        self.assertIn("選択した伝票Noだけ", win._individual_voucher_radio.toolTip())
+        win.switch_voucher("Z002")
+        win._all_vouchers_radio.setChecked(True)
+        self.assertFalse(win._voucher_combo.isEnabled())
+        self.assertEqual(win.current_voucher_no, "Z002")
+        win._individual_voucher_radio.setChecked(True)
+        self.assertEqual(win.current_voucher_no, "Z002")
+
+    def test_single_unique_voucher_disables_scope_and_hides_notice(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        for values, expected in (([" 001 ", "001"], "001"), ([""], ""), ([], "")):
+            with self.subTest(values=values):
+                win = VoucherEditWindow(
+                    order_no=f"SINGLE-{expected}", background_pdf_bytes=b"",
+                    voucher_nos=values)
+                self.addCleanup(win.deleteLater)
+                self.assertEqual(win.voucher_nos, [expected])
+                self.assertTrue(win._all_vouchers_radio.isChecked())
+                self.assertFalse(win._all_vouchers_radio.isEnabled())
+                self.assertFalse(win._individual_voucher_radio.isEnabled())
+                self.assertFalse(win._voucher_combo.isEnabled())
+                self.assertTrue(win._multiple_vouchers_notice.isHidden())
+                self.assertIn("1件のため", win._all_vouchers_radio.toolTip())
+                self.assertIn("1件のため", win._individual_voucher_radio.toolTip())
+
+    def test_multiple_voucher_inline_notice_and_no_modal(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        with (mock.patch("app.voucher_edit_window.QMessageBox.information") as info,
+              mock.patch("app.voucher_edit_window.QMessageBox.warning") as warning):
+            win = VoucherEditWindow(
+                order_no="MULTIPLE-NOTICE", background_pdf_bytes=b"",
+                voucher_nos=["001", "002", "003"])
+        self.addCleanup(win.deleteLater)
+        self.assertTrue(win._all_vouchers_radio.isEnabled())
+        self.assertTrue(win._individual_voucher_radio.isEnabled())
+        self.assertFalse(win._multiple_vouchers_notice.isHidden())
+        self.assertIn("複数の伝票Noがあります", win._multiple_vouchers_notice.text())
+        self.assertIn("3件", win._multiple_vouchers_notice.text())
+        self.assertIn("共通編集", win._multiple_vouchers_notice.toolTip())
+        self.assertFalse(win._voucher_combo.isEnabled())
+        win._individual_voucher_radio.setChecked(True)
+        self.assertTrue(win._voucher_combo.isEnabled())
+        info.assert_not_called()
+        warning.assert_not_called()
+
+    def test_voucher_count_change_is_non_destructive(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="COUNT-CHANGE", background_pdf_bytes=b"",
+            voucher_nos=["Z001", "Z002"])
+        self.addCleanup(win.deleteLater)
+        win.add_text_at(QPointF(10, 20), text="共通")
+        win._individual_voucher_radio.setChecked(True)
+        win.add_text_at(QPointF(30, 40), text="個別")
+        individual_id = win.serialize_objects()[0]["id"]
+        win.set_voucher_numbers([" Z001 ", "Z001"])
+        self.assertEqual(win._edit_mode, "common")
+        self.assertTrue(win._all_vouchers_radio.isChecked())
+        self.assertFalse(win._all_vouchers_radio.isEnabled())
+        self.assertEqual(win._voucher_objects["Z001"][0]["id"], individual_id)
+        self.assertEqual([o["text"] for o in win.serialize_objects()], ["共通"])
+        win.set_voucher_numbers(["Z001", "Z002"])
+        self.assertTrue(win._all_vouchers_radio.isEnabled())
+        self.assertFalse(win._multiple_vouchers_notice.isHidden())
+        win._individual_voucher_radio.setChecked(True)
+        self.assertEqual(win.serialize_objects()[0]["id"], individual_id)
+
+    def test_multiple_voucher_notice_theme_reapplies(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        with mock.patch("app.voucher_edit_window.current_title_bar_is_dark", return_value=False):
+            win = VoucherEditWindow(
+                order_no="NOTICE-THEME", background_pdf_bytes=b"",
+                voucher_nos=["A", "B"])
+        self.addCleanup(win.deleteLater)
+        light_style = win._multiple_vouchers_notice.styleSheet()
+        self.assertIn("#fff3cd", light_style)
+        self.assertIn("#5f4300", light_style)
+        self.assertIn("font-weight: bold", light_style)
+        with mock.patch("app.voucher_edit_window.current_title_bar_is_dark", return_value=True):
+            win._apply_toolbar_theme()
+        dark_style = win._multiple_vouchers_notice.styleSheet()
+        self.assertIn("#5a4618", dark_style)
+        self.assertIn("#fff1b8", dark_style)
+        self.assertNotEqual(light_style, dark_style)
+
+    def test_mode_switch_is_non_destructive_and_common_is_readonly_in_individual(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="SCOPE-DATA", background_pdf_bytes=b"",
+            voucher_nos=["Z001", "Z002"])
+        self.addCleanup(win.deleteLater)
+        win.add_text_at(QPointF(10, 20), text="共通")
+        common_id = win.serialize_objects()[0]["id"]
+        win._individual_voucher_radio.setChecked(True)
+        readonly = [item for item in win._scene.items()
+                    if getattr(item, "_COMMON_READONLY", False)]
+        self.assertEqual(len(readonly), 1)
+        self.assertFalse(readonly[0].flags() &
+                         readonly[0].GraphicsItemFlag.ItemIsSelectable)
+        win.add_text_at(QPointF(30, 40), text="個別")
+        individual_id = win.serialize_objects()[0]["id"]
+        win._all_vouchers_radio.setChecked(True)
+        self.assertEqual(win.serialize_objects()[0]["id"], common_id)
+        win._individual_voucher_radio.setChecked(True)
+        self.assertEqual(win.serialize_objects()[0]["id"], individual_id)
+
+    def test_common_and_individual_undo_histories_are_independent(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="SCOPE-HISTORY", background_pdf_bytes=b"",
+            voucher_nos=["Z001", "Z002"])
+        self.addCleanup(win.deleteLater)
+        win.add_text_at(QPointF(10, 20), text="共通")
+        win.commit_history()
+        win._individual_voucher_radio.setChecked(True)
+        win.add_text_at(QPointF(30, 40), text="個別")
+        win.commit_history()
+        win.undo()
+        self.assertEqual(win.serialize_objects(), [])
+        win._all_vouchers_radio.setChecked(True)
+        self.assertEqual([o["text"] for o in win.serialize_objects()], ["共通"])
+        win.undo()
+        self.assertEqual(win.serialize_objects(), [])
+        win._individual_voucher_radio.setChecked(True)
+        self.assertEqual(win.serialize_objects(), [])
+
+    def test_copy_between_common_and_individual_reissues_ids(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="SCOPE-COPY", background_pdf_bytes=b"",
+            voucher_nos=["Z001", "Z002"])
+        self.addCleanup(win.deleteLater)
+        common_item = win.add_text_at(QPointF(10, 20), text="共通元")
+        common_item.setSelected(True)
+        common_id = win.serialize_objects()[0]["id"]
+        self.assertEqual(win.copy_objects_to_vouchers(
+            ["Z001"], selected_only=True), (1, 1))
+        win._individual_voucher_radio.setChecked(True)
+        copied = win.serialize_objects()[0]
+        self.assertNotEqual(copied["id"], common_id)
+        copied_item = win.edit_items()[0]
+        copied_item.setSelected(True)
+        self.assertEqual(win.copy_objects_to_common(selected_only=True), 1)
+        win._all_vouchers_radio.setChecked(True)
+        self.assertEqual(len(win.serialize_objects()), 2)
+        self.assertEqual(len({o["id"] for o in win.serialize_objects()}), 2)
+
+    def test_copy_selected_to_multiple_vouchers_reissues_id(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="COPY", background_pdf_bytes=b"",
+            voucher_nos=["A001", "A002", "A003"])
+        self.addCleanup(win.deleteLater)
+        win._individual_voucher_radio.setChecked(True)
+        item = win.add_text_at(QPointF(10, 20), text="コピー元")
+        item.setSelected(True)
+        source_id = win.serialize_objects()[0]["id"]
+        self.assertEqual(
+            win.copy_objects_to_vouchers(["A002", "A003"], selected_only=True),
+            (1, 2))
+        win.switch_voucher("A002")
+        copied = win.serialize_objects()[0]
+        self.assertNotEqual(copied["id"], source_id)
+        copied["text"] = "モデル変更"
+        win.switch_voucher("A001")
+        self.assertEqual(win.serialize_objects()[0]["text"], "コピー元")
+
+    def test_copy_all_append_replace_and_destination_undo(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="COPY2", background_pdf_bytes=b"",
+            voucher_nos=["A001", "A002"])
+        self.addCleanup(win.deleteLater)
+        win._individual_voucher_radio.setChecked(True)
+        win.add_text_at(QPointF(1, 2), text="source")
+        win.switch_voucher("A002")
+        win.add_text_at(QPointF(3, 4), text="existing")
+        win.switch_voucher("A001")
+        win.copy_objects_to_vouchers(["A002"], selected_only=False)
+        win.switch_voucher("A002")
+        self.assertEqual({o["text"] for o in win.serialize_objects()}, {"source", "existing"})
+        win.undo()
+        self.assertEqual([o["text"] for o in win.serialize_objects()], ["existing"])
+        win.switch_voucher("A001")
+        win.copy_objects_to_vouchers(
+            ["A002"], selected_only=False, replace=True)
+        win.switch_voucher("A002")
+        self.assertEqual([o["text"] for o in win.serialize_objects()], ["source"])
+
+    def test_multi_voucher_save_and_reload(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(
+            order_no="SAVE-MULTI", background_pdf_bytes=b"",
+            voucher_nos=["A001", "A002"])
+        self.addCleanup(win.deleteLater)
+        win._individual_voucher_radio.setChecked(True)
+        win.add_text_at(QPointF(1, 2), text="A")
+        win.switch_voucher("A002")
+        win.add_text_at(QPointF(3, 4), text="B")
+        with mock.patch("app.voucher_edit_window.QMessageBox.information"):
+            win.save()
+        win2 = VoucherEditWindow(
+            order_no="SAVE-MULTI", background_pdf_bytes=b"",
+            voucher_nos=["A001", "A002"])
+        self.addCleanup(win2.deleteLater)
+        win2._individual_voucher_radio.setChecked(True)
+        self.assertEqual(win2.serialize_objects()[0]["text"], "A")
+        win2.switch_voucher("A002")
+        self.assertEqual(win2.serialize_objects()[0]["text"], "B")
+
+    def test_switch_voucher_changes_background_and_uses_pixmap_cache(self) -> None:
+        from PySide6.QtGui import QColor, QPixmap
+        from app.voucher_edit_window import VoucherEditWindow
+
+        def render(data: bytes):
+            pixmap = QPixmap(20, 20)
+            pixmap.fill(QColor("red" if data == b"pdf-a" else "blue"))
+            return pixmap
+
+        def size(data: bytes):
+            return (100.0, 200.0) if data == b"pdf-a" else (300.0, 400.0)
+
+        with (mock.patch("app.voucher_edit_window.render_order_sheet_background",
+                         side_effect=render) as renderer,
+              mock.patch("app.voucher_edit_window.pdf_page_size", side_effect=size)):
+            win = VoucherEditWindow(
+                order_no="PREVIEW", background_pdf_bytes=b"pdf-a",
+                voucher_nos=["A001", "A002"],
+                background_pdf_by_voucher={"A001": b"pdf-a", "A002": b"pdf-b"})
+            self.addCleanup(win.deleteLater)
+            win._individual_voucher_radio.setChecked(True)
+            win.add_text_at(QPointF(1, 2), text="A object")
+            self.assertEqual(win.background_items()[0].data(1), "A001")
+            self.assertEqual(win._scene.sceneRect().size().toTuple(), (100.0, 200.0))
+            win.switch_voucher("A002")
+            self.assertEqual(win.background_items()[0].data(1), "A002")
+            self.assertEqual(win.serialize_objects(), [])
+            self.assertEqual(win._scene.sceneRect().size().toTuple(), (300.0, 400.0))
+            win.add_text_at(QPointF(3, 4), text="B object")
+            win.switch_voucher("A001")
+            self.assertEqual(win.background_items()[0].data(1), "A001")
+            self.assertEqual(win.serialize_objects()[0]["text"], "A object")
+            win.switch_voucher("A002")
+            self.assertEqual(renderer.call_count, 2)
+
+    def test_preview_failure_does_not_leave_previous_voucher_background(self) -> None:
+        from PySide6.QtGui import QColor, QPixmap
+        from app.voucher_edit_window import VoucherEditWindow
+
+        good = QPixmap(20, 20)
+        good.fill(QColor("red"))
+        with (mock.patch("app.voucher_edit_window.render_order_sheet_background",
+                         side_effect=lambda data: good if data == b"good" else None),
+              mock.patch("app.voucher_edit_window.pdf_page_size",
+                         return_value=(100.0, 200.0))):
+            win = VoucherEditWindow(
+                order_no="PREVIEW-FAIL", background_pdf_bytes=b"good",
+                voucher_nos=["001", "002"],
+                background_pdf_by_voucher={"001": b"good", "002": b"broken"})
+            self.addCleanup(win.deleteLater)
+            win.switch_voucher("002")
+            backgrounds = win.background_items()
+            self.assertTrue(backgrounds)
+            self.assertTrue(all(item.data(1) == "002" for item in backgrounds))
+            self.assertEqual(backgrounds[0].data(2), "error")
+            self.assertEqual(win.current_voucher_no, "002")
+
+    def test_preview_cache_invalidation_and_target_voucher(self) -> None:
+        from PySide6.QtGui import QColor, QPixmap
+        from app.voucher_edit_window import VoucherEditWindow
+
+        def render(_data):
+            pixmap = QPixmap(10, 10)
+            pixmap.fill(QColor("white"))
+            return pixmap
+
+        with (mock.patch("app.voucher_edit_window.render_order_sheet_background",
+                         side_effect=render) as renderer,
+              mock.patch("app.voucher_edit_window.pdf_page_size",
+                         return_value=(100.0, 200.0))):
+            win = VoucherEditWindow(
+                order_no="CACHE", background_pdf_bytes=b"a",
+                voucher_nos=["A", "B"],
+                background_pdf_by_voucher={"A": b"a", "B": b"b"},
+                preview_target_voucher="04")
+            self.addCleanup(win.deleteLater)
+            self.assertEqual(win._active_preview_cache_key[2], "04")
+            win.switch_voucher("B")
+            self.assertEqual(renderer.call_count, 2)
+            win.invalidate_preview_cache(
+                "B", background_pdf_by_voucher={"A": b"a2", "B": b"b2"})
+            win.switch_voucher("A")
+            win.switch_voucher("B")
+            # AもPDF bytesがa→a2へ変わったため、明示invalidate対象がBだけでも
+            # SHA-256入りキーにより旧Pixmapを再利用しない。
+            self.assertEqual(renderer.call_count, 4)
+            self.assertEqual(win._active_preview_cache_key[4], 5)
+            self.assertEqual(len(win._active_preview_cache_key[5]), 64)
+
+    def test_fast_preview_switch_with_blank_voucher_is_safe(self) -> None:
+        from PySide6.QtGui import QColor, QPixmap
+        from app.voucher_edit_window import VoucherEditWindow
+
+        pixmap = QPixmap(10, 10)
+        pixmap.fill(QColor("white"))
+        with (mock.patch("app.voucher_edit_window.render_order_sheet_background",
+                         return_value=pixmap),
+              mock.patch("app.voucher_edit_window.pdf_page_size",
+                         return_value=(100.0, 200.0))):
+            win = VoucherEditWindow(
+                order_no="FAST", background_pdf_bytes=b"blank",
+                voucher_nos=["", "0002"],
+                background_pdf_by_voucher={"": b"blank", "0002": b"two"})
+            self.addCleanup(win.deleteLater)
+            for _ in range(10):
+                win.switch_voucher("0002")
+                win.switch_voucher("")
+            self.assertEqual(win.current_voucher_no, "")
+            self.assertEqual(win.background_items()[0].data(1), "__tks_empty_voucher_no__")
 
     def test_short_text_is_converted_to_symbol_text(self) -> None:
         from PySide6.QtCore import QRectF
@@ -219,6 +736,118 @@ class TestVoucherEditWindow(unittest.TestCase):
         self.assertAlmostEqual(obj["x1"], 10.0)
         self.assertAlmostEqual(obj["x2"], 100.0)
 
+    def _png_bytes(self) -> bytes:
+        from PySide6.QtGui import QColor, QImage
+        from app.voucher_edit_window import qimage_to_png_bytes
+
+        image = QImage(20, 12, QImage.Format.Format_ARGB32)
+        image.fill(QColor("#ffffff"))
+        return qimage_to_png_bytes(image)
+
+    def test_image_selection_does_not_show_left_image_processing_menu(self) -> None:
+        from PySide6.QtCore import QRectF
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-left", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        image = win.add_image(self._png_bytes(), QRectF(10.0, 10.0, 20.0, 12.0))
+        self.assertIsNotNone(image)
+        win._select_only(image)
+        win._update_image_action_buttons()
+        self.assertIsNone(win._image_actions_label)
+        self.assertIsNotNone(win._favorite_list)
+
+    def test_image_context_menu_has_image_processing_menu(self) -> None:
+        from PySide6.QtCore import QRectF
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-img-menu", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        image = win.add_image(self._png_bytes(), QRectF(10.0, 10.0, 20.0, 12.0))
+        menu = win._build_object_context_menu(image)
+        submenus = getattr(menu, "_submenus", [])
+        self.assertTrue(any(m.objectName() == "image_processing_menu" for m in submenus))
+
+    def test_non_image_context_menu_has_no_image_processing_menu(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-text-menu", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(10.0, 10.0), text="abc")
+        menu = win._build_object_context_menu(text)
+        submenus = getattr(menu, "_submenus", [])
+        self.assertFalse(any(m.objectName() == "image_processing_menu" for m in submenus))
+
+    def test_image_processing_runs_from_context_menu(self) -> None:
+        from PySide6.QtCore import QRectF
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-img-action", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        image = win.add_image(self._png_bytes(), QRectF(10.0, 10.0, 20.0, 12.0))
+        with mock.patch.object(win, "_on_threshold_transparent") as threshold:
+            menu = win._build_object_context_menu(image)
+            image_menu = next(m for m in getattr(menu, "_submenus", [])
+                              if m.objectName() == "image_processing_menu")
+            action = next(a for a in image_menu.actions()
+                          if a.objectName() == "transparent_background_action")
+            action.trigger()
+        threshold.assert_called_once()
+
+    def test_image_object_can_be_added_to_favorites(self) -> None:
+        from PySide6.QtCore import QRectF
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-image", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        image = win.add_image(self._png_bytes(), QRectF(10.0, 10.0, 20.0, 12.0))
+        self.assertTrue(win.add_object_to_favorites(image))
+        self.assertEqual(len(win._favorites), 1)
+        self.assertEqual(win._favorites[0]["object"]["type"], "image")
+
+    def test_text_object_can_be_added_to_favorites_and_reloaded(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-text", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(10.0, 10.0), text="favorite")
+        self.assertTrue(win.add_object_to_favorites(text))
+        fav_id = win._favorites[0]["id"]
+
+        win2 = VoucherEditWindow(order_no="fav-text-2", background_pdf_bytes=b"")
+        self.addCleanup(win2.deleteLater)
+        self.assertEqual(win2._favorites[0]["id"], fav_id)
+        self.assertEqual(win2._favorites[0]["object"]["text"], "favorite")
+
+    def test_favorite_can_be_removed(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-remove", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(10.0, 10.0), text="favorite")
+        win.add_object_to_favorites(text)
+        fav_id = win._favorites[0]["id"]
+        self.assertTrue(win.remove_favorite_object(fav_id))
+        self.assertEqual(win._favorites, [])
+
+    def test_favorite_drop_adds_separate_instance(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-drop", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(10.0, 10.0), text="favorite")
+        original_id = text.obj_id
+        win.add_object_to_favorites(text)
+        fav_id = win._favorites[0]["id"]
+        self.assertTrue(win.drop_favorite_object(fav_id, QPointF(100.0, 120.0)))
+        objects = win.serialize_objects()
+        ids = {obj["id"] for obj in objects}
+        self.assertEqual(len(objects), 2)
+        self.assertIn(original_id, ids)
+        self.assertEqual(len(ids), 2)
+        dropped = [obj for obj in objects if obj["id"] != original_id][0]
+        self.assertEqual(dropped["text"], "favorite")
+
     def test_add_rect_with_inner_text_roundtrip(self) -> None:
         """四角形がドラッグ矩形で作成され、内部テキストが保存・再読み込みされる（要件5・6）。"""
         from PySide6.QtCore import QRectF
@@ -242,7 +871,7 @@ class TestVoucherEditWindow(unittest.TestCase):
         self.assertEqual(reloaded[0]["text"], "+2")
 
     def test_toolbar_has_new_actions(self) -> None:
-        """丸・保存して閉じるが追加されている（要件5・8）。"""
+        """保存して閉じる等の主要アクションと、図形メニュー（線/四角/丸）がある（要件5・8）。"""
         from PySide6.QtWidgets import QToolBar
 
         from app.voucher_edit_window import VoucherEditWindow
@@ -251,8 +880,12 @@ class TestVoucherEditWindow(unittest.TestCase):
         self.addCleanup(win.deleteLater)
         from PySide6.QtWidgets import QToolBar as _TB
         actions = [a.text() for tb in win.findChildren(_TB) for a in tb.actions()]
-        for label in ("選択", "テキスト", "線", "四角", "丸", "保存", "保存して閉じる", "閉じる"):
+        for label in ("選択", "テキスト", "保存", "保存して閉じる", "閉じる"):
             self.assertIn(label, actions)
+        # 図形6種は「図形」メニューへまとめた（要件5）。
+        menu_labels = [a.text() for a in win._shape_menu.actions()]
+        for label in ("線", "矢印", "両矢印", "二重線", "四角", "丸"):
+            self.assertIn(label, menu_labels)
 
     def test_delete_key_removes_selected(self) -> None:
         """Deleteキーで選択中オブジェクトが削除される（要件2）。"""
@@ -444,6 +1077,101 @@ class TestVoucherEditWindow(unittest.TestCase):
         self.assertIn("color: #ffffff", EDIT_TOOLBAR_STYLE)
         self.assertIn("border: 2px solid #66b2ff", EDIT_TOOLBAR_STYLE)
         self.assertIn(":checked:disabled", EDIT_TOOLBAR_STYLE)
+
+    def test_toolbar_dark_theme_colors_applied(self) -> None:
+        """ダークテーマでは上部メニューに文字色・背景色が明示され読める（要件6）。"""
+        from PySide6.QtWidgets import QToolBar
+
+        from app.voucher_edit_window import (
+            EDIT_SHAPE_MENU_DARK_STYLE,
+            EDIT_TOOLBAR_CONTAINER_DARK_BG,
+            EDIT_TOOLBAR_DARK_STYLE,
+            VoucherEditWindow,
+        )
+
+        with mock.patch(
+            "app.voucher_edit_window.current_title_bar_is_dark",
+            return_value=True,
+        ):
+            win = VoucherEditWindow(order_no="drk1", background_pdf_bytes=b"")
+            self.addCleanup(win.deleteLater)
+            bar = win.findChildren(QToolBar)[0]
+            # 通常状態の文字色が背景色と別に指定されている。
+            self.assertIn("color: #f0f0f0", EDIT_TOOLBAR_DARK_STYLE)
+            self.assertIn("background-color: #3a4047", EDIT_TOOLBAR_DARK_STYLE)
+            # ダーク用の配色がツールバーへ適用されている。
+            self.assertIn(EDIT_TOOLBAR_DARK_STYLE.strip()[:20], bar.styleSheet())
+            # コンテナ背景・図形メニューもダーク配色。
+            self.assertIn(
+                EDIT_TOOLBAR_CONTAINER_DARK_BG,
+                win._main_toolbar_container.styleSheet(),
+            )
+            self.assertEqual(win._shape_menu.styleSheet(), EDIT_SHAPE_MENU_DARK_STYLE)
+            # disabled でも背景と同化しない別色を指定している。
+            self.assertIn("color: #9aa3ac", EDIT_TOOLBAR_DARK_STYLE)
+
+    def test_toolbar_light_theme_keeps_default(self) -> None:
+        """ライトテーマでは上部メニューを明示的なライト配色にし黒っぽくしない（要件6）。"""
+        from PySide6.QtGui import QColor
+        from PySide6.QtWidgets import QToolBar
+
+        from app.voucher_edit_window import (
+            EDIT_SHAPE_MENU_LIGHT_STYLE,
+            EDIT_TOOLBAR_CONTAINER_LIGHT_BG,
+            EDIT_TOOLBAR_LIGHT_STYLE,
+            VoucherEditWindow,
+        )
+
+        with mock.patch(
+            "app.voucher_edit_window.current_title_bar_is_dark",
+            return_value=False,
+        ):
+            win = VoucherEditWindow(order_no="lgt1", background_pdf_bytes=b"")
+            self.addCleanup(win.deleteLater)
+            container_ss = win._main_toolbar_container.styleSheet()
+            self.assertIn(EDIT_TOOLBAR_CONTAINER_LIGHT_BG, container_ss)
+            # コンテナ背景は明るい色（黒系ではない）。
+            self.assertGreater(QColor(EDIT_TOOLBAR_CONTAINER_LIGHT_BG).lightness(), 200)
+            # 図形メニューはライト配色（空ではなく明示指定）で黒っぽくならない。
+            self.assertEqual(win._shape_menu.styleSheet(), EDIT_SHAPE_MENU_LIGHT_STYLE)
+            self.assertIn("#ffffff", EDIT_SHAPE_MENU_LIGHT_STYLE)
+            # ツールバー本体にライト配色が適用され、ダーク配色は含まれない。
+            bar = win.findChildren(QToolBar)[0]
+            bar_ss = bar.styleSheet()
+            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.strip()[:20], bar_ss)
+            self.assertNotIn("#3a4047", bar_ss)  # ダーク用ボタン背景が残っていない
+            self.assertNotIn("#2b2f33", bar_ss)  # ダーク用ツールバー背景が残っていない
+            # ライト用のボタン文字色・背景色が明示されている。
+            self.assertIn("color: #202124", EDIT_TOOLBAR_LIGHT_STYLE)
+            self.assertIn("background-color: #ffffff", EDIT_TOOLBAR_LIGHT_STYLE)
+
+    def test_toolbar_theme_switches_light_after_dark(self) -> None:
+        """ダーク適用後にライトへ切り替えると黒配色が残らず再適用される（要件6）。"""
+        from PySide6.QtWidgets import QToolBar
+
+        from app.voucher_edit_window import (
+            EDIT_TOOLBAR_LIGHT_STYLE,
+            VoucherEditWindow,
+        )
+
+        with mock.patch(
+            "app.voucher_edit_window.current_title_bar_is_dark",
+            return_value=True,
+        ):
+            win = VoucherEditWindow(order_no="sw1", background_pdf_bytes=b"")
+            self.addCleanup(win.deleteLater)
+            bar = win.findChildren(QToolBar)[0]
+            self.assertIn("#3a4047", bar.styleSheet())  # 初期はダーク
+
+        # テーマをライトへ切り替えて再適用する。
+        with mock.patch(
+            "app.voucher_edit_window.current_title_bar_is_dark",
+            return_value=False,
+        ):
+            win._apply_toolbar_theme()
+            bar_ss = bar.styleSheet()
+            self.assertNotIn("#3a4047", bar_ss)  # ダーク配色は消えている
+            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.strip()[:20], bar_ss)
 
     def test_reflect_target_highlight_switches_exclusively(self) -> None:
         """反映先を切り替えると青背景が1ボタンだけへ移る。"""
@@ -1467,7 +2195,7 @@ class TestVoucherEditWindow(unittest.TestCase):
 
     # ── 全画面 / 最大化表示・ツールバー（要件2-1・2-2・2-5・2-6・2-7）──────────────
     def test_toolbar_has_image_paste_fullscreen_actions(self) -> None:
-        from PySide6.QtWidgets import QToolBar
+        from PySide6.QtWidgets import QScrollArea, QToolBar
 
         from app.voucher_edit_window import VoucherEditWindow
 
@@ -1476,6 +2204,85 @@ class TestVoucherEditWindow(unittest.TestCase):
         actions = [a.text() for tb in win.findChildren(QToolBar) for a in tb.actions()]
         for label in ("画像挿入", "貼り付け", "全画面", "保存して閉じる"):
             self.assertIn(label, actions)
+        scroll = win.findChild(QScrollArea, "mainEditToolBarContainer")
+        self.assertIsNotNone(scroll)
+        self.assertEqual(scroll.widget(), win._main_toolbar)
+
+    def test_toolbar_scroll_area_keeps_content_width_for_horizontal_scroll(self) -> None:
+        from PySide6.QtWidgets import QScrollArea
+
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="ts-scroll", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        scroll = win.findChild(QScrollArea, "mainEditToolBarContainer")
+        self.assertIsNotNone(scroll)
+        self.assertFalse(scroll.widgetResizable())
+        self.assertEqual(
+            scroll.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+        )
+        self.assertEqual(
+            scroll.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        self.assertGreaterEqual(
+            win._main_toolbar.minimumWidth(),
+            win._main_toolbar.sizeHint().width(),
+        )
+
+    def test_left_pane_is_vertical_scroll_area(self) -> None:
+        from PySide6.QtWidgets import QScrollArea
+
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="left-scroll", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        scroll = win.findChild(QScrollArea, "templatePanelScroll")
+        self.assertIsNotNone(scroll)
+        self.assertIs(scroll.widget(), win._template_panel)
+        self.assertTrue(scroll.widgetResizable())
+        self.assertEqual(
+            scroll.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+        )
+        self.assertEqual(
+            scroll.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        # 左ペインをさらに約1.5cm広げた（基準190→250）。scroll 幅も一致して広がる。
+        self.assertLessEqual(scroll.maximumWidth(), 250)
+        self.assertGreaterEqual(scroll.maximumWidth(), 250)
+
+    def test_left_pane_has_right_margin_for_scrollbar(self) -> None:
+        """左ペイン内側レイアウトに、縦スクロールバー分＋余白の右marginがある（要件3）。"""
+        from PySide6.QtWidgets import QStyle
+
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="left-margin", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        layout = win._template_panel.layout()
+        margins = layout.contentsMargins()
+        scrollbar_width = win.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        # 右marginは 8px 以上あり、かつ左marginよりスクロールバー分以上広い。
+        self.assertGreaterEqual(margins.right(), 8)
+        self.assertGreaterEqual(margins.right() - margins.left(), scrollbar_width)
+        # パネル幅（左ペイン幅）は前回広げた状態（250）を維持する。
+        self.assertEqual(win._template_panel.width(), 250)
+        # ボタンが収まる内容幅はパネル幅より右marginぶん狭い（スクロールバーに重ならない）。
+        content_width = win._template_panel.width() - margins.left() - margins.right()
+        self.assertLess(content_width, win._template_panel.width())
+        self.assertGreater(content_width, 0)
+
+    def test_show_opens_maximized(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="ts-max", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        with mock.patch.object(win, "showMaximized") as show_maximized:
+            win.show()
+        show_maximized.assert_called_once_with()
 
     def test_fullscreen_toggle_switches_state(self) -> None:
         from app.voucher_edit_window import VoucherEditWindow
@@ -1694,6 +2501,789 @@ class TestVoucherEditWindow(unittest.TestCase):
             win.closeEvent(event)
         persist.assert_called_once()
         self.assertTrue(event.isAccepted())
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")
+class TestVoucherEditUndoRedoButtons(unittest.TestCase):
+    """上部ツールバーのアンドゥ・リドゥボタン（要件1）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._prev_home = os.environ.get("TKS_TO_KINTONE_HOME")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = self._tmp.name
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("TKS_TO_KINTONE_HOME", None)
+        else:
+            os.environ["TKS_TO_KINTONE_HOME"] = self._prev_home
+        self._tmp.cleanup()
+
+    def test_undo_redo_buttons_exist_with_icons(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="btn1", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertIsNotNone(win._undo_action)
+        self.assertIsNotNone(win._redo_action)
+        self.assertFalse(win._undo_action.icon().isNull())
+        self.assertFalse(win._redo_action.icon().isNull())
+
+    def test_buttons_disabled_when_no_history(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="btn2", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertFalse(win._undo_action.isEnabled())
+        self.assertFalse(win._redo_action.isEnabled())
+
+    def test_button_state_follows_history(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="btn3", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        win.add_text_at(QPointF(10.0, 10.0), text="a", font_size=12.0)
+        win.commit_history()
+        self.assertTrue(win._undo_action.isEnabled())
+        self.assertFalse(win._redo_action.isEnabled())
+        win.undo()
+        self.assertFalse(win._undo_action.isEnabled())
+        self.assertTrue(win._redo_action.isEnabled())
+        win.redo()
+        self.assertTrue(win._undo_action.isEnabled())
+        self.assertFalse(win._redo_action.isEnabled())
+
+    def test_history_limited_to_50(self) -> None:
+        from app.voucher_edit_window import HISTORY_LIMIT, VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="btn4", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        for i in range(HISTORY_LIMIT + 20):
+            win.add_text_at(QPointF(10.0 + i, 10.0 + i), text=f"t{i}", font_size=12.0)
+            win.commit_history()
+        self.assertLessEqual(len(win._history), HISTORY_LIMIT)
+
+    def test_favorite_drop_undo_redo(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="btn5", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(10.0, 10.0), text="fav", font_size=12.0)
+        win.commit_history()
+        win.add_object_to_favorites(text)
+        fav_id = win._favorites[0]["id"]
+        base = len(win.serialize_objects())
+        self.assertTrue(win.drop_favorite_object(fav_id, QPointF(80.0, 80.0)))
+        self.assertEqual(len(win.serialize_objects()), base + 1)
+        win.undo()
+        self.assertEqual(len(win.serialize_objects()), base)
+        win.redo()
+        self.assertEqual(len(win.serialize_objects()), base + 1)
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")
+class TestVoucherEditReflectTemplateLimit(unittest.TestCase):
+    """反映先テンプレ登録の上限8個（要件2）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._prev_home = os.environ.get("TKS_TO_KINTONE_HOME")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = self._tmp.name
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("TKS_TO_KINTONE_HOME", None)
+        else:
+            os.environ["TKS_TO_KINTONE_HOME"] = self._prev_home
+        self._tmp.cleanup()
+
+    def _seed_user_templates(self, extra: int) -> None:
+        from app.voucher_edit_templates import save_user_templates
+
+        templates = [
+            {"name": f"ユーザー{i}", "target_vouchers": ["03"], "color": "#607d8b", "badge": "U"}
+            for i in range(extra)
+        ]
+        save_user_templates(templates)
+
+    def _register_new(self, win, name: str):
+        from PySide6.QtWidgets import QDialog
+
+        with mock.patch("app.voucher_edit_window._TemplateRegisterDialog") as Dlg, \
+                mock.patch("app.voucher_edit_window.QMessageBox.information") as info:
+            inst = Dlg.return_value
+            inst.exec.return_value = QDialog.DialogCode.Accepted
+            inst.template.return_value = {
+                "name": name, "target_vouchers": ["03"],
+                "color": "#607d8b", "badge": "N",
+            }
+            win._on_register_template()
+        return info
+
+    def test_label_shows_count_over_max(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        # 組み込み4個 + ユーザー2個 = 6個。
+        self._seed_user_templates(2)
+        win = VoucherEditWindow(order_no="rt-label", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertEqual(win._reflect_count_label.text(), "6/8")
+
+    def test_can_add_when_below_limit(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        # 組み込み4個 + ユーザー3個 = 7個（追加可能）。
+        self._seed_user_templates(3)
+        win = VoucherEditWindow(order_no="rt-7", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertEqual(win._reflect_template_count(), 7)
+        info = self._register_new(win, "追加テンプレ")
+        info.assert_not_called()
+        self.assertEqual(win._reflect_template_count(), 8)
+        self.assertEqual(win._reflect_count_label.text(), "8/8")
+
+    def test_cannot_add_when_at_limit(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        # 組み込み4個 + ユーザー4個 = 8個（追加不可）。
+        self._seed_user_templates(4)
+        win = VoucherEditWindow(order_no="rt-8", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertEqual(win._reflect_template_count(), 8)
+        info = self._register_new(win, "溢れテンプレ")
+        info.assert_called_once()
+        self.assertEqual(win._reflect_template_count(), 8)
+
+    def test_deleting_allows_adding_again(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        from PySide6.QtWidgets import QMessageBox
+
+        self._seed_user_templates(4)  # 合計8個
+        win = VoucherEditWindow(order_no="rt-del", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        with mock.patch("app.voucher_edit_window.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.Yes):
+            win._delete_template("ユーザー0")
+        self.assertEqual(win._reflect_template_count(), 7)
+        info = self._register_new(win, "再追加")
+        info.assert_not_called()
+        self.assertEqual(win._reflect_template_count(), 8)
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")
+class TestVoucherEditFavoriteLimit(unittest.TestCase):
+    """お気に入り登録の上限20個と固定表示枠（要件2・4）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._prev_home = os.environ.get("TKS_TO_KINTONE_HOME")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = self._tmp.name
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("TKS_TO_KINTONE_HOME", None)
+        else:
+            os.environ["TKS_TO_KINTONE_HOME"] = self._prev_home
+        self._tmp.cleanup()
+
+    def _add_n_favorites(self, win, n: int) -> None:
+        for i in range(n):
+            item = win.add_text_at(QPointF(10.0 + i, 10.0 + i), text=f"f{i}", font_size=12.0)
+            with mock.patch("app.voucher_edit_window.QMessageBox.information"):
+                win.add_object_to_favorites(item)
+
+    def test_max_favorite_objects_is_20(self) -> None:
+        from app.voucher_edit_window import MAX_FAVORITE_OBJECTS
+
+        self.assertEqual(MAX_FAVORITE_OBJECTS, 20)
+
+    def test_can_add_below_limit(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-19", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self._add_n_favorites(win, 19)
+        self.assertEqual(len(win._favorites), 19)
+        item = win.add_text_at(QPointF(200.0, 200.0), text="20th", font_size=12.0)
+        with mock.patch("app.voucher_edit_window.QMessageBox.information") as info:
+            self.assertTrue(win.add_object_to_favorites(item))
+        info.assert_not_called()
+        self.assertEqual(len(win._favorites), 20)
+
+    def test_cannot_add_at_limit(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-20", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self._add_n_favorites(win, 20)
+        self.assertEqual(len(win._favorites), 20)
+        item = win.add_text_at(QPointF(200.0, 200.0), text="21th", font_size=12.0)
+        with mock.patch("app.voucher_edit_window.QMessageBox.information") as info:
+            self.assertFalse(win.add_object_to_favorites(item))
+        info.assert_called_once()
+        # 上限メッセージが「最大20個」であること。
+        message = " ".join(str(a) for a in info.call_args.args)
+        self.assertIn("20", message)
+        self.assertEqual(len(win._favorites), 20)
+
+    def test_label_shows_count(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-label", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertEqual(win._favorite_count_label.text(), "0/20")
+        self._add_n_favorites(win, 6)
+        self.assertEqual(win._favorite_count_label.text(), "6/20")
+
+    def test_delete_allows_adding_again(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-del", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self._add_n_favorites(win, 20)
+        removed_id = win._favorites[0]["id"]
+        self.assertTrue(win.remove_favorite_object(removed_id))
+        self.assertEqual(len(win._favorites), 19)
+        item = win.add_text_at(QPointF(300.0, 300.0), text="again", font_size=12.0)
+        with mock.patch("app.voucher_edit_window.QMessageBox.information") as info:
+            self.assertTrue(win.add_object_to_favorites(item))
+        info.assert_not_called()
+        self.assertEqual(len(win._favorites), 20)
+
+    def test_favorite_list_has_fixed_height(self) -> None:
+        from app.voucher_edit_window import FAVORITE_LIST_FIXED_HEIGHT, VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-h", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        widget = win._favorite_list
+        self.assertEqual(widget.minimumHeight(), widget.maximumHeight())
+        self.assertEqual(widget.maximumHeight(), FAVORITE_LIST_FIXED_HEIGHT)
+
+    def test_fixed_height_maintained_when_empty(self) -> None:
+        from app.voucher_edit_window import FAVORITE_LIST_FIXED_HEIGHT, VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-empty", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertEqual(win._favorite_list.count(), 0)
+        self.assertEqual(win._favorite_list.maximumHeight(), FAVORITE_LIST_FIXED_HEIGHT)
+
+    def test_all_20_displayed(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-all", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self._add_n_favorites(win, 20)
+        self.assertEqual(win._favorite_list.count(), 20)
+
+    def test_drag_and_drop_still_works(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="fav-dnd", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(10.0, 10.0), text="dnd", font_size=12.0)
+        win.add_object_to_favorites(text)
+        fav_id = win._favorites[0]["id"]
+        before = len(win.serialize_objects())
+        self.assertTrue(win.drop_favorite_object(fav_id, QPointF(120.0, 120.0)))
+        self.assertEqual(len(win.serialize_objects()), before + 1)
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")
+class TestVoucherEditDuplicateContextMenu(unittest.TestCase):
+    """オブジェクト右クリックメニューの「複製」（要件1）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._prev_home = os.environ.get("TKS_TO_KINTONE_HOME")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = self._tmp.name
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("TKS_TO_KINTONE_HOME", None)
+        else:
+            os.environ["TKS_TO_KINTONE_HOME"] = self._prev_home
+        self._tmp.cleanup()
+
+    def _png_bytes(self) -> bytes:
+        from PySide6.QtGui import QColor, QImage
+        from app.voucher_edit_window import qimage_to_png_bytes
+
+        image = QImage(20, 12, QImage.Format.Format_ARGB32)
+        image.fill(QColor("#ffffff"))
+        return qimage_to_png_bytes(image)
+
+    def _duplicate_actions(self, menu):
+        return [a for a in menu.actions() if a.objectName() == "duplicate_action"]
+
+    def test_image_menu_has_single_duplicate(self) -> None:
+        from PySide6.QtCore import QRectF
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="dup-img", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        image = win.add_image(self._png_bytes(), QRectF(10.0, 10.0, 20.0, 12.0))
+        menu = win._build_object_context_menu(image)
+        dups = self._duplicate_actions(menu)
+        self.assertEqual(len(dups), 1)
+        self.assertEqual(dups[0].text(), "複製")
+        # 画像処理サブメニューは維持される。
+        submenus = getattr(menu, "_submenus", [])
+        self.assertTrue(any(m.objectName() == "image_processing_menu" for m in submenus))
+
+    def test_text_menu_has_single_duplicate(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="dup-text", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(10.0, 10.0), text="abc")
+        menu = win._build_object_context_menu(text)
+        dups = self._duplicate_actions(menu)
+        self.assertEqual(len(dups), 1)
+        # 非画像には画像処理メニューを出さない仕様を維持。
+        submenus = getattr(menu, "_submenus", [])
+        self.assertFalse(any(m.objectName() == "image_processing_menu" for m in submenus))
+
+    def test_duplicate_increases_count_and_selects_new(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="dup-count", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(30.0, 30.0), text="dup")
+        win.commit_history()
+        self.assertEqual(len(win.serialize_objects()), 1)
+        self.assertTrue(win.duplicate_object(text))
+        objs = win.serialize_objects()
+        self.assertEqual(len(objs), 2)
+        # 複製後の新オブジェクトが選択状態になる。
+        selected = win._scene.selectedItems()
+        self.assertEqual(len(selected), 1)
+        self.assertNotEqual(getattr(selected[0], "obj_id", None), text.obj_id)
+
+    def test_duplicate_undo_redo(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="dup-undo", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        text = win.add_text_at(QPointF(30.0, 30.0), text="dup")
+        win.commit_history()
+        self.assertTrue(win.duplicate_object(text))
+        self.assertEqual(len(win.serialize_objects()), 2)
+        win.undo()
+        self.assertEqual(len(win.serialize_objects()), 1)
+        win.redo()
+        self.assertEqual(len(win.serialize_objects()), 2)
+
+    def test_duplicate_action_triggered_from_menu(self) -> None:
+        from PySide6.QtCore import QRectF
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="dup-trigger", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        rect = win.add_rect(QRectF(20.0, 20.0, 40.0, 30.0), text="r")
+        win.commit_history()
+        menu = win._build_object_context_menu(rect)
+        action = self._duplicate_actions(menu)[0]
+        action.trigger()
+        self.assertEqual(len(win.serialize_objects()), 2)
+
+    def _make_item(self, win, kind):
+        from PySide6.QtCore import QPointF, QRectF
+
+        if kind == "image":
+            return win.add_image(self._png_bytes(), QRectF(10.0, 10.0, 20.0, 12.0))
+        if kind == "text":
+            return win.add_text_at(QPointF(10.0, 10.0), text="abc")
+        if kind == "rect":
+            return win.add_rect(QRectF(10.0, 10.0, 20.0, 12.0))
+        if kind == "ellipse":
+            return win.add_ellipse(QRectF(10.0, 10.0, 20.0, 12.0))
+        if kind == "line":
+            return win.add_line(QPointF(10.0, 10.0), QPointF(40.0, 40.0))
+        raise ValueError(kind)
+
+    # モーダルダイアログを開くアクションはテストでトリガーしない（ハング防止）。
+    _DIALOG_ACTIONS = {"threshold_settings_action"}
+
+    def _trigger_all_enabled(self, menu):
+        for a in list(menu.actions()):
+            sub = a.menu()
+            if sub is not None:
+                self._trigger_all_enabled(sub)
+            elif (
+                not a.isSeparator()
+                and a.isEnabled()
+                and a.objectName() not in self._DIALOG_ACTIONS
+            ):
+                a.trigger()
+
+    def test_context_menu_all_types_do_not_crash(self) -> None:
+        # 画像・テキスト・図形・線すべてで右クリックメニューを作れ、落ちない。
+        from app.voucher_edit_window import VoucherEditWindow
+
+        for kind in ("image", "text", "rect", "ellipse", "line"):
+            win = VoucherEditWindow(order_no=f"rc-{kind}", background_pdf_bytes=b"")
+            self.addCleanup(win.deleteLater)
+            item = self._make_item(win, kind)
+            menu = win._build_object_context_menu(item)
+            self.assertGreaterEqual(len(menu.actions()), 1)
+
+    def test_context_menu_action_on_deleted_item_does_not_crash(self) -> None:
+        # 削除直後の stale item を参照するアクションを叩いても落ちない（要件2）。
+        from app.voucher_edit_window import VoucherEditWindow
+
+        for kind in ("image", "text", "rect", "ellipse", "line"):
+            win = VoucherEditWindow(order_no=f"rc-del-{kind}", background_pdf_bytes=b"")
+            self.addCleanup(win.deleteLater)
+            item = self._make_item(win, kind)
+            win.commit_history()
+            menu = win._build_object_context_menu(item)
+            # メニュー表示後に対象を削除 → 全アクションを叩いても例外を出さない。
+            win._delete_object(item)
+            self._trigger_all_enabled(menu)  # 例外を投げない
+
+    def test_run_object_action_with_missing_id_is_safe(self) -> None:
+        # obj_id が None / 未知でも安全に中止しログを出す（クラッシュしない）。
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="rc-missing", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        called = []
+        win._run_object_action(None, lambda it: called.append(it), name="noop")
+        win._run_object_action("does-not-exist", lambda it: called.append(it), name="noop")
+        self.assertEqual(called, [])
+
+    def test_context_menu_event_on_empty_area_does_not_crash(self) -> None:
+        # 何もない場所を右クリックしても落ちない（キャンバスメニューへ委譲）。
+        from unittest import mock
+        from PySide6.QtCore import QPointF
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="rc-empty", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+
+        class _Evt:
+            def __init__(self):
+                self._accepted = False
+
+            def scenePos(self):
+                return QPointF(500.0, 500.0)
+
+            def screenPos(self):
+                return QPointF(0.0, 0.0)
+
+            def accept(self):
+                self._accepted = True
+
+        with mock.patch.object(win, "_show_canvas_context_menu") as canvas, \
+                mock.patch.object(win, "_show_object_context_menu") as obj:
+            win._scene.contextMenuEvent(_Evt())
+        canvas.assert_called_once()
+        obj.assert_not_called()
+
+    def test_context_menu_event_exception_does_not_propagate(self) -> None:
+        # メニュー生成/表示で例外が出ても contextMenuEvent は落とさない（要件2）。
+        from unittest import mock
+        from PySide6.QtCore import QPointF, QRectF
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="rc-exc", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        rect = win.add_rect(QRectF(10.0, 10.0, 40.0, 40.0))
+
+        class _Evt:
+            def scenePos(self):
+                return QPointF(20.0, 20.0)
+
+            def screenPos(self):
+                return QPointF(0.0, 0.0)
+
+            def accept(self):
+                pass
+
+        with mock.patch.object(
+            win, "_show_object_context_menu", side_effect=RuntimeError("boom")
+        ):
+            win._scene.contextMenuEvent(_Evt())  # 例外を投げない
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")
+class TestVoucherEditReflectAreaFixedHeight(unittest.TestCase):
+    """反映先表示領域を常に最大8個分の固定高さにする（要件3）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._prev_home = os.environ.get("TKS_TO_KINTONE_HOME")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = self._tmp.name
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("TKS_TO_KINTONE_HOME", None)
+        else:
+            os.environ["TKS_TO_KINTONE_HOME"] = self._prev_home
+        self._tmp.cleanup()
+
+    def _seed_user_templates(self, extra: int) -> None:
+        from app.voucher_edit_templates import save_user_templates
+
+        templates = [
+            {"name": f"ユーザー{i}", "target_vouchers": ["03"], "color": "#607d8b", "badge": "U"}
+            for i in range(extra)
+        ]
+        save_user_templates(templates)
+
+    def test_fixed_height_with_zero_extra(self) -> None:
+        # 組み込みテンプレートを全削除し、反映先0個の状態にする。
+        from app.voucher_edit_window import REFLECT_LIST_FIXED_HEIGHT, VoucherEditWindow
+        from app.voucher_edit_templates import save_user_templates
+
+        save_user_templates([], deleted_builtins=["指図書のみ", "梱包のみ"])
+        win = VoucherEditWindow(order_no="rf-0", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        container = win._reflect_list_container
+        self.assertEqual(container.minimumHeight(), container.maximumHeight())
+        self.assertEqual(container.maximumHeight(), REFLECT_LIST_FIXED_HEIGHT)
+
+    def test_fixed_height_with_four(self) -> None:
+        from app.voucher_edit_window import REFLECT_LIST_FIXED_HEIGHT, VoucherEditWindow
+
+        # 既定の組み込み4個。
+        win = VoucherEditWindow(order_no="rf-4", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertEqual(win._reflect_template_count(), 4)
+        self.assertEqual(win._reflect_list_container.maximumHeight(), REFLECT_LIST_FIXED_HEIGHT)
+        self.assertEqual(win._reflect_count_label.text(), "4/8")
+
+    def test_fixed_height_with_eight(self) -> None:
+        from app.voucher_edit_window import REFLECT_LIST_FIXED_HEIGHT, VoucherEditWindow
+
+        self._seed_user_templates(4)  # 4 + 4 = 8
+        win = VoucherEditWindow(order_no="rf-8", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        self.assertEqual(win._reflect_template_count(), 8)
+        self.assertEqual(win._reflect_list_container.maximumHeight(), REFLECT_LIST_FIXED_HEIGHT)
+        self.assertEqual(len(win._template_actions), 8)
+
+    def test_height_unchanged_after_delete(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        from app.voucher_edit_window import REFLECT_LIST_FIXED_HEIGHT, VoucherEditWindow
+
+        self._seed_user_templates(4)
+        win = VoucherEditWindow(order_no="rf-del", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        before = win._reflect_list_container.maximumHeight()
+        with mock.patch("app.voucher_edit_window.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.Yes):
+            win._delete_template("ユーザー0")
+        self.assertEqual(win._reflect_template_count(), 7)
+        self.assertEqual(win._reflect_list_container.maximumHeight(), before)
+        self.assertEqual(win._reflect_list_container.maximumHeight(), REFLECT_LIST_FIXED_HEIGHT)
+
+    def test_selection_highlight_preserved(self) -> None:
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="rf-sel", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        names = list(win._template_actions)
+        win._on_template_selected(win._template_by_name(names[1]))
+        checked = [n for n, b in win._template_actions.items() if b.isChecked()]
+        self.assertEqual(checked, [names[1]])
+        self.assertIn("background-color: #0d6efd",
+                      win._template_actions[names[1]].styleSheet())
+
+
+class TestVoucherEditShapeMenu(unittest.TestCase):
+    """図形6種を「図形」ボタンへ統合（要件5・6・7）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self._prev_home = os.environ.get("TKS_TO_KINTONE_HOME")
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = self._tmp.name
+
+    def tearDown(self) -> None:
+        if self._prev_home is None:
+            os.environ.pop("TKS_TO_KINTONE_HOME", None)
+        else:
+            os.environ["TKS_TO_KINTONE_HOME"] = self._prev_home
+        self._tmp.cleanup()
+
+    def _make(self):
+        from app.voucher_edit_window import VoucherEditWindow
+
+        win = VoucherEditWindow(order_no="shape-menu", background_pdf_bytes=b"")
+        self.addCleanup(win.deleteLater)
+        return win
+
+    def test_shape_button_exists(self) -> None:
+        win = self._make()
+        self.assertIsNotNone(win._shape_tool_button)
+        self.assertIsNotNone(win._shape_menu)
+
+    def test_shape_menu_has_six_items(self) -> None:
+        win = self._make()
+        labels = [a.text() for a in win._shape_menu.actions()]
+        for label in ("線", "矢印", "両矢印", "二重線", "四角", "丸"):
+            self.assertIn(label, labels)
+        self.assertEqual(len(win._shape_menu.actions()), 6)
+
+    def test_individual_shape_buttons_not_in_header(self) -> None:
+        from PySide6.QtWidgets import QToolBar
+
+        win = self._make()
+        actions = [a.text() for tb in win.findChildren(QToolBar) for a in tb.actions()]
+        for label in ("線", "矢印", "両矢印", "二重線", "四角", "丸"):
+            self.assertNotIn(label, actions)
+
+    def test_menu_item_switches_tool_mode(self) -> None:
+        from app.voucher_edit_window import (
+            TOOL_LINE, TOOL_ARROW, TOOL_DOUBLE_ARROW, TOOL_DOUBLE_LINE,
+            TOOL_RECT, TOOL_ELLIPSE,
+        )
+
+        win = self._make()
+        for tool in (TOOL_LINE, TOOL_ARROW, TOOL_DOUBLE_ARROW,
+                     TOOL_DOUBLE_LINE, TOOL_RECT, TOOL_ELLIPSE):
+            win._tool_actions[tool].trigger()
+            self.assertEqual(win.current_tool, tool)
+
+    def test_shape_actions_are_exclusive_group(self) -> None:
+        from app.voucher_edit_window import TOOL_LINE, TOOL_RECT
+
+        win = self._make()
+        win._tool_actions[TOOL_LINE].trigger()
+        win._tool_actions[TOOL_RECT].trigger()
+        checked = [a.text() for a in win._shape_action_group.actions() if a.isChecked()]
+        self.assertEqual(checked, ["四角"])
+        self.assertTrue(win._shape_action_group.isExclusive())
+
+    def test_shape_button_reflects_current_shape(self) -> None:
+        from app.voucher_edit_window import TOOL_ELLIPSE
+
+        win = self._make()
+        win._tool_actions[TOOL_ELLIPSE].trigger()
+        self.assertIn("丸", win._shape_tool_button.text())
+
+    def test_header_menu_scroll_area_maintained(self) -> None:
+        # 上部メニュー横スクロール対応は維持する（要件7）。
+        win = self._make()
+        self.assertIsNotNone(getattr(win, "_main_toolbar_container", None))
+
+
+class TestVoucherEditUndoRedoIconTheme(unittest.TestCase):
+    """アンドゥ/リドゥの色・有効無効状態（要件8）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_icon_has_normal_and_disabled_pixmaps(self) -> None:
+        from PySide6.QtCore import QSize
+        from PySide6.QtGui import QIcon
+        from app.voucher_edit_window import make_undo_redo_icon
+
+        icon, _ = make_undo_redo_icon("undo", dark=False)
+        normal = icon.pixmap(QSize(20, 20), QIcon.Mode.Normal)
+        disabled = icon.pixmap(QSize(20, 20), QIcon.Mode.Disabled)
+        self.assertFalse(normal.isNull())
+        self.assertFalse(disabled.isNull())
+
+    def test_enabled_and_disabled_colors_differ(self) -> None:
+        from app.voucher_edit_window import _undo_redo_colors
+
+        for dark in (True, False):
+            enabled, disabled = _undo_redo_colors(dark)
+            self.assertNotEqual(enabled.name(), disabled.name())
+
+    def test_dark_enabled_icon_not_same_as_background(self) -> None:
+        # ダークテーマの enabled 色が暗色背景と同化しない（明るい色）。
+        from app.voucher_edit_window import _undo_redo_colors
+
+        enabled, _ = _undo_redo_colors(dark=True)
+        # 明るい色（各チャネルが高い）であること。
+        self.assertGreater(enabled.lightness(), 180)
+
+    def test_theme_reapply_method_runs(self) -> None:
+        import os
+        import tempfile
+
+        prev = os.environ.get("TKS_TO_KINTONE_HOME")
+        tmp = tempfile.TemporaryDirectory()
+        os.environ["TKS_TO_KINTONE_HOME"] = tmp.name
+        try:
+            from app.voucher_edit_window import VoucherEditWindow
+
+            win = VoucherEditWindow(order_no="icon-theme", background_pdf_bytes=b"")
+            self.addCleanup(win.deleteLater)
+            # 再適用してもアイコンが空にならない。
+            win._apply_undo_redo_icon_theme()
+            self.assertFalse(win._undo_action.icon().isNull())
+            self.assertFalse(win._redo_action.icon().isNull())
+        finally:
+            if prev is None:
+                os.environ.pop("TKS_TO_KINTONE_HOME", None)
+            else:
+                os.environ["TKS_TO_KINTONE_HOME"] = prev
+            tmp.cleanup()
+
+
+class TestLeftPaneWidthByDpi(unittest.TestCase):
+    """125%以上で左ペイン幅を広げる（要件9）。"""
+
+    def test_scale_100_uses_base_width(self) -> None:
+        """scale 1.0 の左ペイン幅が約250px（190からさらに+60px）。"""
+        from app.window_geometry import left_pane_width_for_scale
+
+        # 既定 base_width が 250（190 + 60px）へ広がっている。
+        self.assertEqual(left_pane_width_for_scale(1.0), 250)
+        self.assertEqual(left_pane_width_for_scale(1.0) - 190, 60)
+
+    def test_scale_125_widens(self) -> None:
+        """scale 1.25 の左ペイン幅が約300px（240からさらに+60px）。"""
+        from app.window_geometry import left_pane_width_for_scale
+
+        self.assertGreater(left_pane_width_for_scale(1.25), left_pane_width_for_scale(1.0))
+        self.assertEqual(left_pane_width_for_scale(1.25), 300)
+        self.assertEqual(left_pane_width_for_scale(1.25) - 240, 60)
+
+    def test_scale_150_widens_further(self) -> None:
+        """scale 1.5 の左ペイン幅が約320px（260からさらに+60px）。"""
+        from app.window_geometry import left_pane_width_for_scale
+
+        w125 = left_pane_width_for_scale(1.25)
+        w150 = left_pane_width_for_scale(1.5)
+        self.assertGreaterEqual(w150, w125)
+        self.assertEqual(w150, 320)
+        self.assertEqual(w150 - 260, 60)
+
+    def test_get_display_scale_returns_positive(self) -> None:
+        from app.window_geometry import get_display_scale
+
+        self.assertGreater(get_display_scale(None), 0)
 
 
 if __name__ == "__main__":

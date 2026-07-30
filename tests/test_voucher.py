@@ -159,6 +159,26 @@ class TestVoucherService(unittest.TestCase):
             self.assertEqual(first.name, "20260622_093015_1405113.pdf")
             self.assertEqual(second.name, "20260622_093015_1405113_2.pdf")
 
+    def test_save_named_pdf_bytes_uses_order_no_filename(self) -> None:
+        import tempfile
+        from app.voucher_service import save_named_pdf_bytes
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = save_named_pdf_bytes(b"%PDF", output_dir=Path(tmpdir), filename_stem="1394161_伝票")
+            self.assertEqual(out.name, "1394161_伝票.pdf")
+
+    def test_save_named_pdf_bytes_collision_uses_sequence(self) -> None:
+        import tempfile
+        from app.voucher_service import save_named_pdf_bytes
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = save_named_pdf_bytes(b"%PDF", output_dir=Path(tmpdir), filename_stem="1394161_伝票")
+            second = save_named_pdf_bytes(b"%PDF", output_dir=Path(tmpdir), filename_stem="1394161_伝票")
+            third = save_named_pdf_bytes(b"%PDF", output_dir=Path(tmpdir), filename_stem="1394161_伝票")
+            self.assertEqual(first.name, "1394161_伝票.pdf")
+            self.assertEqual(second.name, "1394161_伝票_2.pdf")
+            self.assertEqual(third.name, "1394161_伝票_3.pdf")
+
     def test_pdf_filename_sanitizes_invalid_characters(self) -> None:
         import tempfile
         from app.voucher_service import save_pdf_bytes
@@ -415,6 +435,86 @@ class TestBuildVouchersPdfBytes(unittest.TestCase):
         self.assertEqual(len(reader.pages), 3)
 
 
+class TestNameQtyColumnWidthRestored(unittest.TestCase):
+    """品名/数量 列幅変更を元に戻したことのテスト（長名称はフォント縮小で対応）。"""
+
+    # 元の（変更前＝復帰後）の品名/数量境界・数量/単価境界。
+    NAME_QTY_BORDER = 336.0
+    QTY_RIGHT_BORDER = 434.0
+
+    def test_shift_constant_removed(self) -> None:
+        """列幅シフト定数 NAME_QTY_BORDER_SHIFT は廃止されている。"""
+        import app.voucher_templates as vt
+        self.assertFalse(hasattr(vt, "NAME_QTY_BORDER_SHIFT"))
+
+    def test_name_qty_border_restored(self) -> None:
+        """1. 品名／数量境界が元の位置(336.0)に戻っている。"""
+        from app.voucher_templates import TBL_COLS, SHIZU_TBL_COLS
+        self.assertAlmostEqual(TBL_COLS[2], self.NAME_QTY_BORDER, places=2)
+        self.assertAlmostEqual(SHIZU_TBL_COLS[2], self.NAME_QTY_BORDER, places=2)
+
+    def test_qty_column_width_restored(self) -> None:
+        """数量列幅が元の幅(98.0)に戻っている。"""
+        from app.voucher_templates import TBL_COLS, SHIZU_TBL_COLS
+        self.assertAlmostEqual(TBL_COLS[3] - TBL_COLS[2], 98.0, places=2)
+        self.assertAlmostEqual(SHIZU_TBL_COLS[3] - SHIZU_TBL_COLS[2], 98.0, places=2)
+
+    def test_qty_right_border_unchanged(self) -> None:
+        """数量列の右端位置は従来どおり(434.0)。"""
+        from app.voucher_templates import TBL_COLS, SHIZU_TBL_COLS
+        self.assertAlmostEqual(TBL_COLS[3], self.QTY_RIGHT_BORDER, places=2)
+        self.assertAlmostEqual(SHIZU_TBL_COLS[3], self.QTY_RIGHT_BORDER, places=2)
+
+    def test_right_side_columns_unchanged(self) -> None:
+        """7. 単価・金額・摘要・受入日など右側列・表外枠の位置が崩れない。"""
+        from app.voucher_templates import TBL_COLS, SHIZU_TBL_COLS
+        self.assertEqual(TBL_COLS[3:], [434.0, 502.0, 568.0, 695.0])
+        self.assertEqual(SHIZU_TBL_COLS[3:], [434.0, 631.5, 695.0])
+        # 左端・品名左端も不変。
+        self.assertEqual(TBL_COLS[0], 34.0)
+        self.assertEqual(TBL_COLS[1], 45.0)
+
+    def test_name_draw_width_restored(self) -> None:
+        """2. 明細行の商品名称の描画幅(TBL_MAX_NAME)が元の値(267.0)に戻っている。"""
+        from app.voucher_templates import TBL_MAX_NAME
+        self.assertAlmostEqual(TBL_MAX_NAME, 267.0, places=2)
+
+    def test_qty_draw_width_restored(self) -> None:
+        """3. 数量描画幅(TBL_MAX_QTY)が元の値(88.0)に戻っている。"""
+        from app.voucher_templates import TBL_MAX_QTY
+        self.assertAlmostEqual(TBL_MAX_QTY, 88.0, places=2)
+
+    def test_alignment_x_restored(self) -> None:
+        """品名右寄せ基準(DET_NAME_RX)・数量右寄せ基準(DET_QTY_RX)が元の位置に戻る。"""
+        from app.voucher_templates import DET_NAME_RX, DET_QTY_RX, TBL_COLS, DATA_X_PAD
+        self.assertAlmostEqual(DET_NAME_RX, TBL_COLS[2] - DATA_X_PAD, places=2)
+        self.assertAlmostEqual(DET_NAME_RX, self.NAME_QTY_BORDER - DATA_X_PAD, places=2)
+        self.assertAlmostEqual(DET_QTY_RX, self.QTY_RIGHT_BORDER - DATA_X_PAD, places=2)
+
+    def test_name_left_draw_x_unchanged(self) -> None:
+        """品名1段目の左寄せ描画X(TBL_X_NAME)は変わらない（先頭スペース保持に影響しない）。"""
+        from app.voucher_templates import TBL_X_NAME, TBL_COLS, DATA_X_PAD
+        self.assertAlmostEqual(TBL_X_NAME, TBL_COLS[1] + DATA_X_PAD, places=2)
+        self.assertAlmostEqual(TBL_X_NAME, 50.0, places=2)
+
+    def test_fit_width_helper_retained(self) -> None:
+        """4/5. 列幅は戻すが draw_text_fit_width / 自動縮小処理は維持される。"""
+        from app import voucher_service as vs
+        self.assertTrue(callable(vs.draw_text_fit_width))
+        self.assertTrue(hasattr(vs, "DETAIL_NAME_MIN_FONT_SIZE"))
+
+    def test_all_vouchers_generate_pdf(self) -> None:
+        """6. 01〜08すべての伝票でPDF生成できる。"""
+        import io
+        import pypdf
+        from app.voucher_service import build_vouchers_pdf_bytes
+        ids = ["01", "02", "03", "04", "05", "06", "07", "08"]
+        result = build_vouchers_pdf_bytes(ids, base_dir=PROJECT_ROOT)
+        self.assertTrue(result.startswith(b"%PDF"))
+        reader = pypdf.PdfReader(io.BytesIO(result))
+        self.assertEqual(len(reader.pages), len(ids))
+
+
 class TestLauncherWindowStatic(unittest.TestCase):
     """LauncherWindow のソースコード静的テスト。"""
 
@@ -550,9 +650,9 @@ class TestVoucherWindowStatic(unittest.TestCase):
         self.assertIn("closeEvent", self._SOURCE)
         self.assertIn("back_requested.emit()", self._SOURCE)
 
-    def test_print_uses_print_pdf_with_dialog(self) -> None:
-        """印刷ボタンが print_pdf_with_dialog を呼ぶこと。"""
-        self.assertIn("print_pdf_with_dialog", self._SOURCE)
+    def test_print_uses_direct_print(self) -> None:
+        """印刷ボタンが保存済み設定で即時印刷すること。"""
+        self.assertIn("print_pdf_direct", self._SOURCE)
 
 
 class TestVoucherPrintServiceStatic(unittest.TestCase):
@@ -564,24 +664,24 @@ class TestVoucherPrintServiceStatic(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls._SOURCE = (PROJECT_ROOT / "app" / "voucher_print_service.py").read_text(encoding="utf-8")
 
-    def test_uses_qprint_dialog(self) -> None:
-        """QPrintDialog を使う構成になっていること。"""
-        self.assertIn("QPrintDialog", self._SOURCE)
+    def test_does_not_use_qprint_dialog(self) -> None:
+        """伝票印刷では QPrintDialog を表示しないこと。"""
+        self.assertNotIn("QPrintDialog(", self._SOURCE)
 
     def test_does_not_use_os_startfile_print(self) -> None:
         """os.startfile(path, \"print\") をコードとして呼ばないこと。"""
         self.assertNotIn('os.startfile(', self._SOURCE)
 
-    def test_print_pdf_with_dialog_exists(self) -> None:
-        """print_pdf_with_dialog 関数が存在すること。"""
-        self.assertIn("def print_pdf_with_dialog", self._SOURCE)
+    def test_print_pdf_direct_exists(self) -> None:
+        """print_pdf_direct 関数が存在すること。"""
+        self.assertIn("def print_pdf_direct", self._SOURCE)
 
-    def test_returns_bool_on_cancel(self) -> None:
-        """ユーザーキャンセル時に False を返す構成であること。"""
-        self.assertIn("return False", self._SOURCE)
+    def test_missing_printer_setting_is_guarded(self) -> None:
+        """プリンター未設定時は即時印刷せずエラーにすること。"""
+        self.assertIn("印刷設定が未設定です", self._SOURCE)
 
     def test_accepts_bytes_not_path(self) -> None:
-        """print_pdf_with_dialog が bytes を受け取る構成であること。"""
+        """即時印刷処理が bytes を受け取る構成であること。"""
         self.assertIn("pdf_bytes", self._SOURCE)
 
     def test_uses_temp_file_internally(self) -> None:
@@ -597,10 +697,12 @@ class TestVoucherPrintServiceStatic(unittest.TestCase):
         self.assertIn("path.stat().st_size", self._SOURCE)
         self.assertIn("_try_load_pdf_document(tmp_path)", self._SOURCE)
 
-    def test_temp_pdf_is_removed_after_print(self) -> None:
-        """印刷処理後に一時PDFを削除すること。"""
-        self.assertIn("doc.close()", self._SOURCE)
-        self.assertIn("tmp_path.unlink", self._SOURCE)
+    def test_acrobat_print_jobs_are_kept_and_cleaned_later(self) -> None:
+        """Acrobat経由印刷のPDFは即削除せず、print_jobsで一定期間後に削除すること。"""
+        self.assertIn("work\" / \"print_jobs", self._SOURCE)
+        self.assertIn("PRINT_JOB_RETENTION_DAYS = 7", self._SOURCE)
+        self.assertIn("def cleanup_old_print_jobs", self._SOURCE)
+        self.assertIn("voucher_print_*.pdf", self._SOURCE)
 
     def test_qpdf_failure_falls_back_to_pymupdf(self) -> None:
         """QPdfDocumentが使えない場合にPyMuPDFへフォールバックすること。"""
@@ -833,16 +935,14 @@ class TestVoucher01Regression3(unittest.TestCase):
         """note_rxが受注No/伝票No表示に使われること。"""
         self.assertIn("note_rx", self._SVC_SRC)
 
-    # ── 6. 加工名リストに名称12行＋空白1行が並ぶ ─────────────────────────────
-    def test_proc_labels_has_blank_rows(self) -> None:
+    # ── 6. 加工名リストに既存12加工＋名称なし13枠目が並ぶ ───────────────────
+    def test_proc_labels_has_blank_thirteenth_frame(self) -> None:
         from app.voucher_templates import PROC_LABELS
-        named = [lbl for lbl in PROC_LABELS if lbl]
-        blank = [lbl for lbl in PROC_LABELS if not lbl]
-        # フィルム貼・Rとり を追加して名称12・空白1（合計13は据え置き）。
-        self.assertEqual(len(named), 12)
-        self.assertEqual(len(blank), 1)
-        self.assertIn("フィルム貼", named)
-        self.assertIn("Rとり", named)
+        from app.voucher_window import PROCESS_NAMES
+        self.assertEqual(len(PROC_LABELS), 13)
+        # 加工チェック・OLAP由来の内部判定は従来12項目のまま。
+        self.assertEqual(PROC_LABELS[:12], PROCESS_NAMES)
+        self.assertEqual(PROC_LABELS[12], "")
 
     # ── 7. 担当者ラベルは廃止し、担当者データは維持する ───────────────────────
     def test_staff_labels_removed_but_values_remain(self) -> None:
@@ -1667,6 +1767,106 @@ class TestRowSettingsRendering(unittest.TestCase):
             m.assert_called()
 
 
+class TestDeliveryCourseStaffRendering(unittest.TestCase):
+    def _canvas(self):
+        import io
+        from reportlab.pdfgen import canvas as rl_canvas
+        from app import voucher_service
+
+        voucher_service._ensure_font()
+        return rl_canvas.Canvas(
+            io.BytesIO(), pagesize=(voucher_service.PAGE_W, voucher_service.PAGE_H)
+        )
+
+    def test_realistic_course_name_and_staff_are_drawn_as_one_string(self) -> None:
+        from app import voucher_service
+
+        canvas = self._canvas()
+        drawn: list[tuple[float, str]] = []
+        canvas.drawRightString = lambda x, y, text: drawn.append((x, text))  # type: ignore[assignment]
+        canvas.drawString = lambda x, y, text: drawn.append((x, text))  # type: ignore[assignment]
+        voucher_service._draw_staff_values(canvas, {
+            "order_no": "1405113", "voucher_no": "Z001",
+            "delivery_course_code": "01",
+            "delivery_course_name": "パレト", "sales_rep": "大上",
+        })
+        texts = [text for _, text in drawn]
+        self.assertIn("パレト 大上", texts)
+        self.assertNotIn("01 大上", texts)
+        self.assertNotIn("01", texts)
+
+    def test_blank_name_never_falls_back_to_code(self) -> None:
+        from app import voucher_service
+
+        canvas = self._canvas()
+        drawn: list[str] = []
+        canvas.drawRightString = lambda x, y, text: drawn.append(text)  # type: ignore[assignment]
+        canvas.drawString = lambda x, y, text: drawn.append(text)  # type: ignore[assignment]
+        voucher_service._draw_staff_values(canvas, {
+            "delivery_course_code": "01", "delivery_course_name": "",
+            "sales_rep": "大上",
+        })
+        self.assertIn("大上", drawn)
+        self.assertNotIn("01", drawn)
+
+    def test_combined_text_keeps_legacy_sales_right_edge(self) -> None:
+        from app import voucher_service
+
+        canvas = self._canvas()
+        right_draws: list[tuple[float, str]] = []
+        canvas.drawRightString = lambda x, y, text: right_draws.append((x, text))  # type: ignore[assignment]
+        voucher_service._draw_staff_values(canvas, {
+            "delivery_course_name": "パレト", "sales_rep": "大上",
+        })
+        expected_right = min(
+            voucher_service.STAFF_TEXT_RIGHT,
+            voucher_service.STAFF_TEXT_X + canvas.stringWidth(
+                "大上", voucher_service._FONT_NAME,
+                voucher_service.DETAIL_DATA_FONT_SIZE,
+            ),
+        )
+        combined = next(item for item in right_draws if item[1] == "パレト 大上")
+        self.assertAlmostEqual(combined[0], expected_right)
+
+    def test_long_combined_text_is_shrunk_without_line_break(self) -> None:
+        from app import voucher_service
+
+        canvas = self._canvas()
+        text = "非常に長い配送コース名称テスト 大上"
+        drawn: list[str] = []
+        canvas.drawRightString = lambda x, y, value: drawn.append(value)  # type: ignore[assignment]
+        used = voucher_service.draw_text_fit_width_right(
+            canvas, text, 400, 200, 70,
+            voucher_service.DATA_BOLD_FONT_NAME,
+            voucher_service.DETAIL_DATA_FONT_SIZE, 4.0,
+        )
+        self.assertLess(used, voucher_service.DETAIL_DATA_FONT_SIZE)
+        self.assertEqual(drawn, [text, text])  # 擬似太字の2回描画。改行・切捨てなし。
+
+    def test_pdf_contains_course_name_and_combined_staff_for_all_vouchers(self) -> None:
+        import io
+        import pypdf
+        from app.voucher_service import build_vouchers_pdf_bytes
+        from app.voucher_templates import DUMMY_DATA
+
+        page = {
+            **DUMMY_DATA,
+            "delivery_course_code": "01",
+            "delivery_course_name": "パレト",
+            "sales_rep": "大上",
+        }
+        pdf = build_vouchers_pdf_bytes(
+            ["01", "02", "03", "04", "05", "06", "07", "08"],
+            {"pages": [page]}, base_dir=PROJECT_ROOT,
+        )
+        reader = pypdf.PdfReader(io.BytesIO(pdf))
+        self.assertEqual(len(reader.pages), 8)
+        for pdf_page in reader.pages:
+            text = pdf_page.extract_text() or ""
+            self.assertIn("パレト", text)
+            self.assertIn("大上", text)
+
+
 class TestCustomerOrderNo(unittest.TestCase):
     """客先注文No_10桁（お客様注文No）表示の追加仕様テスト。"""
 
@@ -1851,6 +2051,293 @@ class TestCustomerOrderNo(unittest.TestCase):
                 if isinstance(c, dict)
             }
             self.assertIn("客先注文No_10桁", names, f"{rel} に項目が無い")
+
+
+class TestHeaderIGap(unittest.TestCase):
+    """コードNo/伝票No/受注No内の各Iの直後を広げる字間補正のテスト。"""
+
+    def _gap(self) -> float:
+        from app import voucher_service
+        return voucher_service.HEADER_I_CHAR_GAP_PT
+
+    def _canvas(self):
+        import io
+        from reportlab.pdfgen import canvas as rl_canvas
+        from app import voucher_service
+
+        voucher_service._ensure_font()
+        return rl_canvas.Canvas(
+            io.BytesIO(), pagesize=(voucher_service.PAGE_W, voucher_service.PAGE_H)
+        )
+
+    def _collect_emits(self, draw_fn_name: str, data: dict) -> list[tuple[str, float]]:
+        """実描画関数を実行し、_emit_text に渡った (text, x) を順に集める。
+
+        _emit_text を捕捉するため、太字の多重描画に依存せず、1描画=1エントリで
+        文字列と描画開始Xが取れる。stringWidth 計算のため実キャンバスを使う。
+        """
+        from app import voucher_service
+
+        emits: list[tuple[str, float]] = []
+
+        def fake_emit(c, method, x, y, text, bold):
+            emits.append((text, x))
+
+        c = self._canvas()
+        with patch.object(voucher_service, "_emit_text", side_effect=fake_emit):
+            getattr(voucher_service, draw_fn_name)(c, data)
+        return emits
+
+    def _find_x(self, emits: list[tuple[str, float]], text: str) -> float:
+        for t, x in emits:
+            if t == text:
+                return x
+        raise AssertionError(f"{text!r} が描画されていない: {emits}")
+
+    def _str_width(self, text: str, fs: float) -> float:
+        from app import voucher_service
+        c = self._canvas()
+        base = voucher_service._resolve_base_font(voucher_service.DATA_BOLD_FONT_NAME)
+        return c.stringWidth(text, base, fs)
+
+    # ── helper 単体（分割描画されるか）──────────────────────────────
+    def _helper_emits(self, value, fs: float = 10.0, x: float = 100.0):
+        from app import voucher_service
+        emits: list[tuple[str, float]] = []
+
+        def fake_emit(c, method, xx, y, text, bold):
+            emits.append((text, xx))
+
+        c = self._canvas()
+        with patch.object(voucher_service, "_emit_text", side_effect=fake_emit):
+            voucher_service._str_header_value(c, value, x, 200.0, fs)
+        return emits
+
+    def test_gap_value_is_4pt(self) -> None:
+        self.assertEqual(self._gap(), 4.0)
+
+    def test_i_value_has_gap_after_i(self) -> None:
+        emits = self._helper_emits("I40186", fs=10.0, x=100.0)
+        self.assertEqual([t for t, _ in emits], ["I", "40186"])
+        self.assertAlmostEqual(emits[0][1], 100.0)
+        self.assertAlmostEqual(
+            emits[1][1], 100.0 + self._str_width("I", 10.0) + self._gap())
+
+    def test_middle_i_has_gap_only_after_i(self) -> None:
+        emits = self._helper_emits("Y99I111", fs=10.0, x=100.0)
+        self.assertEqual([t for t, _ in emits], ["Y99I", "111"])
+        self.assertAlmostEqual(
+            emits[1][1], emits[0][1] + self._str_width("Y99I", 10.0) + self._gap())
+
+    def test_two_i_values_accumulate_two_gaps(self) -> None:
+        emits = self._helper_emits("II123", fs=10.0, x=100.0)
+        self.assertEqual([t for t, _ in emits], ["I", "I", "123"])
+        self.assertAlmostEqual(
+            emits[1][1], emits[0][1] + self._str_width("I", 10.0) + self._gap())
+        self.assertAlmostEqual(
+            emits[2][1], emits[1][1] + self._str_width("I", 10.0) + self._gap())
+
+    def test_abc_has_normal_spacing(self) -> None:
+        emits = self._helper_emits("ABC", fs=10.0, x=100.0)
+        self.assertEqual(emits, [("ABC", 100.0)])
+
+    def test_fullwidth_i_has_gap(self) -> None:
+        emits = self._helper_emits("Ｉ40186")
+        self.assertEqual([t for t, _ in emits], ["Ｉ", "40186"])
+        self.assertAlmostEqual(
+            emits[1][1], emits[0][1] + self._str_width("Ｉ", 10.0) + self._gap())
+
+    def test_lowercase_i_is_not_adjusted(self) -> None:
+        emits = self._helper_emits("i40186")
+        self.assertEqual([t for t, _ in emits], ["i40186"])
+
+    def test_none_and_empty_no_draw(self) -> None:
+        self.assertEqual(self._helper_emits(None), [])
+        self.assertEqual(self._helper_emits(""), [])
+
+    def test_single_char_i_single_draw(self) -> None:
+        # 1文字だけの "I" は分割しない（従来通り1回）。
+        emits = self._helper_emits("I", x=100.0)
+        self.assertEqual(len(emits), 1)
+        self.assertEqual(emits[0], ("I", 100.0))
+
+    def test_terminal_i_has_no_gap(self) -> None:
+        self.assertEqual(self._helper_emits("123I"), [("123I", 100.0)])
+
+    def test_requested_value_patterns(self) -> None:
+        adjusted = ("I123456", "AI12345", "12I3456", "II12345", "Ｉ123456")
+        for value in adjusted:
+            with self.subTest(value=value):
+                self.assertGreater(len(self._helper_emits(value)), 1)
+        for value in ("1234567", "I", "123I"):
+            with self.subTest(value=value):
+                self.assertEqual(len(self._helper_emits(value)), 1)
+
+    def test_width_includes_exact_gap_count(self) -> None:
+        from app import voucher_service
+
+        c = self._canvas()
+        font = voucher_service.DATA_BOLD_FONT_NAME
+        fs = 10.0
+        plain = c.stringWidth(
+            "II123", voucher_service._resolve_base_font(font), fs
+        )
+        measured = voucher_service.i_spaced_text_width(
+            c, "II123", font, fs
+        )
+        self.assertAlmostEqual(measured, plain + self._gap() * 2)
+
+    def test_right_and_center_alignment_use_adjusted_total_width(self) -> None:
+        from app import voucher_service
+
+        c = self._canvas()
+        font = voucher_service.DATA_BOLD_FONT_NAME
+        fs = 10.0
+        total = voucher_service.i_spaced_text_width(c, "AI12", font, fs)
+
+        def collect(align, anchor):
+            emits = []
+            with patch.object(
+                voucher_service, "_emit_text",
+                side_effect=lambda _c, _m, x, _y, text, _b:
+                emits.append((text, x)),
+            ):
+                voucher_service.draw_text_with_i_gap(
+                    c, "AI12", anchor, 100.0, fs,
+                    font_name=font, align=align,
+                )
+            return emits
+
+        right = collect("right", 300.0)
+        center = collect("center", 300.0)
+        self.assertAlmostEqual(right[0][1], 300.0 - total)
+        self.assertAlmostEqual(center[0][1], 300.0 - total / 2.0)
+
+    def test_no_i_right_alignment_keeps_legacy_anchor_and_size(self) -> None:
+        from app import voucher_service
+
+        c = self._canvas()
+        emits = []
+        with patch.object(
+            voucher_service, "_emit_text",
+            side_effect=lambda _c, method, x, _y, text, _bold:
+            emits.append((method, x, text)),
+        ):
+            used = voucher_service.draw_text_with_i_gap(
+                c, "1234567", 300.0, 100.0, 10.0,
+                max_width=100.0, min_font_size=5.0, align="right",
+            )
+        self.assertEqual(emits, [("drawRightString", 300.0, "1234567")])
+        self.assertEqual(used, 10.0)
+
+    def test_fit_width_uses_gap_in_font_reduction(self) -> None:
+        from app import voucher_service
+
+        c = self._canvas()
+        used = voucher_service.draw_text_with_i_gap(
+            c, "II123456789", 100.0, 100.0, 12.0,
+            max_width=40.0, min_font_size=5.0,
+            align="right",
+        )
+        self.assertLess(used, 12.0)
+        self.assertLessEqual(
+            voucher_service.i_spaced_text_width(
+                c, "II123456789",
+                voucher_service.DATA_BOLD_FONT_NAME, used,
+            ),
+            40.0 + 1e-6,
+        )
+
+    def test_central_right_order_and_voucher_numbers_use_common_drawer(self) -> None:
+        from app import voucher_service
+
+        c = self._canvas()
+        calls = []
+        with patch.object(
+            voucher_service, "draw_text_with_i_gap",
+            wraps=voucher_service.draw_text_with_i_gap,
+        ) as draw:
+            voucher_service._draw_form_data_01(
+                c, {"order_no": "I123456", "voucher_no": "AI12345"}
+            )
+            calls = [
+                call for call in draw.call_args_list
+                if call.kwargs.get("draw_path") == "_draw_form_data_01_central"
+            ]
+        self.assertEqual([call.kwargs["field"] for call in calls],
+                         ["order_no", "voucher_no"])
+        self.assertTrue(all(call.kwargs["align"] == "right" for call in calls))
+
+    # ── 実描画経路（指図書(1)=shizu / overlay など）───────────────
+    def _assert_first_i_unchanged_rest_shifted(self, draw_fn_name, field, i_value):
+        digit_value = i_value.replace("I", "1")  # 例: I40186 -> 140186
+        base_emits = self._collect_emits(draw_fn_name, {field: digit_value})
+        base_x = self._find_x(base_emits, digit_value)
+
+        i_emits = self._collect_emits(draw_fn_name, {field: i_value})
+        first_x = self._find_x(i_emits, "I")
+        rest_x = i_emits[i_emits.index(("I", first_x)) + 1][1]
+        # 先頭Iの開始位置は通常値の基準Xと同一（値全体は動かない）
+        self.assertAlmostEqual(first_x, base_x)
+        # 2文字目以降は I幅 + gap 分だけ右
+        self.assertGreater(rest_x, first_x)
+
+    def test_shizu_order_no_has_gap(self) -> None:
+        self._assert_first_i_unchanged_rest_shifted(
+            "_draw_form_data_shizu", "order_no", "I140999")
+
+    def test_shizu_voucher_no_has_gap(self) -> None:
+        self._assert_first_i_unchanged_rest_shifted(
+            "_draw_form_data_shizu", "voucher_no", "I640548")
+
+    def test_shizu_rest_x_equals_i_width_plus_gap(self) -> None:
+        # 指図書(1) の受注Noで、次文字X - IのX == stringWidth("I") + gap。
+        emits = self._collect_emits("_draw_form_data_shizu", {"order_no": "I140999"})
+        first_x = self._find_x(emits, "I")
+        rest_x = emits[emits.index(("I", first_x)) + 1][1]
+        fs = self._shizu_order_fs()
+        self.assertAlmostEqual(
+            rest_x - first_x, self._str_width("I", fs) + self._gap())
+
+    def _shizu_order_fs(self) -> float:
+        from app import voucher_service
+        return voucher_service.HEADER_MAIN_VALUE_FONT_SIZE
+
+    def test_shizu_code_no_middle_i_has_gap(self) -> None:
+        emits = self._collect_emits(
+            "_draw_form_data_shizu", {"code_no": "Y99I111"})
+        start = next(i for i in range(len(emits) - 1)
+                     if emits[i][0] == "Y99I" and emits[i + 1][0] == "111")
+        fs = self._shizu_order_fs()
+        self.assertAlmostEqual(
+            emits[start + 1][1] - emits[start][1],
+            self._str_width("Y99I", fs) + self._gap())
+
+    def test_overlay_order_no_has_gap(self) -> None:
+        self._assert_first_i_unchanged_rest_shifted(
+            "_draw_header_overlay", "order_no", "I140999")
+
+    def test_overlay_voucher_no_has_gap(self) -> None:
+        self._assert_first_i_unchanged_rest_shifted(
+            "_draw_header_overlay", "voucher_no", "I640548")
+
+    def test_form01_and_delivery_order_no_has_gap(self) -> None:
+        self._assert_first_i_unchanged_rest_shifted(
+            "_draw_form_data_01", "order_no", "I140999")
+        self._assert_first_i_unchanged_rest_shifted(
+            "_draw_delivery_data_common", "order_no", "I140999")
+
+    def test_all_forms_generate_successfully(self) -> None:
+        """01〜08のPDFが受注No「I」始まりでも生成できること。"""
+        import tempfile
+        from app.voucher_service import create_vouchers_pdf
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for vid in ("01", "02", "03", "04", "05", "06", "07", "08"):
+                out = create_vouchers_pdf(
+                    [vid], output_dir=Path(tmpdir), base_dir=PROJECT_ROOT)
+                self.assertTrue(out.exists(), f"{vid} が生成されない")
+                self.assertGreater(out.stat().st_size, 0)
 
 
 if __name__ == "__main__":

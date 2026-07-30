@@ -71,6 +71,22 @@ QPushButton[buttonRole]:disabled, QToolButton[buttonRole]:disabled {
   border-radius: 6px;
   font-weight: normal;
 }
+/* 押下アニメーション（用途別ボタン）: 押した瞬間だけ暗く沈める。
+   背景色のみ変更しレイアウトはズラさない。無効ボタンは押せないため適用されない。 */
+QPushButton[buttonRole="primary"]:pressed, QToolButton[buttonRole="primary"]:pressed,
+QPushButton[buttonRole="olapFetch"]:pressed, QToolButton[buttonRole="olapFetch"]:pressed {
+  background-color: #0d47a1;
+}
+QPushButton[buttonRole="success"]:pressed, QToolButton[buttonRole="success"]:pressed,
+QPushButton[buttonRole="olapUpdate"]:pressed, QToolButton[buttonRole="olapUpdate"]:pressed {
+  background-color: #1b5e20;
+}
+QPushButton[buttonRole="secondary"]:pressed, QToolButton[buttonRole="secondary"]:pressed {
+  background-color: #37474f;
+}
+QPushButton[buttonRole="danger"]:pressed, QToolButton[buttonRole="danger"]:pressed {
+  background-color: #8e0000;
+}
 """
 
 _DANGER_BUTTON_WORDS = ("削除", "初期値に戻す", "登録キャンセル")

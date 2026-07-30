@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tks-to-kintone"
-version = "1.4.16"
+version = "1.6.0"
 description = "TKS OLAP CSV extraction and kintone import CSV generation"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,10 +14,8 @@ dependencies = [
     "qrcode[pil]>=7.4",
     "requests>=2.31",
     "python-dotenv>=1.0",
-    "rembg[cpu]>=2.0",
-    "onnxruntime>=1.16",
     "Pillow>=10.0",
-    "pymatting>=1.1",
+    "comtypes>=1.2 ; platform_system == \"Windows\"",
 ]
 
 [project.scripts]

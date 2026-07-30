@@ -1,0 +1,21 @@
+SumatraPDF ソースコード入手先
+=============================
+
+本アプリ（TksToKintone）は PDF 印刷のため SumatraPDF（ポータブル版）を同梱しています。
+SumatraPDF はオープンソースソフトウェアであり、そのソースコードは以下から入手できます。
+
+公式サイト:   https://www.sumatrapdfreader.org/
+ダウンロード: https://www.sumatrapdfreader.org/download-free-pdf-viewer
+GitHub:       https://github.com/sumatrapdfreader/sumatrapdf
+ソース(zip):  https://github.com/sumatrapdfreader/sumatrapdf/releases
+ライセンス:   https://github.com/sumatrapdfreader/sumatrapdf/blob/master/COPYING
+
+同梱バージョン
+--------------
+Version: 3.5.2 (portable, 64-bit)
+
+注意
+----
+- ここに記載したバージョンは、同梱する SumatraPDF.exe に合わせて更新してください。
+- SumatraPDF.exe は改変せずに同梱し、外部プロセスとして呼び出します。
+- 詳細なライセンス条文は LICENSE-SumatraPDF.txt を参照してください。

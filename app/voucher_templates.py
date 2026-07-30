@@ -75,8 +75,16 @@ HDR_SHIPPING_SHIFT: float = 14.0
 # 取引区分/出荷区分 境界(HDR_TRADE_RIGHT)から右側を更に同量右へずらして取引区分セルを
 # 広げる。出荷区分セル幅は HDR_OPERATOR_X も同量右へずらすことで維持する。
 HDR_TRADE_SHIFT: float = 8.0
-# 入力者名境界(HDR_OPERATOR_X)より右側に掛かる総右移動量（出荷区分拡張＋取引区分拡張）。
-HDR_RIGHT_SHIFT: float = HDR_SHIPPING_SHIFT + HDR_TRADE_SHIFT
+
+# ─── 得意先名・伝票Noセル拡張のための右シフト量 ─────────────────────────────
+# 伝票No / 取引区分境界から右側をまとめて移動する。これにより下段の伝票Noセルと、
+# 入力者名境界に揃う上段の得意先名セルを同じ量だけ広げる。右側の取引区分・出荷区分・
+# 入力者名・受注No・仕上日セルは境界ごと平行移動するため、従来のセル幅を維持する。
+HDR_CUSTOMER_VOUCHER_WIDEN: float = 10.0
+# 入力者名境界(HDR_OPERATOR_X)より右側に掛かる総右移動量。
+HDR_RIGHT_SHIFT: float = (
+    HDR_SHIPPING_SHIFT + HDR_TRADE_SHIFT + HDR_CUSTOMER_VOUCHER_WIDEN
+)
 
 # 会社情報ブロック: 表の黒ヘッダー行のすぐ上・ヘッダー枠右側に配置
 COMPANY_NAME_Y: float  = 453.0   # 会社名ベースライン（フォーム本体9pt下移動済み）
@@ -105,10 +113,13 @@ HDR_DELIVERY_X: float = 108.0
 # 後続の境界（伝票No以降）も右へずらし、各データ1.3倍が枠内に収まる幅を確保する。
 # 入力者名セルは余裕があるため、その幅から後続セルの拡張分を吸収する。
 HDR_DELIVERY_RIGHT: float = 171.0   # 納品日 / 伝票No 境界（発行日と同幅63pt）
-HDR_VOUCHER_RIGHT:  float = 231.0   # 伝票No / 取引区分 境界（伝票No幅60pt）
+HDR_VOUCHER_RIGHT:  float = 231.0 + HDR_CUSTOMER_VOUCHER_WIDEN
+# 伝票No / 取引区分 境界（伝票No幅60pt + 10pt）
 # 取引区分 / 出荷区分 境界。取引区分データを1.3倍化したため HDR_TRADE_SHIFT 分右へずらし、
 # 取引区分セル幅 = 28 + HDR_TRADE_SHIFT pt に拡張する（売上/加工/現金 等が収まる）。
-HDR_TRADE_RIGHT:    float = 259.0 + HDR_TRADE_SHIFT   # 取引区分 / 出荷区分 境界（右シフト）
+HDR_TRADE_RIGHT:    float = (
+    259.0 + HDR_TRADE_SHIFT + HDR_CUSTOMER_VOUCHER_WIDEN
+)  # 取引区分 / 出荷区分 境界（右シフト）
 # 出荷区分 / 入力者名 境界＝入力者名セル左端。HDR_RIGHT_SHIFT 分右へずらすことで
 # 出荷区分セル幅 = 34 + HDR_SHIPPING_SHIFT pt を維持（取引区分拡張分は HDR_TRADE_RIGHT と
 # 一緒に右へ平行移動する）。1.3倍の出荷区分データ（店PM/販PM/直PM/倉PM、全角ＰＭ含む）が
@@ -158,6 +169,8 @@ FORM_TOTAL_ROW_H: float  = 26.0   # 合計行高さ = 通常行と同じ
 FORM_TOTAL_BOT: float    = FORM_DETAIL_BOT - FORM_TOTAL_ROW_H                        # 242
 
 # テーブル列境界 [左端, No/品名, 品名/数量, 数量/単価, 単価/金額, 金額/摘要, 右端]
+# 品名列が長い商品名称で見切れる問題は列幅を広げず、_str_name の自動フォント縮小
+# （draw_text_fit_width）で全文字表示して対応する。列幅は従来どおり。
 TBL_COLS: list[float] = [34.0, FORM_HDR_LEFT, 336.0, 434.0, 502.0, 568.0, 695.0]
 TBL_COL_LABELS: list[str] = ["No", "品　名", "数　量", "単　価", "金　額", ""]  # 摘要列は「摘」「要」に分割して描画
 

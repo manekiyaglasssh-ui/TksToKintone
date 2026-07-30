@@ -1,0 +1,30 @@
+SumatraPDF ライセンス表記
+=========================
+
+本アプリ（TksToKintone）は、PDF の印刷に SumatraPDF（ポータブル版 SumatraPDF.exe）
+を同梱し、外部プロセスとして呼び出しています。SumatraPDF は SumatraPDF プロジェクトに
+より提供されるオープンソースソフトウェアです。
+
+ライセンス
+----------
+SumatraPDF 本体は GPLv3 系（GNU General Public License, version 3）で配布されています。
+SumatraPDF は内部で MuPDF などのコンポーネントを利用しており、それらは AGPLv3 を含む
+各種オープンソースライセンスの下で提供されています。正確かつ最新のライセンス条文は、
+下記の公式サイトおよび GitHub リポジトリを参照してください。
+
+著作権表示
+----------
+Copyright (C) Krzysztof Kowalczyk and the SumatraPDF contributors.
+SumatraPDF is licensed under GPLv3.
+
+改変について
+------------
+本アプリは SumatraPDF.exe を改変せず、そのまま同梱し、外部プロセスとして起動しています。
+SumatraPDF を TksToKintone の一部として組み込み・改変することはしていません。
+
+入手先・ソースコード
+--------------------
+公式サイト:   https://www.sumatrapdfreader.org/
+GitHub:       https://github.com/sumatrapdfreader/sumatrapdf
+ライセンス:   https://github.com/sumatrapdfreader/sumatrapdf/blob/master/COPYING
+同梱バージョンおよびソースコードの入手先は SOURCE-SumatraPDF.txt を参照してください。

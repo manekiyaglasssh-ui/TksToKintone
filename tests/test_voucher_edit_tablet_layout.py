@@ -73,7 +73,7 @@ class TestVoucherEditTabletLayout(unittest.TestCase):
         # 主要15ボタンがすべて同じ1段（1本のツールバー）に並ぶ。
         labels = self._all_toolbar_labels(win)
         for expected in ("手書き", "掴む", "消しゴム", "選択", "太さ:中", "色:黒",
-                         "戻す", "やり直し", "削除", "全消去", "拡大", "縮小",
+                         "元に戻す", "やり直す", "削除", "全消去", "拡大", "縮小",
                          "全体表示", "保存", "タブレット終了"):
             self.assertIn(expected, labels)
 

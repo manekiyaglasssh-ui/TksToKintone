@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +30,12 @@ def is_locked_template(name: str) -> bool:
 
 # 組み込みテンプレート（要件4）。name をキーに扱う。
 BUILTIN_TEMPLATES: list[dict[str, Any]] = [
-    {"name": "標準", "target_vouchers": ["03", "04", "05"], "color": "#1976d2", "badge": "標"},
-    {"name": "全伝票",
+    {"key": "standard", "name": "標準", "target_vouchers": ["03", "04", "05"], "color": "#1976d2", "badge": "標"},
+    {"key": "all_vouchers", "name": "全伝票",
      "target_vouchers": ["01", "02", "03", "04", "05", "06", "07", "08"],
      "color": "#7b1fa2", "badge": "全"},
-    {"name": "指図書のみ", "target_vouchers": ["03", "04"], "color": "#00897b", "badge": "図"},
-    {"name": "梱包のみ", "target_vouchers": ["05"], "color": "#2e7d32", "badge": "梱"},
+    {"key": "instruction_only", "name": "指図書のみ", "target_vouchers": ["03", "04"], "color": "#00897b", "badge": "図"},
+    {"key": "packing_only", "name": "梱包のみ", "target_vouchers": ["05"], "color": "#2e7d32", "badge": "梱"},
 ]
 
 _FILENAME = "voucher_edit_templates.json"
@@ -57,7 +58,14 @@ def _normalize_template(raw: dict[str, Any]) -> dict[str, Any] | None:
         return None
     color = str(raw.get("color") or "#607d8b").strip() or "#607d8b"
     badge = str(raw.get("badge") or name[:1]).strip() or name[:1]
-    return {"name": name, "target_vouchers": targets, "color": color, "badge": badge}
+    key = str(raw.get("key") or "").strip()
+    return {
+        "key": key,
+        "name": name,
+        "target_vouchers": targets,
+        "color": color,
+        "badge": badge,
+    }
 
 
 def load_user_templates(base_dir: Path | None = None) -> list[dict[str, Any]]:
@@ -73,10 +81,22 @@ def load_user_templates(base_dir: Path | None = None) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
     result: list[dict[str, Any]] = []
+    migrated = False
+    seen_keys: set[str] = set()
     for raw in items:
         normalized = _normalize_template(raw)
         if normalized is not None:
+            if not normalized["key"] or normalized["key"] in seen_keys:
+                normalized["key"] = f"user-{uuid.uuid4()}"
+                migrated = True
+            seen_keys.add(normalized["key"])
             result.append(normalized)
+    if migrated:
+        save_user_templates(
+            result,
+            base_dir,
+            deleted_builtins=load_deleted_builtin_names(base_dir),
+        )
     return result
 
 
@@ -115,6 +135,11 @@ def save_user_templates(
     固定テンプレート（LOCKED_REFLECT_TARGETS）は削除対象に含めない（要件7）。
     """
     normalized = [t for t in (_normalize_template(t) for t in templates) if t is not None]
+    seen_keys: set[str] = set()
+    for template in normalized:
+        if not template["key"] or template["key"] in seen_keys:
+            template["key"] = f"user-{uuid.uuid4()}"
+        seen_keys.add(template["key"])
     if deleted_builtins is None:
         deleted_builtins = load_deleted_builtin_names(base_dir)
     builtin_names = {t["name"] for t in BUILTIN_TEMPLATES}
@@ -172,6 +197,8 @@ def load_templates(base_dir: Path | None = None) -> list[dict[str, Any]]:
         if t["name"] in by_name:
             # 同名はユーザー定義で上書きする（並び順は組み込み位置を維持）。
             idx = next(i for i, x in enumerate(ordered) if x["name"] == t["name"])
+            # 組み込み名を上書きしても、反映処理と順序保存に使う正式 key は維持する。
+            t = {**t, "key": ordered[idx]["key"]}
             ordered[idx] = t
         else:
             ordered.append(t)

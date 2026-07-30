@@ -7,7 +7,5 @@ reportlab>=4.0
 pypdf>=4.0
 PyMuPDF>=1.24
 keyring>=24.0
-rembg[cpu]>=2.0
-onnxruntime>=1.16
 Pillow>=10.0
-pymatting>=1.1
+comtypes>=1.2 ; platform_system == "Windows"

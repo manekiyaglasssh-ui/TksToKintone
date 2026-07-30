@@ -1,8 +1,15 @@
 # TksToKintone
 
-TKS OLAPから加工CSV・素板CSVを取得し、既存Excel VBA相当の加工を行って `outputTksToKintone.csv` を作成し、必要に応じてkintoneへ登録するWindows向けGUIアプリです。現在のバージョンネームは `1.4.13`、バージョンコードは `23` です。
+TKS OLAPから加工CSV・素板CSVを取得し、既存Excel VBA相当の加工を行って `outputTksToKintone.csv` を作成し、必要に応じてkintoneへ登録するWindows向けGUIアプリです。現在のバージョンネームは `1.6.0`、バージョンコードは `44` です。
 
 ユーザー向けの操作手順は [docs/ユーザー向け簡易マニュアル.md](docs/ユーザー向け簡易マニュアル.md) を参照してください。
+
+## バージョン 1.6.0 の変更点
+
+- SumatraPDFをアプリへ同梱する方式から、Windowsへ独立インストールする方式へ変更しました。
+- SumatraPDFが未導入の場合、新規インストール時と更新時のセットアップで自動導入します。
+- 更新後にSumatraPDFが見つからず印刷できない問題を修正しました。
+- インストール済みSumatraPDFを印刷時に自動検出します。
 
 ## インストール
 
@@ -67,7 +74,7 @@ TKS_SOBA_REQUEST_TEMPLATE=docs/olap/soba_request_template.json
 
 DRY_RUNがONの場合、TKS取得とCSV作成後に登録前確認画面を表示します。確認画面では伝票番号ごとに重複を除いた `受注No`、`仕上日`、`出荷区分` を確認し、仕上日と出荷区分を変更できます。変更した値は同じ受注Noの全レコードへ反映します。確認画面で `登録` を押した場合だけkintoneへ送信し、`登録キャンセル` を押した場合は送信しません。OFFの場合は確認画面を出さずにkintone REST API `PUT /k/v1/records.json` に `upsert=true` で100件単位登録します。`検索キー` が既存レコードにあれば更新し、なければ追加します。APIトークンには対象アプリのレコード追加・編集権限が必要です。
 
-画面の `設定` からテーマカラー、Kintone接続先、デバッグ項目の表示/非表示、高度な設定、バージョン情報の確認ができます。テーマカラーは `システム`、`ライト`、`ダーク` から選択できます。Kintone接続先は `本番`、`テスト` から選択でき、初期値は `本番` です。`テスト` は `config.env` の現在の接続先、`本番` は本番用URL/アプリID/APIトークンを使用します。デバッグ表示の初期値はOFFです。デバッグ表示をOFFにすると `TKS_CLIENT_MODE`、Kintone接続先、ProgramDataフォルダ、各フォルダを開くボタン、TKS接続テスト、OLAP取得テスト、ログ表示を非表示にします。
+画面の `設定` からテーマカラー、Kintone接続先、デバッグ項目の表示/非表示、高度な設定、バージョン情報の確認ができます。テーマカラーは `システム`、`ライト`、`ダーク` から選択できます。Kintone接続先は `本番`、`テスト` から選択でき、初期値は `本番` です。`テスト` は `config.env` の現在の接続先、`本番` は本番用URL/アプリID/APIトークンを使用します。デバッグ表示の初期値はOFFです。機能選択画面の設定でデバッグ表示をONにすると、更新確認用KintoneのアプリIDとAPIトークンを代替接続先として設定できます。両方が空欄の場合は本番設定、両方が有効な場合だけデバッグ設定を更新確認とインストーラ取得に使用します。片方だけ、または不正値は保存エラーになり、有効なデバッグ接続先で通信に失敗しても本番へ自動切替しません。APIトークンは資格情報ストアへ保存し、ログには出力しません。デバッグ表示をOFFにすると保存値を残したまま本番設定を使用し、`TKS_CLIENT_MODE`、Kintone接続先、ProgramDataフォルダ、各フォルダを開くボタン、TKS接続テスト、OLAP取得テスト、ログ表示を非表示にします。
 
 設定画面の `高度な設定を開く` から、ログ保存日数、加工抽出ロジックと素板抽出ロジックの `R2List` 抽出条件を確認・変更できます。ログ保存日数は既定で30日です。アプリ起動時に `logs` 配下の `tks_to_kintone_*.log` から、設定日数より古いログを自動削除します。抽出条件の初期値は `config.env` で指定したOLAPリクエストテンプレートの現在値です。変更できるのは抽出条件の値で、`受注No` 条件は実行時に画面入力された伝票番号へ差し替えるため編集不可です。`初期値に戻す` を押すと保存済みの変更を破棄し、テンプレートの値に戻します。
 
@@ -77,18 +84,31 @@ DRY_RUNがONの場合、TKS取得とCSV作成後に登録前確認画面を表�
 
 以前は更新時に `run_update.ps1` を生成し PowerShell（`ExecutionPolicy Bypass`）で実行していましたが、DeepInstinct に PowerShell 実行がブロックされるため廃止しました。現在は PowerShell・一時スクリプト・`ExecutionPolicy Bypass` を一切使わず、通常のファイル操作とプロセス起動だけで更新します。
 
-1. アプリ本体（Python/EXE）が、署名済みインストーラ `tks-to-kintone-setup.exe` を `updates` フォルダへダウンロードします（認証トークンは本体側だけで使用し、コマンドラインには渡しません）。
-2. アプリ本体からインストーラを `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-` と `/LOG=...\update_installer.log` 付きで直接起動します。
-3. インストーラ起動に成功したら、アプリ本体を速やかに終了します。
-4. Inno Setup の Restart Manager / CloseApplications により既存プロセスの終了を待ち、既存インストール先へ上書き更新します。管理者権限が必要な場合の昇格はインストーラ側が行います。
+1. アプリモーダルの進捗画面を表示し、workerスレッドがインストーラを `.part` へダウンロードします。実受信バイト数、Content-Length、配布レコードのファイルサイズを照合します。
+2. 配布レコードの `SHA-256` とPE形式を検証し、成功後だけ正式なEXE名へ置換します。Authenticode署名の有無は更新可否に影響しません。認証トークン、HTTPヘッダー、完全なダウンロードURLはログやコマンドラインへ出しません。
+3. 検証workerの完了後、未保存編集の確認と実行中workerの有無を確認します。終了をキャンセルした場合はインストーラを削除し、UACを表示せず通常操作へ戻ります。
+4. 終了可能と確定した後だけ、別workerがWindowsの管理者確認を表示し、インストーラを `/SILENT /SUPPRESSMSGBOXES /NORESTART /SP- /RELAUNCHAPP=1` と試行ごとに一意な `/LOG=...\update_installer_<日時>_<PID>_<識別子>.log` 付きで起動します。
+5. `ShellExecuteExW` の成功、`hInstApp > 32`、プロセスハンドル取得、プロセス生存、一意なSetupログの生成（非空）を確認してから旧アプリを終了します。UAC拒否や15秒以内にログを確認できない場合はアプリを終了しません。
+6. インストーラ起動成功後は終了をコミットし、再確認なしで設定保存・worker整理・単一起動ロック解放・ログflushを行います。UAC拒否や起動失敗時は終了しません。
+7. セットアップとSumatraPDF依存処理が正常終了した場合だけ、Inno Setupの `runasoriginaluser` で `TksToKintone.exe --post-update` を通常ユーザー権限で起動します。通常の手動インストールでは自動起動しません。
 
-配布管理に登録する更新ファイルは、署名済みのインストーラ `tks-to-kintone-setup.exe` とします。`tks_update_helper.exe` は廃止済みで、通常ビルドではビルド・同梱しません。
+配布管理には、`tks-to-kintone-setup.exe` とその64桁SHA-256を `SHA-256` フィールドへ登録します。コード署名は任意です。
 
 ## 出力とログ
 
 作業ファイルは `work`、ログは `logs`、登録失敗CSVは `error` に保存します。既存の `outputTksToKintone.csv` は上書き前に日時付きで退避します。実行履歴として `work\input_yyyyMMdd_HHmmss.csv` も保存します。
 
 登録失敗時は `error\failed_yyyyMMdd_HHmmss.csv` に失敗レコードを出力します。再実行時は `検索キー` を使って既存レコードを更新します。
+
+## 印刷（SumatraPDFについて）
+
+PDF印刷には、TksToKintoneとは別のWindowsアプリであるSumatraPDFを使用します。セットアップは固定版の公式64bit installerを内部に収録しているため、インストール中のインターネット接続は不要です。
+
+- 新規インストール・更新のどちらでもSumatraPDF.exeの実在を確認し、未導入または登録が壊れている場合だけ自動導入します。既存の有効なSumatraPDFは更新・再設定しません。
+- 印刷時は明示設定、HKCU、HKLM、`LOCALAPPDATA`、`Program Files`の順でSumatraPDF.exeを検出します。見つからない場合は印刷を失敗として確定し、セットアップの再実行を案内します。
+- TksToKintoneをアンインストールしてもSumatraPDFは残ります。
+- 第三者ソフトウェア通知・入手先は `third_party_licenses/SumatraPDF.txt` を参照してください。
+- ビルド時は `scripts/sumatra_config.py` の固定URL・SHA-256を使って公式installerを検証し、`build/vendor/sumatra/`へ配置します。検証失敗時はセットアップを生成しません。
 
 ## 開発実行
 
@@ -115,9 +135,17 @@ DeepInstinctなどのEDR/AVでブロックされる場合は、未署名のPyIns
 4. 検知名、ブロックログ、署名済みファイルをDeepInstinctへ誤検知として提出します。
 5. 利用者への配布は、DeepInstinctで許可済みの社内配布経路から行います。
 
-`build_exe.bat` は、以下の環境変数がある場合に `dist\TksToKintone\TksToKintone.exe` を署名します。
+`build_exe.bat` のコード署名は任意です。署名設定がなければ、signtoolや証明書がない環境でも未署名セットアップを正常に生成します。署名する場合だけ証明書ストアのSubject／拇印またはPFXを指定できます。
 
 ```bat
+rem 既定: 未署名でビルド
+build_exe.bat
+
+rem 任意: 証明書ストアの拇印を優先指定
+set SIGN_CERT_THUMBPRINT=証明書のSHA-1拇印
+build_exe.bat
+
+rem 任意: PFXを明示指定
 set SIGN_CERT_PATH=C:\path\to\code-signing-cert.pfx
 set SIGN_CERT_PASSWORD=証明書パスワード
 set SIGNTOOL_PATH=C:\Program Files (x86)\Windows Kits\10\bin\x64\signtool.exe

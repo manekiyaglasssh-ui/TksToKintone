@@ -1,6 +1,8 @@
 """指図書編集オブジェクトの保存/再読み込み・PDF反映のテスト。"""
 from __future__ import annotations
 
+import hashlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +34,214 @@ class TestVoucherEditObjects(unittest.TestCase):
             self.assertEqual(text_obj["text"], "メモ")
             self.assertIn("created_at", text_obj)
             self.assertIn("updated_at", text_obj)
+
+    def test_style_change_updates_canonical_hash_and_revision(self) -> None:
+        from app import voucher_edit_objects
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            regular = [{
+                "id": "trace-text", "type": "text", "text": "テキスト",
+                "font_family": "Yu Gothic UI", "font_size": 18,
+                "font_bold": True, "font_italic": False,
+                "font_underline": True, "x": 10, "y": 20,
+            }]
+            path = voucher_edit_objects.save_edit_objects(
+                "TRACE", regular, base, voucher_no="V1")
+            first = voucher_edit_objects.load_edit_document_metadata("TRACE", base)
+            italic = [dict(regular[0], font_italic=True)]
+            voucher_edit_objects.save_edit_objects(
+                "TRACE", italic, base, voucher_no="V1")
+            second = voucher_edit_objects.load_edit_document_metadata("TRACE", base)
+            self.assertNotEqual(
+                voucher_edit_objects.edit_objects_sha256(regular),
+                voucher_edit_objects.edit_objects_sha256(italic))
+            self.assertNotEqual(
+                first["edit_objects_sha256"], second["edit_objects_sha256"])
+            self.assertEqual(second["edit_revision"], first["edit_revision"] + 1)
+            self.assertIn(
+                '"edit_revision": 2', path.read_text(encoding="utf-8"))
+
+    def test_save_worker_pdf_trace_reloads_latest_deep_copy(self) -> None:
+        import pypdf
+        from app import voucher_service
+
+        trace_id = "trace-save-worker-pdf-preview"
+        object_id = "same-object-id"
+        stale = {
+            "id": object_id, "type": "text", "text": "TEST",
+            "font_family": "Helvetica", "font_size": 24,
+            "font_bold": True, "font_italic": False,
+            "font_underline": True, "x": 80, "y": 80,
+            "width": 180, "height": 40, "target_vouchers": ["03"],
+        }
+        latest = dict(stale, font_italic=True)
+        latest_hash = "a" * 64
+        data = {"pages": [{
+            "order_no": "TRACE-E2E", "voucher_no": "V1",
+            "customer_name": "顧客", "details": [],
+            "edit_objects": [stale],
+        }]}
+        with mock.patch(
+            "app.voucher_edit_objects.load_edit_objects",
+            return_value=[latest],
+        ), mock.patch(
+            "app.voucher_edit_objects.load_edit_document_metadata",
+            return_value={
+                "edit_revision": 7,
+                "edit_objects_sha256": latest_hash,
+            },
+        ), self.assertLogs("tks_to_kintone_app", level="INFO") as captured:
+            pdf = voucher_service.build_vouchers_pdf_bytes(
+                ["03"], data, edit_render_trace_id=trace_id,
+                reload_edit_objects=True, bypass_preview_cache=True)
+        logs = "\n".join(captured.output)
+        self.assertIn(
+            f"event=voucher_pdf_worker_input trace_id={trace_id} "
+            f"object_id={object_id}", logs)
+        self.assertIn("italic=True", logs)
+        self.assertIn(
+            f"event=voucher_edit_pdf_text_draw trace_id={trace_id} "
+            f"object_id={object_id}", logs)
+        self.assertIn(
+            f"event=draw_styled_pdf_text trace_id={trace_id} "
+            f"object_id={object_id}", logs)
+        self.assertIn("font_italic=True", logs)
+        self.assertIn(f"edit_objects_sha256={latest_hash}", logs)
+        pdf_hash = hashlib.sha256(pdf).hexdigest()
+        self.assertIn(
+            f"event=voucher_pdf_bytes_ready trace_id={trace_id} "
+            f"pdf_sha256={pdf_hash}", logs)
+        stream = pypdf.PdfReader(
+            io.BytesIO(pdf)).pages[0].get_contents().get_data()
+        self.assertIn(b"1 0 .2 1", stream)
+        # 呼出し元の古いsnapshotはdeep copy境界の外なので変更しない。
+        self.assertFalse(data["pages"][0]["edit_objects"][0]["font_italic"])
+
+    def test_voucher_no_state_is_independent_and_preserves_leading_zero(self) -> None:
+        from app import voucher_edit_objects
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            state = {
+                voucher_edit_objects.voucher_key_for("0012"): [
+                    {"id": "a", "type": "text", "text": "A", "x": 1, "y": 2}],
+                voucher_edit_objects.voucher_key_for("A002"): [
+                    {"id": "b", "type": "text", "text": "B", "x": 3, "y": 4}],
+            }
+            voucher_edit_objects.save_voucher_edit_state(
+                "ORDER", state, [" 0012 ", "A002"], base)
+            loaded = voucher_edit_objects.load_voucher_edit_state(
+                "ORDER", ["0012", "A002"], base)
+            self.assertEqual(loaded["0012"][0]["text"], "A")
+            self.assertEqual(loaded["A002"][0]["text"], "B")
+            loaded["0012"][0]["text"] = "changed"
+            self.assertEqual(loaded["A002"][0]["text"], "B")
+
+    def test_partial_voucher_save_keeps_other_vouchers(self) -> None:
+        from app import voucher_edit_objects
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            voucher_edit_objects.save_edit_objects(
+                "ORDER", [{"id": "a", "type": "text", "text": "A"}],
+                base, voucher_no="A001")
+            voucher_edit_objects.save_edit_objects(
+                "ORDER", [{"id": "b", "type": "text", "text": "B"}],
+                base, voucher_no="A002")
+            self.assertEqual(
+                voucher_edit_objects.load_edit_objects(
+                    "ORDER", base, voucher_no="A001")[0]["text"], "A")
+            self.assertEqual(
+                voucher_edit_objects.load_edit_objects(
+                    "ORDER", base, voucher_no="A002")[0]["text"], "B")
+
+    def test_legacy_objects_migrate_only_to_first_voucher(self) -> None:
+        import json
+        from app import voucher_edit_objects
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = voucher_edit_objects.edit_objects_path_for("ORDER", base)
+            path.write_text(json.dumps({"order_no": "ORDER", "objects": [
+                {"id": "legacy", "type": "text", "text": "旧データ"}
+            ]}), encoding="utf-8")
+            loaded = voucher_edit_objects.load_voucher_edit_state(
+                "ORDER", ["A001", "A002"], base)
+            self.assertEqual(len(loaded["A001"]), 1)
+            self.assertEqual(loaded["A002"], [])
+            voucher_edit_objects.save_voucher_edit_state(
+                "ORDER", loaded, ["A001", "A002"], base)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["schema_version"], 3)
+            self.assertEqual(saved["common_edit"]["objects"], [])
+            self.assertIn("voucher_edits", saved)
+
+    def test_clone_reissues_ids_and_deep_copies(self) -> None:
+        from app import voucher_edit_objects
+
+        source = [{"id": "same", "type": "image", "image_data": "abc",
+                   "meta": {"nested": [1]}}]
+        cloned = voucher_edit_objects.clone_edit_objects(source)
+        self.assertNotEqual(cloned[0]["id"], source[0]["id"])
+        cloned[0]["meta"]["nested"].append(2)
+        self.assertEqual(source[0]["meta"]["nested"], [1])
+
+    def test_schema_v3_roundtrip_keeps_common_and_individual_separate(self) -> None:
+        import json
+        from app import voucher_edit_objects
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            common = [{"id": "common", "type": "text", "text": "共通"}]
+            edits = {
+                "Z001": [{"id": "one", "type": "text", "text": "個別1"}],
+                "Z002": [{"id": "two", "type": "text", "text": "個別2"}],
+            }
+            path = voucher_edit_objects.save_voucher_edit_document(
+                "ORDER", common, edits, ["Z001", "Z002"], base)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["schema_version"], 3)
+            self.assertEqual(saved["common_edit"]["objects"][0]["text"], "共通")
+            loaded = voucher_edit_objects.load_voucher_edit_document(
+                "ORDER", ["Z001", "Z002"], base)
+            self.assertEqual(loaded["common_edit"][0]["text"], "共通")
+            self.assertEqual(loaded["voucher_edits"]["Z001"][0]["text"], "個別1")
+            self.assertEqual(
+                [o["text"] for o in voucher_edit_objects.load_edit_objects(
+                    "ORDER", base, voucher_no="Z002")], ["共通", "個別2"])
+
+    def test_schema_v2_load_adds_empty_common_without_losing_individual(self) -> None:
+        import json
+        from app import voucher_edit_objects
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = voucher_edit_objects.edit_objects_path_for("ORDER", base)
+            path.write_text(json.dumps({
+                "schema_version": 2,
+                "voucher_order": ["Z001"],
+                "voucher_edits": {"Z001": {"voucher_no": "Z001", "objects": [
+                    {"id": "old", "type": "text", "text": "旧個別"}
+                ]}},
+            }), encoding="utf-8")
+            loaded = voucher_edit_objects.load_voucher_edit_document(
+                "ORDER", ["Z001"], base)
+            self.assertEqual(loaded["common_edit"], [])
+            self.assertEqual(loaded["voucher_edits"]["Z001"][0]["text"], "旧個別")
+
+    def test_pdf_resolves_objects_by_page_voucher_no(self) -> None:
+        from app import voucher_service
+
+        with mock.patch("app.voucher_edit_objects.load_edit_objects") as load:
+            load.side_effect = lambda order_no, **kwargs: [
+                {"id": kwargs["voucher_no"], "type": "text", "text": kwargs["voucher_no"]}]
+            a = voucher_service._resolve_edit_objects(
+                {"order_no": "ORDER", "voucher_no": "A001"})
+            b = voucher_service._resolve_edit_objects(
+                {"order_no": "ORDER", "voucher_no": "A002"})
+        self.assertEqual(a[0]["text"], "A001")
+        self.assertEqual(b[0]["text"], "A002")
 
     def test_save_creates_file_keyed_by_order_no(self) -> None:
         from app import voucher_edit_objects

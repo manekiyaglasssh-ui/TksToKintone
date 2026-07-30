@@ -72,6 +72,15 @@ class TestCredentialStore(unittest.TestCase):
         self.assertEqual(saved.kintone_login_id, "")
         self.assertEqual(saved.kintone_password, "")
 
+    def test_save_load_and_clear_update_debug_api_token(self) -> None:
+        self.cs.save_update_debug_kintone_api_token("update-secret")
+        self.assertEqual(
+            self.cs.load_update_debug_kintone_api_token(), "update-secret"
+        )
+
+        self.cs.save_update_debug_kintone_api_token("")
+        self.assertEqual(self.cs.load_update_debug_kintone_api_token(), "")
+
     def test_load_failure_returns_empty(self) -> None:
         with mock.patch.object(self.cs, "_settings", side_effect=RuntimeError("boom")):
             saved = self.cs.load_saved_credentials()

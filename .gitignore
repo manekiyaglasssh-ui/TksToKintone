@@ -1,3 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Build outputs
+build/
 dist/
-installer/
+
+# Installer generated outputs
+installer/Output/
+installer/*.exe
+installer/*.log
+
+# Runtime and local data
+logs/
+updates/
+work/
+.programdata/**/logs/
+.programdata/**/work/
+
+# Downloaded/generated large files
 assets/rembg/u2net.onnx
+tools/SumatraPDF/SumatraPDF.exe

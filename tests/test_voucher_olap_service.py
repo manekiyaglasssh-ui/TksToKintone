@@ -138,6 +138,126 @@ class VoucherOlapServiceTest(unittest.TestCase):
             [{"field": condition["フィールド論理名"], "value": condition["OLAP値"]} for condition in conditions],
         )
 
+    def test_quantity_unit_code_column_included_in_request(self) -> None:
+        from app.voucher_olap_service import _build_voucher_payload
+
+        payload, _ = _build_voucher_payload("1405113")
+        names = [
+            column.get("フィールド論理名")
+            for column in payload["R1List"]
+            if isinstance(column, dict)
+        ]
+        self.assertIn("数量単位コード", names)
+
+    def test_quantity_unit_code_column_added_when_missing_from_template(self) -> None:
+        from app.voucher_olap_service import _ensure_quantity_unit_code_column
+
+        payload = {
+            "OLAP対象データ": "OLAP_T01-03 受注入力明細データ",
+            "R1List": [
+                {
+                    "OLAP表示No": 6,
+                    "OLAP表示名": "受注No",
+                    "フィールド論理名": "受注No",
+                    "エンティティ論理名": "OLAP_T01-03 受注入力明細データ",
+                }
+            ],
+        }
+        _ensure_quantity_unit_code_column(payload)
+        added = payload["R1List"][-1]
+        self.assertEqual(added["フィールド論理名"], "数量単位コード")
+        self.assertEqual(added["エンティティ論理名"], "OLAP_T01-03 受注入力明細データ")
+        # 既に列がある場合は重複追加しない。
+        _ensure_quantity_unit_code_column(payload)
+        self.assertEqual(
+            sum(
+                1
+                for column in payload["R1List"]
+                if column.get("フィールド論理名") == "数量単位コード"
+            ),
+            1,
+        )
+
+    def test_delivery_course_name_column_included_in_request(self) -> None:
+        from app.voucher_olap_service import _build_voucher_payload
+
+        payload, _ = _build_voucher_payload("1405113")
+        code_column = next(
+            item for item in payload["R1List"]
+            if item.get("OLAP表示名") == "配送コース"
+        )
+        name_column = next(
+            item for item in payload["R1List"]
+            if item.get("OLAP表示名") == "配送コース名称"
+        )
+        self.assertEqual(code_column["OLAP表示No"], 48)
+        self.assertEqual(name_column["OLAP表示No"], 49)
+        for column, logical_name in ((code_column, "配送コース"), (name_column, "配送コース名称")):
+            self.assertEqual(column["エンティティ論理名"], "OLAP_M01-19 営業所別配送コースマスタ")
+            self.assertEqual(column["フィールド論理名"], logical_name)
+            self.assertEqual(column["XupperRoutingItems"][0]["フィールド論理名"], "営業所配送コース")
+
+    def test_delivery_course_name_column_is_added_without_fixed_display_no(self) -> None:
+        from app.voucher_olap_service import _ensure_delivery_course_name_column
+
+        payload = {
+            "OLAP対象データ": "OLAP_T01-03 受注入力明細データ",
+            "R1List": [{
+                "OLAP表示No": 72,
+                "OLAP表示名": "受注No",
+                "フィールド論理名": "受注No",
+                "エンティティ論理名": "OLAP_T01-03 受注入力明細データ",
+            }],
+        }
+        _ensure_delivery_course_name_column(payload)
+        code, name = payload["R1List"][-2:]
+        self.assertEqual((code["OLAP表示No"], name["OLAP表示No"]), (73, 74))
+        self.assertEqual((code["フィールド論理名"], name["フィールド論理名"]), ("配送コース", "配送コース名称"))
+        _ensure_delivery_course_name_column(payload)
+        self.assertEqual(len(payload["R1List"]), 3)
+
+    def test_delivery_course_name_column_is_added_as_49_after_old_template(self) -> None:
+        from app.voucher_olap_service import _ensure_delivery_course_name_column
+
+        payload = {
+            "OLAP対象データ": "OLAP_T01-03 受注入力明細データ",
+            "R1List": [{
+                "OLAP表示No": 48,
+                "OLAP表示名": "旧テンプレート最終列",
+                "フィールド論理名": "旧テンプレート最終列",
+                "エンティティ論理名": "OLAP_T01-03 受注入力明細データ",
+            }],
+        }
+        _ensure_delivery_course_name_column(payload)
+        self.assertEqual(
+            [item["OLAP表示No"] for item in payload["R1List"][-2:]],
+            [49, 50],
+        )
+
+    def test_request_and_response_delivery_course_diagnostics_have_actual_values(self) -> None:
+        response = {"ResponseData": {"R1List": [{
+            "6": "1405113",
+            "9": "Z001",
+            "16": "商品A",
+            "48": "01",
+            "49": "パレト",
+        }]}}
+        service, log_stream = _service_with_response(response)
+
+        rows = service.fetch_voucher_rows("1405113")
+
+        self.assertEqual(rows[0]["delivery_course_code"], "01")
+        self.assertEqual(rows[0]["delivery_course_name"], "パレト")
+        logs = log_stream.getvalue()
+        self.assertIn("voucher_delivery_course_request_column", logs)
+        self.assertIn("display_no=48", logs)
+        self.assertIn("logical_name=配送コース名称", logs)
+        self.assertIn("voucher_delivery_course_code_parsed", logs)
+        self.assertIn("voucher_delivery_course_name_parsed", logs)
+        self.assertIn("response_key=49", logs)
+        self.assertIn("voucher_no=Z001", logs)
+        self.assertIn("パレト", logs)
+
     def test_blank_sales_month_condition_is_removed(self) -> None:
         from app.voucher_olap_service import _build_voucher_payload
 

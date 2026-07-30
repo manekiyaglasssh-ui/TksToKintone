@@ -197,12 +197,40 @@ def olap_template_source_dirs() -> list[Path]:
 
     PyInstaller実行時（_MEIPASS / _internal 配下）と開発環境の両方で
     参照できるようにする。
+
+    PyInstaller onedir では sys._MEIPASS が `...\\TksToKintone\\_internal` を指すため、
+    resource_path("docs/olap") が正規の `_internal\\docs\\olap` を返す。
+    一方 resource_path("_internal/docs/olap") は `_internal\\_internal\\docs\\olap`
+    という存在しない重複パスになる（過去のエラーログに出ていた重複の原因）。
+    そこで _MEIPASS に依存せず、実行ファイル（sys.executable）の隣にある
+    `docs\\olap` と `_internal\\docs\\olap` も候補に加え、レイアウト差異に強くする。
+    重複パスは順序を保ったまま除外する。
     """
-    return [
+    candidates: list[Path] = [
+        # PyInstaller onedir: _MEIPASS=_internal なので _internal\docs\olap になる。
         resource_path("docs/olap"),
+        # 旧レイアウト/別配置の保険。重複しても後段で除外される。
         resource_path("_internal/docs/olap"),
-        Path(__file__).resolve().parents[1] / "docs" / "olap",
     ]
+    try:
+        # 配布時は sys.executable が本体EXE。その隣の実インストールパスを直接探す。
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "docs" / "olap")
+        candidates.append(exe_dir / "_internal" / "docs" / "olap")
+    except Exception:
+        # 実行環境によっては sys.executable が解決できない場合がある（スキップ）。
+        pass
+    # 開発環境（リポジトリ直下 docs/olap）。
+    candidates.append(Path(__file__).resolve().parents[1] / "docs" / "olap")
+
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
 
 
 def find_bundled_olap_template(name: str) -> Path | None:

@@ -58,6 +58,15 @@ def setup_logger(log_dir: Path, gui_callback: Callable[[str], None] | None = Non
         gui_handler.addFilter(secret_filter)
         logger.addHandler(gui_handler)
 
+    logger.info("event=application_log_ready log_path=%s", log_file.resolve())
+    # Imported lazily so non-GUI helpers do not need to initialize Qt.
+    try:
+        from app.qt_message_logging import flush_pending_qt_messages
+
+        flush_pending_qt_messages()
+    except Exception as exc:  # pragma: no cover - diagnostics must never block startup.
+        logger.warning("event=qt_message_buffer_flush_failed error_type=%s", type(exc).__name__)
+
     return logger, log_file
 
 

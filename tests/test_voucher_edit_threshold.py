@@ -360,51 +360,46 @@ class TestVoucherEditThresholdButtons(unittest.TestCase):
         return win
 
     def _add_selected_image(self, win, image_bytes: bytes | None = None):
-        with mock.patch.object(win, "_start_rembg_warmup_if_needed"):
-            item = win.add_image(
-                image_bytes or _white_with_black_line(),
-                rect=QRectF(100.0, 100.0, 30.0, 20.0),
-                select=True,
-            )
+        item = win.add_image(
+            image_bytes or _white_with_black_line(),
+            rect=QRectF(100.0, 100.0, 30.0, 20.0),
+            select=True,
+        )
         self.assertIsNotNone(item)
         return item
 
-    def _all_buttons(self, win):
-        return [
-            win._transparent_bg_button,
-            win._binarize_button,
-            win._threshold_transparent_button,
-            win._restore_image_button,
-            win._threshold_settings_button,
-        ]
+    def _image_processing_menu(self, win, item):
+        menu = win._build_object_context_menu(item)
+        for submenu in getattr(menu, "_submenus", []):
+            if submenu.objectName() == "image_processing_menu":
+                return submenu
+        return None
 
     # ── 表示条件（要件3・13）─────────────────────────────────────────────────
     def test_buttons_hidden_when_no_selection(self) -> None:
         win = self._make_window()
         win._scene.clearSelection()
         win._update_image_action_buttons()
-        self.assertTrue(win._image_actions_label.isHidden())
-        for btn in self._all_buttons(win):
-            self.assertTrue(btn.isHidden())
+        self.assertIsNone(win._image_actions_label)
+        self.assertIsNotNone(win._favorite_list)
 
     def test_buttons_hidden_for_non_image_selection(self) -> None:
         win = self._make_window()
         text = win.add_text_rect(QRectF(10.0, 20.0, 80.0, 24.0),
                                  text="t", auto_edit=False)
         win._select_only(text)
-        self.assertTrue(win._image_actions_label.isHidden())
-        for btn in self._all_buttons(win):
-            self.assertTrue(btn.isHidden())
+        self.assertIsNone(win._image_actions_label)
+        self.assertIsNone(self._image_processing_menu(win, text))
 
     def test_all_buttons_visible_when_image_selected(self) -> None:
         win = self._make_window()
-        self._add_selected_image(win)
-        self.assertFalse(win._image_actions_label.isHidden())
-        for btn in self._all_buttons(win):
-            self.assertFalse(btn.isHidden())
+        item = self._add_selected_image(win)
+        processing = self._image_processing_menu(win, item)
+        self.assertIsNotNone(processing)
+        self.assertIn("二値化", [a.text() for a in processing.actions()])
 
     def test_button_order_under_label(self) -> None:
-        # 画像処理ラベルの直下に要件4の順で並ぶ。
+        # 左ペインには画像処理ではなくお気に入り一覧を表示する。
         win = self._make_window()
         layout = win._template_panel_layout
         widgets = [
@@ -412,25 +407,19 @@ class TestVoucherEditThresholdButtons(unittest.TestCase):
             for i in range(layout.count())
             if layout.itemAt(i).widget() is not None
         ]
-        order = [
-            win._image_actions_label,
-            win._transparent_bg_button,
-            win._binarize_button,
-            win._threshold_transparent_button,
-            win._restore_image_button,
-            win._threshold_settings_button,
-        ]
-        indices = [widgets.index(w) for w in order]
-        self.assertEqual(indices, sorted(indices))
+        self.assertIn(win._favorite_list, widgets)
 
     # ── ボタン表記（要件4・5・13）──────────────────────────────────────────────
     def test_button_labels_two_lines(self) -> None:
         win = self._make_window()
-        self.assertEqual(win._transparent_bg_button.text(), "背景を透過\n（rembg）")
-        self.assertEqual(win._threshold_transparent_button.text(), "背景を透過\n（閾値）")
-        self.assertEqual(win._binarize_button.text(), "二値化")
-        self.assertEqual(win._restore_image_button.text(), "背景を戻す")
-        self.assertEqual(win._threshold_settings_button.text(), "閾値設定")
+        item = self._add_selected_image(win)
+        processing = self._image_processing_menu(win, item)
+        labels = [a.text() for a in processing.actions()]
+        self.assertNotIn("背景を透過 （rembg）", labels)
+        self.assertIn("背景を透過 （閾値）", labels)
+        self.assertIn("二値化", labels)
+        self.assertIn("背景を戻す", labels)
+        self.assertIn("閾値設定", labels)
 
     # ── 二値化（要件6・13）──────────────────────────────────────────────────────
     def test_binarize_keeps_geometry_and_selection(self) -> None:
@@ -497,7 +486,7 @@ class TestVoucherEditThresholdButtons(unittest.TestCase):
         item = self._add_selected_image(win)
         original = bytes(item.image_bytes)
         win._on_binarize()
-        self.assertTrue(win._restore_image_button.isEnabled())
+        self.assertTrue(item.has_original_image())
         win._on_restore_image()
         self.assertEqual(item.image_bytes, original)
         self.assertTrue(item.isSelected())

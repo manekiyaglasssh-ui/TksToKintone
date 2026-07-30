@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -42,20 +43,27 @@ DEFAULT_FIELD_MAPPING_SUPPLEMENTS: dict[str, str] = {
     "加工種類": "加工種類",
     "得意先選択": "得意先選択",
 }
+_FIELD_MAPPING_CACHE: dict[Path, tuple[int, dict[str, str]]] = {}
+_FIELD_MAPPING_CACHE_LOCK = threading.RLock()
 
 
 class KintoneClient:
     def __init__(self, config: AppConfig, logger: logging.Logger) -> None:
         self.config = config
         self.logger = logger
+        self.request_count = 0
+        self.duplicate_check_request_count = 0
         supplement_field_mapping(config.paths.field_mapping_json, logger)
-        self.mapping = load_field_mapping(config.paths.field_mapping_json)
+        self.mapping, self.field_mapping_cache_hit = load_field_mapping_cached(
+            config.paths.field_mapping_json
+        )
 
     def check_connection(self) -> None:
         """kintoneへの接続とAPIトークンの有効性を確認する。失敗時は例外を送出する。"""
         if requests is None:
             raise RuntimeError("kintone接続確認には requests が必要です。requirements.txt をインストールしてください。")
         url = f"https://{self.config.kintone_domain}/k/v1/app.json"
+        self.request_count += 1
         response = requests.get(
             url,
             headers={"X-Cybozu-API-Token": self.config.kintone_api_token},
@@ -88,6 +96,8 @@ class KintoneClient:
         offset = 0
         while True:
             query = f"{base_query} limit {FETCH_LIMIT} offset {offset}"
+            self.request_count += 1
+            self.duplicate_check_request_count += 1
             response = requests.get(
                 url,
                 headers={"X-Cybozu-API-Token": self.config.kintone_api_token},
@@ -225,6 +235,7 @@ class KintoneClient:
         if requests is None:
             raise RuntimeError("kintone登録には requests が必要です。requirements.txt をインストールしてください。")
         url = f"https://{self.config.kintone_domain}/k/v1/records.json"
+        self.request_count += 1
         response = requests.put(
             url,
             headers={
@@ -261,6 +272,19 @@ def load_field_mapping(path: Path) -> dict[str, str]:
     if not isinstance(data, dict):
         raise ValueError(f"field_mapping.json はJSONオブジェクトにしてください: {path}")
     return {str(key): str(value) for key, value in data.items() if str(key).strip() and str(value).strip()}
+
+
+def load_field_mapping_cached(path: Path) -> tuple[dict[str, str], bool]:
+    """変更時刻が同じfield mappingをプロセス内で再利用する。"""
+    resolved = path.resolve()
+    mtime_ns = resolved.stat().st_mtime_ns
+    with _FIELD_MAPPING_CACHE_LOCK:
+        cached = _FIELD_MAPPING_CACHE.get(resolved)
+        if cached is not None and cached[0] == mtime_ns:
+            return dict(cached[1]), True
+        mapping = load_field_mapping(resolved)
+        _FIELD_MAPPING_CACHE[resolved] = (mtime_ns, dict(mapping))
+        return mapping, False
 
 
 def supplement_field_mapping(path: Path, logger: logging.Logger | None = None) -> None:

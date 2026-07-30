@@ -4,7 +4,9 @@ import csv
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Sequence
 
+from app.csv_column_settings import CsvColumn, STANDARD_CSV_COLUMNS
 from tks_to_kintone.csv_io import read_csv_dicts, write_quoted_csv
 from tks_to_kintone.transform import OUTPUT_HEADERS, transform_files
 
@@ -54,27 +56,33 @@ def write_output_csv(path: Path, rows: list[dict[str, str]]) -> None:
     write_quoted_csv(path, OUTPUT_HEADERS, rows)
 
 
-def export_registration_records_to_csv(rows: list[dict[str, str]], output_path: Path) -> Path:
+def export_registration_records_to_csv(
+    rows: list[dict[str, str]],
+    output_path: Path,
+    columns: Sequence[CsvColumn] | None = None,
+) -> Path:
     """登録前確認の登録用データを確認用CSVとして出力する。
 
     kintoneへは送信せず、登録ボタン押下時に送信される最終データをそのまま書き出す。
     Excelで開きやすいよう UTF-8 BOM付き（utf-8-sig）で出力する。
-    列は REGISTRATION_EXPORT_HEADERS（OUTPUT_HEADERS + 加工名・加工mm・加工種類）。
+    columns 未指定時の列は標準順（OUTPUT_HEADERS + 加工名・加工mm・加工種類・得意先選択）。
     空欄もそのまま出力する。
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    export_columns = list(columns) if columns is not None else list(STANDARD_CSV_COLUMNS)
+    headers = [column.header for column in export_columns]
     with output_path.open("w", encoding="utf-8-sig", newline="") as fp:
         writer = csv.DictWriter(
             fp,
-            fieldnames=REGISTRATION_EXPORT_HEADERS,
+            fieldnames=headers,
             extrasaction="ignore",
             quoting=csv.QUOTE_ALL,
             lineterminator="\r\n",
         )
         writer.writeheader()
         for row in rows:
-            writer.writerow({header: row.get(header, "") for header in REGISTRATION_EXPORT_HEADERS})
+            writer.writerow({header: row.get(header, "") for header in headers})
     return output_path
 
 

@@ -92,6 +92,16 @@ class TeamsSettingsAndVoucherIntegrationTest(unittest.TestCase):
 
         with mock.patch.object(VoucherWindow, "_save_records"):
             win = VoucherWindow(olap_login_id="id", olap_password="pw")
+        win._on_add_row()
+        input_row = getattr(win, "_new_input_row", None)
+        if input_row is not None:
+            logical_index = input_row.table_row_index
+            if logical_index >= 0:
+                win._table.removeRow(logical_index)
+            win._new_input_row = None
+            for row in win._rows:
+                if row.table_row_index > logical_index:
+                    row.table_row_index -= 1
         # 他テストが使用した保存済み伝票状態に依存させない。
         win._registration_status_by_order.clear()
         self.addCleanup(win.deleteLater)

@@ -93,10 +93,9 @@ class TestLineDecorationsWindow(unittest.TestCase):
         return win
 
     def test_toolbar_buttons_order_after_line(self) -> None:
-        """要件1: 線の右隣に 矢印/両矢印/二重線 がこの順で並ぶ。"""
+        """要件1/5: 図形メニュー内に 線/矢印/両矢印/二重線 がこの順で並ぶ。"""
         win = self._new_window()
-        labels = [a.text() for tb in win.findChildren(QToolBar)
-                  for a in tb.actions()]
+        labels = [a.text() for a in win._shape_menu.actions()]
         idx = labels.index("線")
         self.assertEqual(labels[idx:idx + 4], ["線", "矢印", "両矢印", "二重線"])
 
@@ -120,19 +119,17 @@ class TestLineDecorationsWindow(unittest.TestCase):
         self.assertFalse(win._tool_actions[TOOL_LINE].isChecked())
 
     def test_tool_buttons_have_edit_tool_property_for_themes(self) -> None:
-        """要件16: 新ボタンも editToolButton property を持ち、両テーマでハイライト可。"""
+        """要件16/5: 図形ボタンが editToolButton property を持ち、各図形はチェック可能。"""
         from app.voucher_edit_window import (
             TOOL_ARROW, TOOL_DOUBLE_ARROW, TOOL_DOUBLE_LINE,
         )
         win = self._new_window()
-        bars = win.findChildren(QToolBar)
+        # 図形ボタン本体は editToolButton property を持つ（両テーマでハイライト可）。
+        self.assertTrue(win._shape_tool_button.property("editToolButton"))
+        # 各図形アクションはチェック可能（選択中が分かる）。
         for tool in (TOOL_ARROW, TOOL_DOUBLE_ARROW, TOOL_DOUBLE_LINE):
             action = win._tool_actions[tool]
-            widget = None
-            for tb in bars:
-                widget = tb.widgetForAction(action) or widget
-            self.assertIsNotNone(widget)
-            self.assertTrue(widget.property("editToolButton"))
+            self.assertTrue(action.isCheckable())
 
     def test_create_select_move_delete_each_type(self) -> None:
         """要件6-8: 矢印・両矢印・二重線を作成→選択→移動→削除できる。"""

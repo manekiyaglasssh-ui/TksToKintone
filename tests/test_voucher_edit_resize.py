@@ -88,6 +88,61 @@ class TestResizeHandles(unittest.TestCase):
         obj = win.serialize_objects()[0]
         self.assertGreater(obj["width"], 80.0)
         self.assertGreater(obj["height"], 24.0)
+        self.assertGreater(obj["font_size"], 12.0)
+
+    def test_scene_handle_press_keeps_same_handle_alive_and_resizes_font(self) -> None:
+        """実イベント経路でpress時にハンドルを再生成せず、文字サイズを変更する。"""
+        from PySide6.QtWidgets import QGraphicsSceneMouseEvent
+
+        win = self._make_window()
+        item = win.add_text_rect(
+            QRectF(40.0, 50.0, 80.0, 30.0), text="123",
+            font_size=36.0, auto_edit=False, auto_fit=False)
+        handle = self._select_resize_handle(win, item)
+        before = item.font_size
+        press = QGraphicsSceneMouseEvent(
+            QGraphicsSceneMouseEvent.Type.GraphicsSceneMousePress)
+        press.setScenePos(handle.pos())
+        press.setButton(Qt.MouseButton.LeftButton)
+        press.setButtons(Qt.MouseButton.LeftButton)
+        win._scene.mousePressEvent(press)
+
+        self.assertIs(handle.scene(), win._scene)
+        self.assertIn(handle, win._handles)
+        self.assertIs(handle._target, item)
+        self.assertIs(handle.owner_item, item)
+        self.assertIs(handle.source_item, item)
+
+        handle.setPos(QPointF(240.0, 140.0))
+        self.assertGreater(item.font_size, before)
+        release = QGraphicsSceneMouseEvent(
+            QGraphicsSceneMouseEvent.Type.GraphicsSceneMouseRelease)
+        release.setScenePos(handle.pos())
+        release.setButton(Qt.MouseButton.LeftButton)
+        win._scene.mouseReleaseEvent(release)
+        self.assertGreater(item.font_size, before)
+
+    def test_handles_after_symbol_conversion_reference_new_text_item(self) -> None:
+        """symbol_text昇格後の8ハンドルが、削除済みsymbolではなく新itemを指す。"""
+        from app.voucher_edit_window import _EditSymbolTextItem, _EditTextItem
+
+        win = self._make_window()
+        original = win.add_text_rect(
+            QRectF(40.0, 50.0, 100.0, 40.0), text="123",
+            font_size=72.0, auto_edit=False)
+        object_id = original.obj_id
+        self.assertTrue(win.maybe_convert_text_item_to_symbol(original))
+        symbol = win._edit_item_by_id(object_id)
+        self.assertIsInstance(symbol, _EditSymbolTextItem)
+        symbol.setSelected(True)
+        self.assertTrue(win.begin_text_edit(symbol))
+        editable = win._edit_item_by_id(object_id)
+        self.assertIsInstance(editable, _EditTextItem)
+        handles = [h for h in win._handles if hasattr(h, "_position")]
+        self.assertEqual(len(handles), 8)
+        self.assertTrue(all(h._target is editable for h in handles))
+        self.assertTrue(all(h.owner_item is editable for h in handles))
+        self.assertTrue(all(h.source_item is editable for h in handles))
 
     def test_rect_resized_by_dragging_handle(self) -> None:
         win = self._make_window()
@@ -182,15 +237,17 @@ class TestResizeHandles(unittest.TestCase):
 
     # ── ハンドルのクリック判定が画像本体より優先される（不具合1）──────────────
     def test_handle_shape_larger_than_visual(self) -> None:
-        from app.voucher_edit_window import HANDLE_HIT_SIZE, HANDLE_SIZE
+        from app.voucher_edit_window import HANDLE_HIT_SIZE_PX, HANDLE_SIZE
 
         win = self._make_window()
         item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
         handle = self._select_resize_handle(win, item)
         shape_rect = handle.shape().boundingRect()
         # クリック判定（shape）は見た目（rect）より広い。
-        self.assertAlmostEqual(shape_rect.width(), HANDLE_HIT_SIZE, delta=0.01)
-        self.assertGreater(HANDLE_HIT_SIZE, HANDLE_SIZE)
+        view_scale = abs(win._view.transform().m11()) or 1.0
+        self.assertAlmostEqual(
+            shape_rect.width() * view_scale, HANDLE_HIT_SIZE_PX, delta=0.01)
+        self.assertGreater(shape_rect.width(), HANDLE_SIZE)
 
     def test_handle_hit_area_prioritized_over_image(self) -> None:
         """画像本体と重なる点・拡大判定領域とも、最前面のハンドルが拾われる。"""

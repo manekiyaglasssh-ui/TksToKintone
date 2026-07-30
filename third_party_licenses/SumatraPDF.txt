@@ -1,0 +1,34 @@
+SumatraPDF 第三者ソフトウェア通知
+=================================
+
+名称: SumatraPDF
+セットアップへ同梱するバージョン: 3.6.1 (64-bit installer)
+公式配布物: SumatraPDF-3.6.1-64-install.exe
+
+TksToKintoneは、SumatraPDFの公式配布物を改変せず、独立したWindows
+アプリケーションのインストーラーとしてセットアップ内に収録しています。
+SumatraPDFはTksToKintoneとは別のソフトウェアであり、印刷時に外部プロセス
+として利用します。
+
+SumatraPDFはGNU General Public License version 3 (GPLv3) の条件で
+配布されています。SumatraPDFが利用するコンポーネントには、それぞれ別の
+ライセンス条件が適用される場合があります。正確なライセンス本文と各通知は、
+下記の公式プロジェクト配布物・ソースツリーを確認してください。
+
+Copyright (C) Krzysztof Kowalczyk and the SumatraPDF contributors.
+
+公式サイト:
+https://www.sumatrapdfreader.org/
+
+公式ダウンロード:
+https://www.sumatrapdfreader.org/download-free-pdf-viewer
+
+ソースコード入手先:
+https://github.com/sumatrapdfreader/sumatrapdf
+https://github.com/sumatrapdfreader/sumatrapdf/releases/tag/3.6.1rel
+
+ライセンス本文:
+https://github.com/sumatrapdfreader/sumatrapdf/blob/3.6.1rel/COPYING
+
+GNU GPL v3:
+https://www.gnu.org/licenses/gpl-3.0.html

@@ -157,7 +157,8 @@ class UpdateHelperTest(unittest.TestCase):
                 subprocess.Popen = original  # type: ignore[assignment]
 
             installer_call = calls[0]
-            self.assertIn("/VERYSILENT", installer_call)
+        self.assertIn("/SILENT", installer_call)
+        self.assertNotIn("/VERYSILENT", installer_call)
 
     def test_run_update_normal_does_not_pass_silent_args(self) -> None:
         with TemporaryDirectory() as temp_dir:

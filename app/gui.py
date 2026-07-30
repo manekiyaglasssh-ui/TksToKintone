@@ -3,9 +3,11 @@ from __future__ import annotations
 import csv
 import importlib
 import json
+import logging
 import os
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import replace
 from datetime import date, datetime
@@ -31,12 +33,16 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QPlainTextEdit,
     QRadioButton,
+    QStyle,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -67,6 +73,13 @@ from app.csv_processor import (
     write_input_history,
     write_output_csv,
 )
+from app.csv_column_settings import (
+    CsvColumnSetting,
+    default_csv_column_settings,
+    enabled_csv_columns,
+    load_csv_column_settings,
+    save_csv_column_settings,
+)
 from app.kakou_master import (
     KAKOU_MASTER_HEADERS,
     CUSTOMER_KEYS,
@@ -79,6 +92,7 @@ from app.kakou_master import (
     get_kakou_name,
     load_default_master,
     load_master,
+    load_master_cached,
     lookup,
     read_csv_with_auto_encoding,
     restore_master,
@@ -102,6 +116,7 @@ from app.preview_state import (
 )
 from app.tks_client import create_tks_client
 from app.version import VERSION_CODE, VERSION_NAME
+from app.window_geometry import apply_app_dpi_policy, clamp_window_to_available_geometry
 
 
 SETTINGS_ORG = "Manekiya"
@@ -139,6 +154,23 @@ THEME_LABELS = {
 }
 KAKOU_SETTING_DEFAULT = "selected"
 _PROCESSING_TYPE = "2"
+
+# 登録前確認は最初の10件で操作可能にし、以降も10件単位でGUIへ反映する。
+INITIAL_INTERACTIVE_ROW_COUNT = 10
+BACKGROUND_LOAD_BATCH_SIZE = 10
+_REGISTRATION_LOADING_TOOLTIP = "全レコードの確認が完了するまで登録できません。"
+# close時にGUIスレッドでwaitしない一方、実行中QThreadのPython wrapperを
+# 通信完了前に破棄しないための退避領域。
+_DETACHED_RUNNING_THREADS: set[QThread] = set()
+_SINGLE_INSTANCE_SERVER: QLocalServer | None = None
+UPDATE_SHUTDOWN_COMMITTED_PROPERTY = "update_shutdown_committed"
+
+
+def _detach_running_thread(worker: QThread) -> None:
+    _DETACHED_RUNNING_THREADS.add(worker)
+    worker.finished.connect(
+        lambda current=worker: _DETACHED_RUNNING_THREADS.discard(current)
+    )
 
 # Kintone登録処理画面の出荷区分（AM・PM）で「なし」を表す選択肢ラベル。
 # 「なし」選択時は登録値・登録前確認とも空欄扱いにする（要件3）。
@@ -384,6 +416,7 @@ class WorkerThread(QThread):
     credentials_validated = Signal(str, str)
     succeeded = Signal(object)
     pending_registration = Signal(object)
+    kintone_checks_ready = Signal(object, object)
     failed = Signal(str)
 
     def __init__(self, config: AppConfig, run_input: RunInput) -> None:
@@ -392,13 +425,23 @@ class WorkerThread(QThread):
         self.run_input = run_input
 
     def run(self) -> None:
+        worker_started = time.perf_counter()
         logger, log_file = setup_logger(self.config.paths.log_dir, self.log_line.emit)
+        def log_phase(phase: str, phase_started: float, **fields: object) -> None:
+            extras = " ".join(f"{key}={value}" for key, value in fields.items())
+            logger.info(
+                "event=perf_kintone_registration phase=%s elapsed_ms=%d %s",
+                phase,
+                int((time.perf_counter() - phase_started) * 1000),
+                extras,
+            )
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             work_dir = self.config.paths.work_dir
             work_dir.mkdir(parents=True, exist_ok=True)
 
             logger.info("起動日時: %s", datetime.now().isoformat(timespec="seconds"))
+            logger.info("アプリバージョン: %s (コード %s)", VERSION_NAME, VERSION_CODE)
             logger.info("対象受注No: %s", ",".join(self.run_input.denpyo_numbers))
             logger.info("仕上日: %s", self.run_input.shiage_date)
             logger.info("出荷区分: %s", self.run_input.shukka_kbn)
@@ -410,12 +453,25 @@ class WorkerThread(QThread):
                 self.run_input.shukka_kbn,
             )
 
+            phase_started = time.perf_counter()
             tks_client = create_tks_client(self.config, logger)
+            log_phase("kintone_settings_loaded", phase_started)
+            if self.isInterruptionRequested():
+                return
+            phase_started = time.perf_counter()
             tks_client.login(self.run_input)
+            log_phase("authentication_complete", phase_started, kintone_request_count=0)
             self.credentials_validated.emit(self.run_input.olap_login_id, self.run_input.olap_password)
+            if self.isInterruptionRequested():
+                return
+            phase_started = time.perf_counter()
             soba_csv, kakou_csv = tks_client.fetch_csvs(self.run_input, work_dir, self.config.csv_encoding)
+            log_phase("reference_data_fetched", phase_started)
+            if self.isInterruptionRequested():
+                return
 
             output_csv = work_dir / "outputTksToKintone.csv"
+            phase_started = time.perf_counter()
             rows = create_output_csv(
                 soba_csv,
                 kakou_csv,
@@ -423,37 +479,75 @@ class WorkerThread(QThread):
                 self.run_input.shiage_date,
                 self.run_input.shukka_kbn,
             )
+            log_phase("record_data_mapping", phase_started, total_count=len(rows))
             logger.info("outputTksToKintone.csv 出力件数: %s", len(rows))
 
+            phase_started = time.perf_counter()
             output_rows = read_output_rows(output_csv)
-            master = load_master(self.config.paths.kakou_master_csv)
+            log_phase("registration_data_deep_copy", phase_started, total_count=len(output_rows))
+            if self.isInterruptionRequested():
+                return
+            phase_started = time.perf_counter()
+            master, master_cache_hit = load_master_cached(self.config.paths.kakou_master_csv)
             apply_kakou_names_per_row(output_rows, master)
+            log_phase(
+                "processing_name_and_warning_generation",
+                phase_started,
+                total_count=len(output_rows),
+                master_cache_hit=str(master_cache_hit).lower(),
+            )
             logger.info("加工名マスタ適用件数: %s", len(master))
+
+            # 表示用データができた時点で先にGUIへ渡す。Kintone既存確認はこの後も
+            # 同じworkerで継続し、登録可否だけは完了まで確定しない。
+            pending = PendingRegistration(
+                output_csv=output_csv,
+                rows=output_rows,
+                output_count=len(rows),
+                log_file=log_file,
+                timestamp=timestamp,
+                kakou_master=master,
+            )
+            self.pending_registration.emit(pending)
 
             # Kintoneに同一受注Noの既存レコードがあるか確認する（登録前確認画面に反映するため）。
             # 検索に失敗しても処理を止めず、画面を開く前に警告で続行/中止を選べるようにする（要件11）。
             existing_records: list[dict[str, str]] = []
             existing_fetch_error: str | None = None
+            kintone_client = KintoneClient(self.config, logger)
+            phase_started = time.perf_counter()
             try:
-                existing_records = KintoneClient(self.config, logger).fetch_existing_records_by_order_numbers(
+                existing_records = kintone_client.fetch_existing_records_by_order_numbers(
                     self.run_input.denpyo_numbers
                 )
                 logger.info("Kintone既存レコード取得件数: %s", len(existing_records))
             except Exception as fetch_exc:  # noqa: BLE001 - 通信失敗でも落とさず警告に回す
                 existing_fetch_error = str(fetch_exc) or fetch_exc.__class__.__name__
                 logger.warning("Kintone既存データの検索に失敗しました: %s", existing_fetch_error)
-
-            logger.info("登録前確認画面を表示します。登録ボタン押下までkintoneへ送信しません。")
-            self.pending_registration.emit(
-                PendingRegistration(
-                    output_csv=output_csv,
-                    rows=output_rows,
-                    output_count=len(rows),
-                    log_file=log_file,
-                    timestamp=timestamp,
-                    existing_kintone_records=existing_records,
-                    existing_fetch_error=existing_fetch_error,
-                )
+            log_phase(
+                "duplicate_and_registered_check",
+                phase_started,
+                duplicate_check_request_count=kintone_client.duplicate_check_request_count,
+                kintone_request_count=kintone_client.request_count,
+            )
+            if self.isInterruptionRequested():
+                return
+            logger.info(
+                "event=perf_kintone_registration phase=kintone_app_and_field_info "
+                "elapsed_ms=0 field_schema_cache_hit=%s note=field_mapping_cache",
+                str(kintone_client.field_mapping_cache_hit).lower(),
+            )
+            self.kintone_checks_ready.emit(existing_records, existing_fetch_error)
+            logger.info(
+                "event=perf_kintone_registration phase=kintone_checks_complete "
+                "elapsed_ms=%d total_count=%d kintone_request_count=%d "
+                "duplicate_check_request_count=%d field_schema_cache_hit=%s master_cache_hit=%s",
+                int((time.perf_counter() - worker_started) * 1000),
+                len(output_rows),
+                kintone_client.request_count,
+                kintone_client.duplicate_check_request_count,
+                str(kintone_client.field_mapping_cache_hit).lower(),
+                str(master_cache_hit).lower(),
             )
         except Exception as exc:
             logger.exception("処理中にエラーが発生しました")
@@ -461,6 +555,122 @@ class WorkerThread(QThread):
             if debug_file is not None:
                 logger.error("最新debugファイル: %s", debug_file)
             self.failed.emit(_format_error_message(exc, log_file, debug_file))
+
+
+class RegistrationPrepareWorkerThread(QThread):
+    """登録前確認用のplain dataを1つのworkerで10件ずつ準備する。
+
+    QWidgetには一切触れず、override・既存Kintone値の突合とdeep copyだけを行い、
+    GUIへは list[dict] のバッチを送る。
+    """
+
+    batch_ready = Signal(int, object, object)
+    succeeded = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(
+        self,
+        generation: int,
+        rows: list[dict[str, str]],
+        existing_records: list[dict[str, str]],
+        overrides: dict[str, dict[str, object]],
+    ) -> None:
+        super().__init__()
+        self.generation = generation
+        self.rows = rows
+        self.existing_records = existing_records
+        self.overrides = overrides
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        try:
+            copy_started = time.perf_counter()
+            overridden = apply_order_overrides(self.rows, self.overrides)
+            copy_ms = int((time.perf_counter() - copy_started) * 1000)
+
+            existing_started = time.perf_counter()
+            prepared_rows, existing_by_row = merge_existing_kintone_records_into_preview_rows(
+                overridden, self.existing_records
+            )
+            existing_ms = int((time.perf_counter() - existing_started) * 1000)
+            validation_started = time.perf_counter()
+            validation_errors = [
+                f"{index + 1}行目: 検索キーが空です"
+                for index, row in enumerate(prepared_rows)
+                if not str(row.get("検索キー", "")).strip()
+            ]
+            validation_ms = int((time.perf_counter() - validation_started) * 1000)
+            logging.getLogger("tks_to_kintone_app").info(
+                "event=perf_kintone_registration phase=target_rows_and_existing_merge "
+                "elapsed_ms=%d deep_copy_ms=%d total_count=%d",
+                existing_ms,
+                copy_ms,
+                len(prepared_rows),
+            )
+
+            for start in range(0, len(prepared_rows), BACKGROUND_LOAD_BATCH_SIZE):
+                if self.isInterruptionRequested():
+                    return
+                end = start + BACKGROUND_LOAD_BATCH_SIZE
+                # signal境界を越えるデータはworker所有のmutable objectと共有しない。
+                row_batch = [dict(row) for row in prepared_rows[start:end]]
+                existing_batch = [dict(row) for row in existing_by_row[start:end]]
+                self.batch_ready.emit(self.generation, row_batch, existing_batch)
+
+            self.succeeded.emit(
+                self.generation,
+                {
+                    "total_count": len(prepared_rows),
+                    "deep_copy_ms": copy_ms,
+                    "existing_check_ms": existing_ms,
+                    "validation_ms": validation_ms,
+                    "validation_errors": validation_errors,
+                    "worker_ms": int((time.perf_counter() - started) * 1000),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - GUI側へ安全に通知する
+            logging.getLogger("tks_to_kintone_app").exception(
+                "登録前確認データの準備に失敗しました"
+            )
+            self.failed.emit(self.generation, str(exc) or exc.__class__.__name__)
+
+
+class RegistrationExistingMergeWorkerThread(QThread):
+    """遅れて完了したKintone既存確認をplain dataへ反映するworker。"""
+
+    succeeded = Signal(int, object, object, object)
+    failed = Signal(int, str)
+
+    def __init__(
+        self,
+        generation: int,
+        rows: list[dict[str, str]],
+        existing_records: list[dict[str, str]],
+    ) -> None:
+        super().__init__()
+        self.generation = generation
+        self.rows = rows
+        self.existing_records = existing_records
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        try:
+            merged_rows, existing_by_row = merge_existing_kintone_records_into_preview_rows(
+                self.rows, self.existing_records
+            )
+            if self.isInterruptionRequested():
+                return
+            self.succeeded.emit(
+                self.generation,
+                merged_rows,
+                existing_by_row,
+                {"existing_merge_worker_ms": int((time.perf_counter() - started) * 1000)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("tks_to_kintone_app").exception(
+                "Kintone既存データの反映に失敗しました"
+            )
+            self.failed.emit(self.generation, str(exc) or exc.__class__.__name__)
 
 
 class KintoneRegisterWorkerThread(QThread):
@@ -711,8 +921,13 @@ class KakouMasterDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("加工名マスタ管理")
-        self.resize(1520, 720)
-        self.setMinimumSize(1320, 620)
+        clamp_window_to_available_geometry(
+            self,
+            desired_width=1520,
+            desired_height=720,
+            min_width=1100,
+            min_height=560,
+        )
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         self.master_path = master_path
         self.backup_dir = backup_dir
@@ -1069,6 +1284,108 @@ class KakouMasterDialog(QDialog):
         self.reject()
 
 
+_CONFIRM_LOGGER = logging.getLogger("tks_to_kintone_app")
+
+
+class CsvColumnSettingsDialog(QDialog):
+    """登録前確認CSVの列順と出力対象を編集するダイアログ。"""
+
+    def __init__(self, columns: list[CsvColumnSetting], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("CSV列設定")
+        self.resize(520, 560)
+        self._saved_columns: list[CsvColumnSetting] | None = None
+
+        self.column_list = QListWidget()
+        self.column_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.column_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.column_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.column_list.setToolTip("ドラッグ＆ドロップ、または「上へ」「下へ」で列順を変更できます。")
+        self._populate(columns)
+
+        self.up_button = QPushButton("上へ")
+        self.down_button = QPushButton("下へ")
+        self.reset_button = QPushButton("初期順序に戻す")
+        self.save_button = QPushButton("保存して閉じる")
+        self.cancel_button = QPushButton("キャンセル")
+        self.up_button.clicked.connect(lambda: self._move_current(-1))
+        self.down_button.clicked.connect(lambda: self._move_current(1))
+        self.reset_button.clicked.connect(self._reset_to_default)
+        self.save_button.clicked.connect(self._save_and_close)
+        self.cancel_button.clicked.connect(self.reject)
+
+        order_buttons = QVBoxLayout()
+        order_buttons.addWidget(self.up_button)
+        order_buttons.addWidget(self.down_button)
+        order_buttons.addStretch(1)
+
+        list_row = QHBoxLayout()
+        list_row.addWidget(self.column_list, 1)
+        list_row.addLayout(order_buttons)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.reset_button)
+        bottom.addStretch(1)
+        bottom.addWidget(self.save_button)
+        bottom.addWidget(self.cancel_button)
+
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("CSVへ出力する列を選び、出力順を設定してください。"))
+        root.addLayout(list_row, 1)
+        root.addLayout(bottom)
+
+    def _populate(self, columns: list[CsvColumnSetting]) -> None:
+        from app.csv_column_settings import STANDARD_CSV_COLUMNS
+
+        labels = {column.key: column.header for column in STANDARD_CSV_COLUMNS}
+        self.column_list.clear()
+        for column in columns:
+            if column.key not in labels:
+                continue
+            item = QListWidgetItem(labels[column.key])
+            item.setData(Qt.ItemDataRole.UserRole, column.key)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
+            item.setCheckState(Qt.CheckState.Checked if column.enabled else Qt.CheckState.Unchecked)
+            self.column_list.addItem(item)
+        if self.column_list.count():
+            self.column_list.setCurrentRow(0)
+
+    def column_settings(self) -> list[CsvColumnSetting]:
+        result: list[CsvColumnSetting] = []
+        for index in range(self.column_list.count()):
+            item = self.column_list.item(index)
+            result.append(
+                CsvColumnSetting(
+                    str(item.data(Qt.ItemDataRole.UserRole)),
+                    item.checkState() == Qt.CheckState.Checked,
+                )
+            )
+        return result
+
+    def saved_column_settings(self) -> list[CsvColumnSetting] | None:
+        return self._saved_columns
+
+    def _move_current(self, offset: int) -> None:
+        current = self.column_list.currentRow()
+        target = current + offset
+        if current < 0 or target < 0 or target >= self.column_list.count():
+            return
+        item = self.column_list.takeItem(current)
+        self.column_list.insertItem(target, item)
+        self.column_list.setCurrentRow(target)
+
+    def _reset_to_default(self) -> None:
+        self._populate(default_csv_column_settings())
+
+    def _save_and_close(self) -> None:
+        columns = self.column_settings()
+        if not any(column.enabled for column in columns):
+            QMessageBox.warning(self, "CSV列設定", "出力する列を1つ以上選択してください。")
+            return
+        self._saved_columns = columns
+        self.accept()
+
+
 class RegistrationPreviewDialog(QDialog):
     """登録前確認ダイアログ。
 
@@ -1076,6 +1393,9 @@ class RegistrationPreviewDialog(QDialog):
     登録データは必ず PreviewState.build_registration_rows() から生成する。
     絞り込みフィルタは表示制御のみで、登録対象は常に全CSVレコードである。
     """
+
+    loading_cancel_requested = Signal()
+    retry_requested = Signal()
 
     def __init__(
         self,
@@ -1088,12 +1408,41 @@ class RegistrationPreviewDialog(QDialog):
         preview_color_theme: str = "light",
         debug_visible: bool = False,
         kintone_existing_by_row: list[dict[str, str]] | None = None,
+        progressive_loading: bool = False,
+        request_started: float | None = None,
+        generation: int = 0,
     ) -> None:
         super().__init__(parent)
+        _confirm_init_start = time.perf_counter()
+        self._request_started = request_started or _confirm_init_start
+        self._progressive_loading = progressive_loading
+        self._generation = generation
+        # 受注Noごとに、得意先選択を誰が決めたかを保持する。非同期結果の反映時に
+        # 自動設定・ユーザー設定を暗黙に上書きしないための所有権情報。
+        self._customer_selection_source_by_order: dict[str, str] = {}
+        self._all_rows_ready = not progressive_loading
+        self._load_failed = False
+        self._first_batch_logged = False
+        self._gui_row_generation_ms = 0
+        self._total_count = len(rows)
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_init_started %s", {"row_count": len(rows)}
+        )
+        # 起動時に大量セルウィジェットを一括生成する際は再描画を抑制する（要件3）。
+        self._cell_widget_count = 0
         self.setWindowTitle("登録前確認")
-        # 商品名称列の拡張に伴い横幅をさらに広げ、右端の未登録警告まで見切れないようにする（要件7・8）。
-        self.resize(1650, 700)
-        self.setMinimumWidth(1500)
+        # 縦幅を約1.5cm狭め、横幅は「表の実際の列幅合計」に合わせて狭める（要件1）。
+        # 旧実装は固定幅1520pxで、列幅を狭めても未登録警告列の右に大きな余白が残っていた。
+        # 初期幅はレイアウト確定後に _apply_content_based_geometry() で列幅合計から算出する。
+        self._CONFIRM_DESIRED_HEIGHT = 645  # 従来700から55px（約1.5cm）縮小
+        self._CONFIRM_MIN_WIDTH = 820  # 下部ボタン・CSV出力先欄・参照ボタンが見切れない最小幅
+        self._CONFIRM_MIN_HEIGHT = 505  # 従来560から縮小
+        # 参考: 旧固定初期幅（この値より狭くなることを検証する）。
+        self._CONFIRM_PREVIOUS_FIXED_WIDTH = 1520
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_window_height_reduced %s",
+            {"old_height": 700, "new_height": self._CONFIRM_DESIRED_HEIGHT, "reduced_px": 700 - self._CONFIRM_DESIRED_HEIGHT},
+        )
         self._master = master
         self._shukka_options = shukka_options
         self._customer_match_patterns = customer_match_patterns or {}
@@ -1101,10 +1450,15 @@ class RegistrationPreviewDialog(QDialog):
         # PreviewState が唯一の内部データモデル
         # Kintone既存データの行単位反映値を渡し、加工名・加工mm・㎡ などをKintone値で優先表示する。
         existing_by_row = [dict(item) for item in (kintone_existing_by_row or [])]
-        self._state = PreviewState(
-            rows=[dict(row) for row in rows],
-            kintone_existing_by_row=existing_by_row,
-        )
+
+        def _build_state() -> PreviewState:
+            return PreviewState(
+                rows=[dict(row) for row in rows],
+                kintone_existing_by_row=existing_by_row,
+            )
+
+        # Kintone既存データの行単位反映（既存確認）の所要時間を計測する（要件3）。
+        self._state = self._confirm_timed("kintone_confirm_existing_check", _build_state)
 
         self._kakou_options: list[tuple[str, str]] = [("selected", "選択なし")]
         for key in CUSTOMER_KEYS:
@@ -1144,21 +1498,92 @@ class RegistrationPreviewDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(_COL_KAKOU, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(_COL_NO, 40)
+        # 判定加工名（旧Stretch）を Interactive の固定幅にして狭める。Stretch のままだと
+        # 横幅縮小時に潰れ、逆に画面を広げると過度に伸びるため、明示幅で制御する。
+        # 列幅は表の実幅（＝ウィンドウ幅）を決める主因。右側余白を消して画面全体を
+        # 狭めるため、内容が短い/tooltipで補える列をさらに詰める（要件1）。
+        self.table.setColumnWidth(_COL_NO, 34)
         self.table.setColumnWidth(_COL_ORDER_NO, 110)
         self.table.setColumnWidth(_COL_PRODUCT, 270)
-        self.table.setColumnWidth(_COL_KAKURITSU_CODE, 100)
+        self.table.setColumnWidth(_COL_KAKURITSU_CODE, 84)
         self.table.setColumnWidth(_COL_KAKURITSU_NAME, 145)
-        self.table.setColumnWidth(_COL_TYPE, 55)
-        self.table.setColumnWidth(_COL_KAKOU_TYPE, 95)
+        self.table.setColumnWidth(_COL_TYPE, 46)
+        self.table.setColumnWidth(_COL_KAKOU_TYPE, 84)
         self.table.setColumnWidth(_COL_SHIAGE, 130)
-        self.table.setColumnWidth(_COL_SHUKKA, 85)
+        self.table.setColumnWidth(_COL_SHUKKA, 72)
         self.table.setColumnWidth(_COL_CUSTOMER, 155)
-        self.table.setColumnWidth(_COL_WARNING, 185)
-        self._populate_table()
+        # 判定加工名: 旧Stretch（約280px）→168px。長い加工名はtooltipで確認可能。
+        _DETECTED_PROCESS_NAME_WIDTH = 168
+        # 未登録警告: 185px→96px。全文はセルtooltipで確認可能。
+        _UNREGISTERED_WARNING_WIDTH = 96
+        self.table.setColumnWidth(_COL_KAKOU, _DETECTED_PROCESS_NAME_WIDTH)
+        self.table.setColumnWidth(_COL_WARNING, _UNREGISTERED_WARNING_WIDTH)
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_column_width_adjusted %s",
+            {
+                "detected_process_name": _DETECTED_PROCESS_NAME_WIDTH,
+                "unregistered_warning": _UNREGISTERED_WARNING_WIDTH,
+            },
+        )
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_detected_process_name_width %s",
+            {"old": 190, "new": _DETECTED_PROCESS_NAME_WIDTH},
+        )
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_unregistered_warning_width %s",
+            {"old": 110, "new": _UNREGISTERED_WARNING_WIDTH},
+        )
+        # 大量行のセルウィジェット生成中はテーブルの再描画・シグナルを止めて軽くする（要件3）。
+        self._cell_widgets_started = time.perf_counter()
+        _CONFIRM_LOGGER.info("kintone_confirm_cell_widgets_started")
+        self.table.setUpdatesEnabled(False)
+        _prev_block = self.table.blockSignals(True)
+        try:
+            self._confirm_timed("kintone_confirm_table_populate", self._populate_table)
+        finally:
+            self.table.blockSignals(_prev_block)
+            self.table.setUpdatesEnabled(True)
+        # 生成したセルウィジェット数（判定加工名・未登録警告は全行、他は受注No先頭行のみ）。
+        # 全行全セルに QWidget を敷かず、編集が必要な列だけに限定していることを可視化する。
+        _combobox_count = (
+            sum(1 for w in self._shukka_widgets if w is not None)
+            + sum(1 for w in self._customer_widgets if w is not None)
+        )
+        _dateedit_count = sum(1 for w in self._shiage_widgets if w is not None)
+        _lineedit_count = sum(1 for w in self._kakou_type_widgets if w is not None)
+        self._cell_widget_count = (
+            len(self._kakou_labels)
+            + len(self._state.rows)
+            + _combobox_count
+            + _dateedit_count
+            + _lineedit_count
+        )
+        _CONFIRM_LOGGER.info("kintone_confirm_rows_count %s", {"rows_count": len(self._state.rows)})
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_cell_widget_count %s", {"cell_widget_count": self._cell_widget_count}
+        )
+        _CONFIRM_LOGGER.info("kintone_confirm_combobox_count %s", {"combobox_count": _combobox_count})
+        _CONFIRM_LOGGER.info("kintone_confirm_dateedit_count %s", {"dateedit_count": _dateedit_count})
+        _CONFIRM_LOGGER.info("kintone_confirm_lineedit_count %s", {"lineedit_count": _lineedit_count})
+        _cell_widgets_ms = int((time.perf_counter() - self._cell_widgets_started) * 1000)
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_cell_widgets_finished %s",
+            {"elapsed_ms": _cell_widgets_ms, "cell_widget_count": self._cell_widget_count},
+        )
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_cell_widgets_elapsed_ms %s",
+            {"elapsed_ms": _cell_widgets_ms, "cell_widget_count": self._cell_widget_count},
+        )
+        if _cell_widgets_ms >= 300:
+            _CONFIRM_LOGGER.warning(
+                "kintone_confirm_slow_step_detected %s",
+                {"step": "kintone_confirm_cell_widgets", "elapsed_ms": _cell_widgets_ms},
+            )
         self._apply_initial_customer_matches()
 
+        # 下部レイアウト・ボタン・警告バナーの構築時間を計測する（要件3）。
+        _build_ui_start = time.perf_counter()
+        _CONFIRM_LOGGER.info("kintone_confirm_build_ui_started")
         # 未登録警告バナー
         all_warnings: list[str] = []
         for row in self._state.rows:
@@ -1182,6 +1607,9 @@ class RegistrationPreviewDialog(QDialog):
         self.csv_create_button = QPushButton("CSV作成")
         self.csv_create_button.setToolTip("登録ボタン押下時と同じ登録用データをCSVへ出力します（kintone登録はしません）。")
         self.csv_create_button.clicked.connect(self._on_create_csv)
+        self.csv_column_settings_button = QPushButton("CSV列設定")
+        self.csv_column_settings_button.setToolTip("CSVファイルに出力する列と並び順を設定します。")
+        self.csv_column_settings_button.clicked.connect(self._open_csv_column_settings)
         self._load_csv_output_dir()
 
         csv_row = QHBoxLayout()
@@ -1190,12 +1618,17 @@ class RegistrationPreviewDialog(QDialog):
         csv_row.addWidget(self.csv_browse_button)
 
         bottom = QHBoxLayout()
+        self.retry_button = QPushButton("再試行")
+        self.retry_button.setVisible(False)
+        self.retry_button.clicked.connect(self.retry_requested)
+        bottom.addWidget(self.retry_button)
         self.print_button: QPushButton | None = None
         if debug_visible:
             self.print_button = QPushButton("印刷")
             self.print_button.clicked.connect(self._print_slips)
             bottom.addWidget(self.print_button)
         bottom.addStretch(1)
+        bottom.addWidget(self.csv_column_settings_button)
         bottom.addWidget(self.csv_create_button)
         bottom.addWidget(buttons)
 
@@ -1213,11 +1646,22 @@ class RegistrationPreviewDialog(QDialog):
         # （専用の小さいフォント指定を外し、既定サイズ・既定色に合わせる）。
         kakou_type_legend = QLabel(KAKOU_TYPE_LEGEND_TEXT)
         root.addWidget(kakou_type_legend)
+        self.loading_status_label = QLabel()
+        self.loading_status_label.setObjectName("registrationLoadingStatus")
+        if progressive_loading:
+            self.loading_status_label.setText("Kintone登録準備中\n0件を表示しました\nデータを確認しています…")
+        else:
+            self.loading_status_label.setText(f"{len(self._state.rows)}件を表示しました")
+        root.addWidget(self.loading_status_label)
+        self.warning_label = QLabel()
+        self.warning_label.setStyleSheet("color: #cc7700;")
+        self.warning_label.setVisible(bool(all_warnings))
         if all_warnings:
             unique_warnings = list(dict.fromkeys(all_warnings))
-            warn_label = QLabel("未登録の掛率集計コードがあります:\n" + "\n".join(unique_warnings))
-            warn_label.setStyleSheet("color: #cc7700;")
-            root.addWidget(warn_label)
+            self.warning_label.setText(
+                "未登録の掛率集計コードがあります:\n" + "\n".join(unique_warnings)
+            )
+        root.addWidget(self.warning_label)
         root.addWidget(self.table, 1)
         root.addLayout(csv_row)
         root.addLayout(bottom)
@@ -1225,6 +1669,255 @@ class RegistrationPreviewDialog(QDialog):
 
         self.register_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
+        if progressive_loading:
+            self.register_button.setEnabled(False)
+            self.register_button.setToolTip(_REGISTRATION_LOADING_TOOLTIP)
+            self.csv_create_button.setEnabled(False)
+            self.csv_create_button.setToolTip(_REGISTRATION_LOADING_TOOLTIP)
+            self.csv_column_settings_button.setEnabled(False)
+            if self.print_button is not None:
+                self.print_button.setEnabled(False)
+                self.print_button.setToolTip(_REGISTRATION_LOADING_TOOLTIP)
+
+        _build_ui_ms = int((time.perf_counter() - _build_ui_start) * 1000)
+        _CONFIRM_LOGGER.info(
+            "event=perf_kintone_registration phase=ui_components_created elapsed_ms=%d "
+            "total_count=%d",
+            _build_ui_ms,
+            len(self._state.rows),
+        )
+        _CONFIRM_LOGGER.info("kintone_confirm_build_ui_finished %s", {"elapsed_ms": _build_ui_ms})
+        _CONFIRM_LOGGER.info("kintone_confirm_build_ui_elapsed_ms %s", {"elapsed_ms": _build_ui_ms})
+        if _build_ui_ms >= 300:
+            _CONFIRM_LOGGER.warning(
+                "kintone_confirm_slow_step_detected %s",
+                {"step": "kintone_confirm_build_ui", "elapsed_ms": _build_ui_ms},
+            )
+
+        # レイアウト確定後に、表の実際の列幅合計に合わせて初期ウィンドウ幅を算出する（要件4・5）。
+        self._confirm_timed("kintone_confirm_geometry", self._apply_content_based_geometry)
+
+        _confirm_init_ms = int((time.perf_counter() - _confirm_init_start) * 1000)
+        _CONFIRM_LOGGER.info(
+            "event=perf_kintone_registration phase=registration_window_created "
+            "elapsed_ms=%d total_count=%d",
+            _confirm_init_ms,
+            len(self._state.rows),
+        )
+        _CONFIRM_LOGGER.info("kintone_confirm_init_finished %s", {"elapsed_ms": _confirm_init_ms})
+        _CONFIRM_LOGGER.info("kintone_confirm_init_elapsed_ms %s", {"elapsed_ms": _confirm_init_ms})
+        if _confirm_init_ms >= 1000:
+            _CONFIRM_LOGGER.warning(
+                "kintone_confirm_slow_step_detected %s",
+                {"step": "kintone_confirm_init", "elapsed_ms": _confirm_init_ms},
+            )
+
+    @staticmethod
+    def _confirm_timed(event: str, func):
+        """登録前確認画面の主要ステップ所要時間(ms)を計測しログへ出す（要件3）。
+
+        `{event}_started` / `{event}_finished` / `{event}_elapsed_ms` を出力し、
+        300ms以上は kintone_confirm_slow_step_detected を出す。例外は伝播する。
+        """
+        start = time.perf_counter()
+        _CONFIRM_LOGGER.info("%s_started", event)
+        try:
+            return func()
+        finally:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            _CONFIRM_LOGGER.info("%s_finished %s", event, {"elapsed_ms": elapsed_ms})
+            _CONFIRM_LOGGER.info("%s_elapsed_ms %s", event, {"elapsed_ms": elapsed_ms})
+            if elapsed_ms >= 300:
+                _CONFIRM_LOGGER.warning(
+                    "kintone_confirm_slow_step_detected %s",
+                    {"step": event, "elapsed_ms": elapsed_ms},
+                )
+
+    def _apply_content_based_geometry(self) -> None:
+        """設定した列幅の合計から初期ウィンドウ幅を明示的に決めて狭める（要件4・5）。
+
+        前回修正では clamp 経由の resize だけで幅を決めていたが、実機で幅が縮まらなかった。
+        原因は (1) `horizontalHeader().length()` ではなく実設定列幅で算出すべきだったこと、
+        (2) CSV出力先欄(QLineEdit, stretch=1)がウィンドウ幅を引っ張っていたこと、
+        (3) resize 後に layout/exec で幅が広がる環境があったこと。
+        本メソッドでは実列幅合計から target を計算し、`resize` に加えて初回表示中だけ
+        `setMaximumWidth(target)` を掛けて幅を強制し、右側余白をなくす。maximumWidth は
+        showEvent 後に解除してユーザーが手動で広げられるようにする。
+        """
+        initial_width = self.width()
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_initial_width_before_resize %s", {"width": initial_width}
+        )
+
+        header = self.table.horizontalHeader()
+        header_length = int(header.length())
+        # header.length() ではなく、実際に setColumnWidth した列幅の合計を基準にする（要件4）。
+        column_width_sum = sum(
+            self.table.columnWidth(c) for c in range(self.table.columnCount())
+        )
+        viewport_width = int(self.table.viewport().width())
+        vheader_width = self.table.verticalHeader().width() if self.table.verticalHeader().isVisible() else 0
+
+        frame_width = self.table.frameWidth() * 2
+        # 縦スクロールバー1本分は表の実幅に含める（多数行でも最終列が横スクロールなしで見える）。
+        scrollbar_width = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_table_column_width_sum %s",
+            {"column_width_sum": column_width_sum},
+        )
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_table_header_length %s",
+            {"header_length": header_length, "vheader_width": vheader_width},
+        )
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_table_viewport_width %s",
+            {"viewport_width": viewport_width},
+        )
+
+        # 表の実幅（縦ヘッダ + 列幅合計 + 枠 + 縦スクロールバー分）。
+        table_width = vheader_width + column_width_sum + frame_width + scrollbar_width
+        # テーブルが横に伸びて右側に余白を作らないよう、実幅で上限を固定する（右側余白の主因対策）。
+        self.table.setMaximumWidth(table_width)
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_table_width_target %s",
+            {"table_width": table_width, "scrollbar_width": scrollbar_width, "frame_width": frame_width},
+        )
+
+        # CSV出力先欄（stretch=1 の QLineEdit）がウィンドウ幅を引っ張らないよう、
+        # 最大幅を表幅以下に抑える（要件4・5）。下部ボタン行も同様に表幅内へ収める。
+        self.csv_output_dir_edit.setMaximumWidth(table_width)
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_csv_row_width_policy %s",
+            {
+                "csv_edit_max_width": table_width,
+                "note": "expanding_but_capped_to_table_width",
+            },
+        )
+
+        margins = self.layout().contentsMargins()
+        layout_margins = margins.left() + margins.right()
+        safety_margin = 4
+        dialog_target_width = table_width + layout_margins + safety_margin
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_dialog_width_target %s",
+            {
+                "dialog_target_width": dialog_target_width,
+                "layout_margins": layout_margins,
+                "safety_margin": safety_margin,
+            },
+        )
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            max_allowed_w = int(avail.width() * 0.95)
+            max_allowed_h = int(avail.height() * 0.95)
+        else:
+            max_allowed_w = dialog_target_width
+            max_allowed_h = self._CONFIRM_DESIRED_HEIGHT
+        # 画面外に出ないよう上限だけ掛ける（広げる方向には使わない）。
+        final_target_width = min(dialog_target_width, max_allowed_w)
+        min_width = min(self._CONFIRM_MIN_WIDTH, max_allowed_w)
+        final_target_width = max(final_target_width, min_width)
+        final_height = min(self._CONFIRM_DESIRED_HEIGHT, max_allowed_h)
+        min_height = min(self._CONFIRM_MIN_HEIGHT, max_allowed_h)
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_target_dialog_width %s",
+            {"target_width": final_target_width, "target_height": final_height},
+        )
+        # clamp が幅を広げていないことを検証ログに残す（要件4）。
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_clamp_did_not_expand_width %s",
+            {
+                "dialog_target_width": dialog_target_width,
+                "final_target_width": final_target_width,
+                "expanded": final_target_width > dialog_target_width,
+            },
+        )
+
+        # 最小サイズ→resize→初回表示中のみ maximumWidth 強制、の順で確実に幅を適用する。
+        self.setMinimumSize(min_width, min_height)
+        self.resize(final_target_width, final_height)
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_resize_applied %s",
+            {"width": final_target_width, "height": final_height},
+        )
+        # 初回表示で layout/exec が幅を広げるのを防ぐため maximumWidth を掛ける。
+        # showEvent 後に解除してユーザーが手動で広げられるようにする（要件4）。
+        self._initial_target_width = final_target_width
+        self._initial_max_width_locked = True
+        self.setMaximumWidth(final_target_width)
+
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_width_after_resize %s",
+            {"width": self.width(), "height": self.height()},
+        )
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_minimum_width %s", {"minimum_width": self.minimumWidth()}
+        )
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_maximum_width %s", {"maximum_width": self.maximumWidth()}
+        )
+
+        right_blank = max(0, final_target_width - table_width)
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_right_blank_width %s",
+            {"right_blank_width": right_blank, "window_width": final_target_width, "table_width": table_width},
+        )
+        if right_blank >= 50:
+            _CONFIRM_LOGGER.warning(
+                "kintone_confirm_right_blank_warning %s",
+                {"right_blank_width": right_blank, "window_width": final_target_width, "table_width": table_width},
+            )
+        if final_target_width < self._CONFIRM_PREVIOUS_FIXED_WIDTH:
+            _CONFIRM_LOGGER.info(
+                "kintone_confirm_window_width_reduced_to_table %s",
+                {
+                    "previous_fixed_width": self._CONFIRM_PREVIOUS_FIXED_WIDTH,
+                    "new_width": final_target_width,
+                    "reduced_px": self._CONFIRM_PREVIOUS_FIXED_WIDTH - final_target_width,
+                    "table_width": table_width,
+                },
+            )
+        _CONFIRM_LOGGER.info(
+            "kintone_confirm_window_final_width %s",
+            {"width": final_target_width, "height": final_height},
+        )
+        _CONFIRM_LOGGER.info(
+            "event=perf_kintone_registration phase=column_width_calculated "
+            "elapsed_ms=0 column_count=%d column_width_sum=%d",
+            self.table.columnCount(),
+            column_width_sum,
+        )
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """初回表示時に幅ロックを解除し、最大化表示を検出・記録する（要件4）。"""
+        super().showEvent(event)
+        if not getattr(self, "_window_shown_logged", False):
+            self._window_shown_logged = True
+            elapsed_ms = int((time.perf_counter() - self._request_started) * 1000)
+            _CONFIRM_LOGGER.info(
+                "event=perf_kintone_registration phase=window_shown elapsed_ms=%d "
+                "total_count=%d first_batch_count=%d batch_size=%d",
+                elapsed_ms,
+                self._total_count,
+                min(self._total_count, INITIAL_INTERACTIVE_ROW_COUNT),
+                BACKGROUND_LOAD_BATCH_SIZE,
+            )
+        if getattr(self, "_initial_max_width_locked", False):
+            self._initial_max_width_locked = False
+            # 幅の強制は初回表示のみ。以降はユーザーが手動で広げられるよう解除する。
+            # QWIDGETSIZE_MAX(=16777215) を最大幅に戻す（PySide6では定数未エクスポート）。
+            self.setMaximumWidth(16777215)
+            _CONFIRM_LOGGER.info(
+                "kintone_confirm_initial_width_lock_released %s",
+                {"width": self.width(), "restored_max_width": self.maximumWidth()},
+            )
+        if self.isMaximized():
+            _CONFIRM_LOGGER.warning(
+                "kintone_confirm_show_maximized_detected %s", {"width": self.width()}
+            )
 
     # ── テーブル構築 ──────────────────────────────────────
 
@@ -1358,7 +2051,9 @@ class RegistrationPreviewDialog(QDialog):
 
         fg_brush = QBrush(QColor(fg_hex))
 
-        for row_idx, row in enumerate(self._state.rows):
+        population_start = getattr(self, "_population_start", 0)
+        for row_idx in range(population_start, len(self._state.rows)):
+            row = self._state.rows[row_idx]
             is_first = row_idx in first_indices
             group_idx = group_indices[row_idx]
             # 同一受注No内は先頭行・後続行とも同じ背景色（グループ単位の交互色のみ）
@@ -1466,9 +2161,240 @@ class RegistrationPreviewDialog(QDialog):
             warning_label = QLabel(warning_text)
             warn_color = warning_color if warning_text else fg_hex
             warning_label.setStyleSheet(f"color: {warn_color}; background-color: {bg_hex};")
+            # 列幅を狭めたため、全文はtooltipで確認できるようにする。
+            if warning_text:
+                warning_label.setToolTip(warning_text)
             self.table.setCellWidget(row_idx, _COL_WARNING, warning_label)
 
             self._refresh_kakou_label(row_idx)
+            if self._progressive_loading:
+                for column in (_COL_KAKOU_TYPE, _COL_SHIAGE, _COL_SHUKKA, _COL_CUSTOMER):
+                    editor = self.table.cellWidget(row_idx, column)
+                    if editor is not None:
+                        editor.setEnabled(False)
+
+    def append_prepared_batch(
+        self,
+        rows: list[dict[str, str]],
+        existing_by_row: list[dict[str, str]],
+        *,
+        total_count: int,
+    ) -> None:
+        """workerが準備したplain dataをGUIスレッドで1バッチだけ反映する。"""
+        if not self._progressive_loading or self._all_rows_ready or self._load_failed:
+            return
+        if not rows:
+            return
+        batch_started = time.perf_counter()
+        start = len(self._state.rows)
+        batch_state = PreviewState(
+            rows=[dict(row) for row in rows],
+            kintone_existing_by_row=[dict(row) for row in existing_by_row],
+        )
+        self._state.rows.extend(batch_state.rows)
+        self._state.kintone_existing_by_row.extend(batch_state.kintone_existing_by_row)
+        self._state.shiage_by_row.extend(batch_state.shiage_by_row)
+        self._state.shukka_by_row.extend(batch_state.shukka_by_row)
+        self._state.customer_key_by_row.extend(batch_state.customer_key_by_row)
+        self._state.kakou_type_by_row.extend(batch_state.kakou_type_by_row)
+        self._total_count = total_count
+
+        # 受注Noがバッチ境界をまたぐ場合も先頭行の編集状態を引き継ぐ。
+        first_by_order: dict[str, int] = {}
+        for index, row in enumerate(self._state.rows):
+            order_no = row.get("受注No", "")
+            if order_no not in first_by_order:
+                first_by_order[order_no] = index
+            elif index >= start:
+                first = first_by_order[order_no]
+                self._state.shiage_by_row[index] = self._state.shiage_by_row[first]
+                self._state.shukka_by_row[index] = self._state.shukka_by_row[first]
+                self._state.customer_key_by_row[index] = self._state.customer_key_by_row[first]
+
+        self.table.setUpdatesEnabled(False)
+        previous_block = self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self._state.rows))
+            self._population_start = start
+            self._populate_table()
+            self._apply_initial_customer_matches(start)
+            self._apply_filter(self._filter_edit.text())
+        finally:
+            self._population_start = 0
+            self.table.blockSignals(previous_block)
+            self.table.setUpdatesEnabled(True)
+
+        batch_ms = int((time.perf_counter() - batch_started) * 1000)
+        self._gui_row_generation_ms += batch_ms
+        self._cell_widget_count = (
+            len(self._kakou_labels)
+            + len(self._state.rows)
+            + sum(1 for widget in self._shiage_widgets if widget is not None)
+            + sum(1 for widget in self._shukka_widgets if widget is not None)
+            + sum(1 for widget in self._customer_widgets if widget is not None)
+            + sum(1 for widget in self._kakou_type_widgets if widget is not None)
+        )
+        displayed = len(self._state.rows)
+        self.loading_status_label.setText(
+            f"Kintone登録準備中\n{displayed} / {total_count}件を表示しました\n"
+            "残りのデータを確認しています…"
+        )
+        _CONFIRM_LOGGER.info(
+            "event=perf_kintone_registration phase=table_rows_generated elapsed_ms=%d "
+            "batch_count=%d displayed_count=%d total_count=%d",
+            batch_ms,
+            len(rows),
+            displayed,
+            total_count,
+        )
+        interactive_threshold = min(total_count, INITIAL_INTERACTIVE_ROW_COUNT)
+        if not self._first_batch_logged and displayed >= interactive_threshold:
+            self._first_batch_logged = True
+            elapsed_ms = int((time.perf_counter() - self._request_started) * 1000)
+            _CONFIRM_LOGGER.info(
+                "event=perf_kintone_registration phase=first_10_rows_ready elapsed_ms=%d "
+                "total_count=%d first_batch_count=%d batch_size=%d gui_row_generation_ms=%d",
+                elapsed_ms,
+                total_count,
+                interactive_threshold,
+                BACKGROUND_LOAD_BATCH_SIZE,
+                self._gui_row_generation_ms,
+            )
+            _CONFIRM_LOGGER.info(
+                "event=perf_kintone_registration phase=interactive elapsed_ms=%d "
+                "displayed_count=%d total_count=%d loading=true",
+                elapsed_ms,
+                displayed,
+                total_count,
+            )
+
+    def finish_progressive_loading(self, metrics: dict[str, object] | None = None) -> None:
+        if not self._progressive_loading or self._load_failed:
+            return
+        self._all_rows_ready = True
+        displayed = len(self._state.rows)
+        self.loading_status_label.setText(f"{displayed} / {self._total_count}件の確認が完了しました")
+        warnings = [
+            warning
+            for row in self._state.rows
+            if (warning := _row_unregistered_warning(row, self._master))
+        ]
+        if warnings:
+            self.warning_label.setText(
+                "未登録の掛率集計コードがあります:\n"
+                + "\n".join(dict.fromkeys(warnings))
+            )
+            self.warning_label.setVisible(True)
+        self.register_button.setEnabled(bool(self._state.rows))
+        self.register_button.setToolTip("")
+        self.csv_create_button.setEnabled(bool(self._state.rows))
+        self.csv_create_button.setToolTip(
+            "登録ボタン押下時と同じ登録用データをCSVへ出力します（kintone登録はしません）。"
+        )
+        self.csv_column_settings_button.setEnabled(True)
+        for widgets in (
+            self._kakou_type_widgets,
+            self._shiage_widgets,
+            self._shukka_widgets,
+            self._customer_widgets,
+        ):
+            for widget in widgets:
+                if widget is not None:
+                    widget.setEnabled(True)
+        if self.print_button is not None:
+            self.print_button.setEnabled(True)
+            self.print_button.setToolTip("")
+        elapsed_ms = int((time.perf_counter() - self._request_started) * 1000)
+        worker_ms = int((metrics or {}).get("worker_ms", 0))
+        _CONFIRM_LOGGER.info(
+            "event=perf_kintone_registration phase=all_rows_ready elapsed_ms=%d "
+            "total_count=%d first_batch_count=%d batch_size=%d "
+            "gui_row_generation_ms=%d worker_processing_ms=%d",
+            elapsed_ms,
+            self._total_count,
+            min(self._total_count, INITIAL_INTERACTIVE_ROW_COUNT),
+            BACKGROUND_LOAD_BATCH_SIZE,
+            self._gui_row_generation_ms,
+            worker_ms,
+        )
+
+    def apply_existing_check_result(
+        self,
+        merged_rows: list[dict[str, str]],
+        existing_by_row: list[dict[str, str]],
+    ) -> None:
+        """Kintone確認完了後の値を、ユーザー編集開始前に表示済み行へ反映する。"""
+        if len(merged_rows) != len(self._state.rows):
+            raise ValueError("Kintone既存確認結果の行数が一致しません。")
+        # 後着のKintone確認結果は行データを更新するが、既に画面で確定した得意先
+        # 選択の所有権は奪わない。旧実装はここで PreviewState を丸ごと交換し、
+        # setCurrentIndex の currentIndexChanged まで発火させていた。
+        preserved_customer_by_order: dict[str, str] = {}
+        for row_idx in self._state.first_indices_by_order():
+            order_no = str(self._state.rows[row_idx].get("受注No", "") or "")
+            preserved_customer_by_order[order_no] = self._state.customer_key_by_row[row_idx]
+
+        refreshed = PreviewState(
+            rows=[dict(row) for row in merged_rows],
+            kintone_existing_by_row=[dict(row) for row in existing_by_row],
+        )
+        self._state = refreshed
+        for row_idx in self._state.first_indices_by_order():
+            order_no = str(self._state.rows[row_idx].get("受注No", "") or "")
+            if order_no in preserved_customer_by_order:
+                self._state.set_customer_key_for_order(
+                    row_idx, preserved_customer_by_order[order_no]
+                )
+        self.table.setUpdatesEnabled(False)
+        try:
+            for row_idx in range(len(self._state.rows)):
+                date_widget = self._shiage_widgets[row_idx]
+                if date_widget is not None:
+                    value = self._state.shiage_by_row[row_idx]
+                    date_widget.setDate(_date_from_text(value) if value else _SHIAGE_NONE_DATE)
+                shukka_widget = self._shukka_widgets[row_idx]
+                if shukka_widget is not None:
+                    value = self._state.shukka_by_row[row_idx] or SHUKKA_NONE_LABEL
+                    if value not in (SHUKKA_NONE_LABEL, *self._shukka_options):
+                        shukka_widget.addItem(value)
+                    shukka_widget.setCurrentText(value)
+                customer_widget = self._customer_widgets[row_idx]
+                if customer_widget is not None:
+                    index = customer_widget.findData(self._state.customer_key_by_row[row_idx])
+                    if index >= 0:
+                        previous = customer_widget.blockSignals(True)
+                        try:
+                            customer_widget.setCurrentIndex(index)
+                        finally:
+                            customer_widget.blockSignals(previous)
+                kakou_widget = self._kakou_type_widgets[row_idx]
+                if kakou_widget is not None:
+                    kakou_widget._code = self._state.kakou_type_by_row[row_idx]
+                    kakou_widget._show_label()
+                self._refresh_kakou_label(row_idx)
+        finally:
+            self.table.setUpdatesEnabled(True)
+
+    def fail_progressive_loading(self, message: str) -> None:
+        self._load_failed = True
+        displayed = len(self._state.rows)
+        if displayed:
+            text = f"{displayed}件を表示しましたが、残りの確認に失敗しました。\n{message}"
+        else:
+            text = f"データの確認に失敗しました。\n{message}"
+        self.loading_status_label.setText(text)
+        self.register_button.setEnabled(False)
+        self.register_button.setToolTip(_REGISTRATION_LOADING_TOOLTIP)
+        self.csv_create_button.setEnabled(False)
+        self.csv_column_settings_button.setEnabled(False)
+        if self.print_button is not None:
+            self.print_button.setEnabled(False)
+        self.retry_button.setVisible(True)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._progressive_loading and not self._all_rows_ready:
+            self.loading_cancel_requested.emit()
+        super().closeEvent(event)
 
     def _set_ro(self, row: int, col: int, text: str, bold: bool = False, bg: QBrush | None = None, fg: QBrush | None = None) -> None:
         item = QTableWidgetItem(text)
@@ -1521,31 +2447,114 @@ class RegistrationPreviewDialog(QDialog):
     def _on_customer_changed(self, row_idx: int) -> None:
         widget = self._customer_widgets[row_idx]
         new_key = (widget.currentData() if widget is not None else None) or DEFAULT_CUSTOMER_KEY
+        order_no = str(self._state.rows[row_idx].get("受注No", "") or "")
+        self._customer_selection_source_by_order[order_no] = "user_selected"
         # 同一受注No の全行（非表示行含む）に反映
         self._state.set_customer_key_for_order(row_idx, new_key)
+        self._log_customer_auto_select(
+            phase="selection_preserved",
+            row_idx=row_idx,
+            target_customer_key=new_key,
+            current_customer_key=new_key,
+            selection_source="user_selected",
+            reason="user_selected",
+        )
         # 同一受注No の全行の判定加工名を更新
         for i in self._state.indices_for_order(row_idx):
             self._refresh_kakou_label(i)
 
-    def _apply_initial_customer_matches(self) -> None:
+    def _apply_initial_customer_matches(self, start_row: int = 0) -> None:
         first_indices = self._state.first_indices_by_order()
         for row_idx in sorted(first_indices):
-            key = customer_key_from_name(
-                self._state.rows[row_idx].get("得意先名称", ""),
-                self._customer_match_patterns,
-            )
-            if key == DEFAULT_CUSTOMER_KEY:
+            if row_idx < start_row:
                 continue
+            row = self._state.rows[row_idx]
+            order_no = str(row.get("受注No", "") or "")
+            selection_source = self._customer_selection_source_by_order.get(order_no, "")
+            if selection_source == "user_selected":
+                self._log_customer_auto_select(
+                    phase="selection_preserved",
+                    row_idx=row_idx,
+                    target_customer_key=self._state.customer_key_by_row[row_idx],
+                    current_customer_key=self._state.customer_key_by_row[row_idx],
+                    selection_source=selection_source,
+                    reason="user_selected",
+                )
+                continue
+            raw_name = str(row.get("得意先名称", "") or "")
+            normalized_name = normalize_customer_name(raw_name)
+            key = customer_key_from_name(normalized_name, self._customer_match_patterns)
+            current_key = self._state.customer_key_by_row[row_idx]
+            self._log_customer_auto_select(
+                phase="source_resolved",
+                row_idx=row_idx,
+                target_customer_key=key,
+                current_customer_key=current_key,
+                selection_source=selection_source or "unresolved",
+                customer_name_raw=raw_name,
+                customer_name_normalized=normalized_name,
+            )
             self._state.set_customer_key_for_order(row_idx, key)
+            self._customer_selection_source_by_order[order_no] = (
+                "auto_match" if key != DEFAULT_CUSTOMER_KEY else "auto_cleared"
+            )
             widget = self._customer_widgets[row_idx]
             if widget is not None:
                 idx = widget.findData(key)
                 if idx >= 0:
-                    widget.blockSignals(True)
-                    widget.setCurrentIndex(idx)
-                    widget.blockSignals(False)
+                    previous = widget.blockSignals(True)
+                    try:
+                        widget.setCurrentIndex(idx)
+                    finally:
+                        widget.blockSignals(previous)
+            self._log_customer_auto_select(
+                phase="selection_applied" if key != DEFAULT_CUSTOMER_KEY else "selection_cleared",
+                row_idx=row_idx,
+                target_customer_key=key,
+                current_customer_key=key,
+                selection_source=self._customer_selection_source_by_order[order_no],
+                reason="elevator_match" if key != DEFAULT_CUSTOMER_KEY else "no_elevator",
+                customer_name_raw=raw_name,
+                customer_name_normalized=normalized_name,
+            )
             for i in self._state.indices_for_order(row_idx):
                 self._refresh_kakou_label(i)
+
+    def _log_customer_auto_select(
+        self,
+        *,
+        phase: str,
+        row_idx: int,
+        target_customer_key: str,
+        current_customer_key: str,
+        selection_source: str,
+        reason: str = "",
+        customer_name_raw: str | None = None,
+        customer_name_normalized: str | None = None,
+    ) -> None:
+        row = self._state.rows[row_idx]
+        raw = (
+            str(row.get("得意先名称", "") or "")
+            if customer_name_raw is None
+            else customer_name_raw
+        )
+        normalized = normalize_customer_name(raw) if customer_name_normalized is None else customer_name_normalized
+        _CONFIRM_LOGGER.info(
+            "event=kintone_customer_auto_select phase=%s order_no=%s "
+            "customer_name_raw=%r customer_name_normalized=%r contains_elevator=%s "
+            "target_customer_key=%s current_customer_key=%s selection_source=%s "
+            "generation=%d reason=%s",
+            phase,
+            str(row.get("受注No", "") or ""),
+            raw,
+            normalized,
+            str("エレベータ" in normalized).lower(),
+            target_customer_key,
+            current_customer_key,
+            selection_source,
+            self._generation,
+            reason,
+        )
 
     # ── 加工種類 変更ハンドラ ─────────────────────────────
 
@@ -1565,7 +2574,10 @@ class RegistrationPreviewDialog(QDialog):
 
     def _refresh_kakou_label(self, row_idx: int) -> None:
         name = self._state.compute_kakou_name(row_idx, self._master)
-        self._kakou_labels[row_idx].setText(name)
+        label = self._kakou_labels[row_idx]
+        label.setText(name)
+        # 列幅を狭めたため、長い判定加工名はtooltipで全文を確認できるようにする。
+        label.setToolTip(name)
 
     # ── 受注No 絞り込み（表示のみ、登録対象は変わらない）────
 
@@ -1637,6 +2649,14 @@ class RegistrationPreviewDialog(QDialog):
         self.csv_output_dir_edit.setText(selected)
         self._save_csv_output_dir(selected)
 
+    def _open_csv_column_settings(self) -> None:
+        dialog = CsvColumnSettingsDialog(load_csv_column_settings(self._settings()), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        columns = dialog.saved_column_settings()
+        if columns is not None:
+            save_csv_column_settings(self._settings(), columns)
+
     def _on_create_csv(self) -> None:
         """登録ボタン押下時と同じ登録用データを確認用CSVへ出力する（要件4）。
 
@@ -1667,7 +2687,12 @@ class RegistrationPreviewDialog(QDialog):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = unique_timestamp_csv_path(output_dir, timestamp)
         try:
-            export_registration_records_to_csv(records, output_path)
+            column_settings = load_csv_column_settings(self._settings())
+            export_registration_records_to_csv(
+                records,
+                output_path,
+                columns=enabled_csv_columns(column_settings),
+            )
         except OSError as exc:
             QMessageBox.critical(self, "CSV作成", f"CSVの作成に失敗しました。\n{exc}")
             return
@@ -1717,7 +2742,13 @@ class AdvancedSettingsDialog(QDialog):
     def __init__(self, settings: QSettings, config: AppConfig | None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("高度な設定")
-        self.resize(980, 620)
+        clamp_window_to_available_geometry(
+            self,
+            desired_width=980,
+            desired_height=620,
+            min_width=720,
+            min_height=480,
+        )
         self.settings = settings
         self.tables: dict[str, QTableWidget] = {}
         kakou_template = (
@@ -1818,7 +2849,13 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("設定")
-        self.resize(520, 360)
+        clamp_window_to_available_geometry(
+            self,
+            desired_width=520,
+            desired_height=360,
+            min_width=420,
+            min_height=320,
+        )
         self.config = config
         self.settings = settings
         self.update_callback = update_callback
@@ -1925,11 +2962,18 @@ class MainWindow(QMainWindow):
         self.config: AppConfig | None = None
         self.fallback_base_dir = default_base_dir()
         self.worker: WorkerThread | None = None
+        self.prepare_worker: RegistrationPrepareWorkerThread | None = None
+        self.existing_merge_worker: RegistrationExistingMergeWorkerThread | None = None
         self.debug_worker: TksDebugWorkerThread | None = None
         self.register_worker: KintoneRegisterWorkerThread | None = None
         self.update_check_worker: UpdateCheckWorkerThread | None = None
         self.update_check_manual = False
         self._closing = False
+        self._registration_generation = 0
+        self._preview_dialog: RegistrationPreviewDialog | None = None
+        self._pending_registration: PendingRegistration | None = None
+        self._preview_prepare_metrics: dict[str, object] | None = None
+        self._kintone_checks_received = False
         # 起動直後の自動更新確認は廃止。更新確認は機能選択画面（LauncherWindow）表示時に行う。
         # ここでは設定画面からの手動更新確認のみを残す。
 
@@ -1976,6 +3020,16 @@ class MainWindow(QMainWindow):
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.result_label = QLabel("")
+        # 処理中表示用の不定進捗バー（OLAP取得・CSV出力・Kintone登録）。
+        # UI全体は無効化せず、処理中であることだけを示す。
+        self._busy_counter = 0
+        self._busy_progress = QProgressBar()
+        self._busy_progress.setObjectName("busyProgress")
+        self._busy_progress.setTextVisible(False)
+        self._busy_progress.setFixedWidth(160)
+        self._busy_progress.setRange(0, 0)
+        self._busy_progress.setVisible(False)
+        self._busy_progress.setToolTip("処理中です。")
 
         self._build_layout()
         apply_theme(str(self.settings.value(SETTINGS_THEME, THEME_SYSTEM) or THEME_SYSTEM))
@@ -2040,7 +3094,10 @@ class MainWindow(QMainWindow):
         root.addWidget(self.log_title)
         root.addWidget(self.log_view, 1)
         root.addWidget(self.result_title)
-        root.addWidget(self.result_label)
+        result_row = QHBoxLayout()
+        result_row.addWidget(self.result_label, 1)
+        result_row.addWidget(self._busy_progress)
+        root.addLayout(result_row)
 
         widget = QWidget()
         widget.setLayout(root)
@@ -2051,6 +3108,8 @@ class MainWindow(QMainWindow):
         self._closing = True
         for worker in (
             self.worker,
+            self.prepare_worker,
+            self.existing_merge_worker,
             self.debug_worker,
             self.register_worker,
             self.update_check_worker,
@@ -2058,7 +3117,7 @@ class MainWindow(QMainWindow):
             if worker is not None and worker.isRunning():
                 worker.requestInterruption()
                 worker.quit()
-                worker.wait(1000)
+                _detach_running_thread(worker)
         super().closeEvent(event)
 
     def showEvent(self, event) -> None:  # noqa: N802
@@ -2141,6 +3200,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "保存エラー", f"設定の保存に失敗しました:\n{exc}")
 
     def start_run(self) -> None:
+        button_started = time.perf_counter()
+        _CONFIRM_LOGGER.info(
+            "event=perf_kintone_registration phase=button_clicked elapsed_ms=0 "
+            "total_count=0 first_batch_count=0 batch_size=%d",
+            BACKGROUND_LOAD_BATCH_SIZE,
+        )
         if self.config is None:
             return
         # 同じ受注Noが複数入力されている場合は実行前に警告して中止する（要件5）。
@@ -2159,18 +3224,72 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "入力エラー", str(exc))
             return
+        _CONFIRM_LOGGER.info(
+            "event=perf_kintone_registration phase=target_rows_collected elapsed_ms=%d "
+            "target_order_count=%d",
+            int((time.perf_counter() - button_started) * 1000),
+            len(run_input.denpyo_numbers),
+        )
 
         self.result_label.setText("")
         self.log_view.clear()
-        self._cleanup_old_files()
         self._set_buttons_enabled(False)
+        self._registration_generation += 1
+        generation = self._registration_generation
+        self._kintone_register_perf_start = button_started
+
+        # 画面枠は通信・全件マッピング・セル生成より先に表示する。
+        dialog = RegistrationPreviewDialog(
+            [],
+            self.config.shukka_kbn_options,
+            [],
+            self.config.customer_labels,
+            self.config.customer_match_patterns,
+            self,
+            preview_color_theme=self.config.preview_color_theme,
+            debug_visible=_settings_bool(self.settings, SETTINGS_DEBUG_VISIBLE, False),
+            progressive_loading=True,
+            request_started=self._kintone_register_perf_start,
+            generation=generation,
+        )
+        dialog.loading_status_label.setText(
+            "Kintone登録準備中\n"
+            f"対象受注No: {len(run_input.denpyo_numbers)}件\n"
+            "データを確認しています…"
+        )
+        self._preview_dialog = dialog
+        self._pending_registration = None
+        self._preview_prepare_metrics = None
+        self._kintone_checks_received = False
+        dialog.loading_cancel_requested.connect(self._cancel_registration_loading)
+        dialog.retry_requested.connect(self._retry_registration_loading)
+        dialog.rejected.connect(self._on_preview_rejected)
+        dialog.accepted.connect(self._on_preview_accepted)
+        dialog.open()
+
+        self._set_busy("OLAP取得中...", context="run_olap")
+        # event loopへ戻して画面をpaintした後にworkerを起動する。
+        QTimer.singleShot(0, lambda: self._start_registration_source_worker(generation, run_input))
+
+    def _start_registration_source_worker(self, generation: int, run_input: RunInput) -> None:
+        if generation != self._registration_generation or self._preview_dialog is None:
+            return
         self.worker = WorkerThread(self._effective_config(), run_input)
-        self.worker.log_line.connect(self.append_log)
-        self.worker.succeeded.connect(self.on_succeeded)
-        self.worker.pending_registration.connect(self.on_pending_registration)
-        self.worker.failed.connect(self.on_failed)
-        self.worker.finished.connect(lambda: self._set_buttons_enabled(True))
-        self.worker.start()
+        worker = self.worker
+        worker.log_line.connect(self.append_log)
+        worker.pending_registration.connect(
+            lambda pending, g=generation: self.on_pending_registration(pending, g)
+        )
+        worker.kintone_checks_ready.connect(
+            lambda records, error, g=generation: self._on_kintone_checks_ready(
+                g, records, error
+            )
+        )
+        worker.failed.connect(
+            lambda message, g=generation: self._on_registration_load_failed(g, message)
+        )
+        worker.finished.connect(lambda: self._clear_busy(context="run_olap"))
+        worker.start()
 
     def start_tks_login_test(self) -> None:
         if self.config is None:
@@ -2196,11 +3315,13 @@ class MainWindow(QMainWindow):
         self.result_label.setText("")
         self.log_view.clear()
         self._set_buttons_enabled(False)
+        self._set_busy("OLAP取得中..." if mode == "olap" else "TKS接続確認中...", context="debug_worker")
         self.debug_worker = TksDebugWorkerThread(self._effective_config(), run_input, mode)
         self.debug_worker.log_line.connect(self.append_log)
         self.debug_worker.succeeded.connect(self.on_debug_succeeded)
         self.debug_worker.failed.connect(self.on_failed)
         self.debug_worker.finished.connect(lambda: self._set_buttons_enabled(True))
+        self.debug_worker.finished.connect(lambda: self._clear_busy(context="debug_worker"))
         self.debug_worker.start()
 
     def open_settings(self) -> None:
@@ -2240,7 +3361,7 @@ class MainWindow(QMainWindow):
 
         release_notes = f"\n\nリリースノート:\n{info.release_notes}" if info.release_notes else ""
         self.append_log(f"新しいバージョンを検出: {info.version_name} (コード {info.version_code})")
-        QMessageBox.information(
+        answer = QMessageBox.question(
             self._message_parent(),
             "更新確認",
             "新しいバージョンが見つかりました。\n\n"
@@ -2248,8 +3369,12 @@ class MainWindow(QMainWindow):
             f"新しいバージョン: {info.version_name} (コード {info.version_code})\n"
             f"ファイル名: {info.file_name}"
             f"{release_notes}\n\n"
-            "更新ファイルをダウンロードして適用します。",
+            "更新ファイルをダウンロードして適用しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         self.start_update_download(info)
 
     def on_update_check_failed(self, message: str) -> None:
@@ -2258,82 +3383,169 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self._message_parent(), "更新確認失敗", message)
 
     def start_update_download(self, info: object) -> None:
-        try:
-            update_client = _update_client_module()
-            launch_external_update = update_client.launch_external_update
-            default_update_dir = update_client.default_update_dir
-            started = launch_external_update(
-                info,
-                default_update_dir(),
-                Path(sys.executable).resolve(),
-            )
-        except Exception as exc:
-            QMessageBox.warning(self._message_parent(), "更新失敗", str(exc))
-            return
-        if not started:
-            QMessageBox.warning(
-                self._message_parent(),
-                "更新失敗",
-                "更新インストーラを起動できませんでした。\n"
-                "ログフォルダの update_installer.log を確認してください。",
-            )
-            return
-        QMessageBox.information(
+        from app.update_progress import start_update
+
+        start_update(
             self._message_parent(),
-            "更新開始",
-            "更新を開始します。\nアプリを終了し、自動でダウンロードとインストールを行います。",
+            info,
+            Path(sys.executable).resolve(),
         )
-        # インストーラ起動が成功したので本体を速やかに終了する。
-        quit_app_for_update()
 
     def _message_parent(self) -> QWidget:
         active_window = QApplication.activeWindow()
         return active_window if isinstance(active_window, QWidget) else self
 
-    def on_pending_registration(self, pending: PendingRegistration) -> None:
-        if self.config is None:
+    def on_pending_registration(
+        self, pending: PendingRegistration, generation: int | None = None
+    ) -> None:
+        generation = self._registration_generation if generation is None else generation
+        dialog = self._preview_dialog
+        if (
+            self.config is None
+            or dialog is None
+            or generation != self._registration_generation
+        ):
             return
-        master = load_master(self.config.paths.kakou_master_csv)
-        # 伝票作成・印刷画面から渡された受注Noごとの仕上日／AM・PMを反映する（要件1・5）。
-        preview_rows = apply_order_overrides(pending.rows, self.get_order_overrides())
-
-        # Kintone既存データの検索に失敗していたら、画面を開く前に続行/中止を確認する（要件11）。
-        existing_records = pending.existing_kintone_records
-        if pending.existing_fetch_error:
-            answer = QMessageBox.question(
-                self._message_parent(),
-                "Kintone既存データの確認に失敗",
-                "Kintone既存データの確認に失敗しました。\n"
-                f"{pending.existing_fetch_error}\n\n"
-                "このままOLAP取得データのみで登録前確認を開きますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                self.result_label.setText("処理を中止しました（Kintone既存データの確認に失敗）。")
-                return
-            existing_records = []
-
-        # Kintone既存データを登録前確認の行へ反映する（要件4〜7）。
-        preview_rows, existing_by_row = merge_existing_kintone_records_into_preview_rows(
-            preview_rows, existing_records
+        self._pending_registration = pending
+        dialog._master = [dict(row) for row in pending.kakou_master]
+        dialog._total_count = len(pending.rows)
+        self.prepare_worker = RegistrationPrepareWorkerThread(
+            generation,
+            pending.rows,
+            pending.existing_kintone_records,
+            self.get_order_overrides(),
         )
+        prepare_worker = self.prepare_worker
+        prepare_worker.batch_ready.connect(self._on_preview_batch_ready)
+        prepare_worker.succeeded.connect(self._on_preview_preparation_complete)
+        prepare_worker.failed.connect(self._on_registration_load_failed)
+        prepare_worker.start()
+
+    def _on_preview_batch_ready(
+        self,
+        generation: int,
+        rows: list[dict[str, str]],
+        existing_by_row: list[dict[str, str]],
+    ) -> None:
+        dialog = self._preview_dialog
+        pending = self._pending_registration
+        if (
+            generation != self._registration_generation
+            or dialog is None
+            or pending is None
+        ):
+            return
+        dialog.append_prepared_batch(
+            rows, existing_by_row, total_count=len(pending.rows)
+        )
+
+    def _on_preview_preparation_complete(
+        self, generation: int, metrics: dict[str, object]
+    ) -> None:
+        dialog = self._preview_dialog
+        pending = self._pending_registration
+        if (
+            generation != self._registration_generation
+            or dialog is None
+            or pending is None
+        ):
+            return
+        validation_errors = metrics.get("validation_errors", [])
+        if validation_errors:
+            first_errors = "\n".join(str(item) for item in list(validation_errors)[:5])
+            dialog.fail_progressive_loading(
+                "必須項目の確認でエラーが見つかりました。\n" + first_errors
+            )
+            return
+        self._preview_prepare_metrics = metrics
+        if self._kintone_checks_received:
+            self._start_existing_result_merge(generation)
+
+    def _on_kintone_checks_ready(
+        self,
+        generation: int,
+        existing_records: list[dict[str, str]],
+        existing_fetch_error: str | None,
+    ) -> None:
+        pending = self._pending_registration
+        dialog = self._preview_dialog
+        if (
+            generation != self._registration_generation
+            or pending is None
+            or dialog is None
+        ):
+            return
+        pending.existing_kintone_records = [dict(row) for row in existing_records]
+        pending.existing_fetch_error = existing_fetch_error
         reflection_message = summarize_existing_reflection(existing_records)
         if reflection_message:
             self.append_log(reflection_message)
+        self._kintone_checks_received = True
+        if existing_fetch_error:
+            dialog.fail_progressive_loading(
+                "Kintone既存データの確認に失敗したため登録できません。\n"
+                + existing_fetch_error
+            )
+            return
+        if self._preview_prepare_metrics is not None:
+            self._start_existing_result_merge(generation)
 
-        dialog = RegistrationPreviewDialog(
-            preview_rows,
-            self.config.shukka_kbn_options,
-            master,
-            self.config.customer_labels,
-            self.config.customer_match_patterns,
-            self,
-            preview_color_theme=self.config.preview_color_theme,
-            debug_visible=_settings_bool(self.settings, SETTINGS_DEBUG_VISIBLE, False),
-            kintone_existing_by_row=existing_by_row,
+    def _start_existing_result_merge(self, generation: int) -> None:
+        dialog = self._preview_dialog
+        pending = self._pending_registration
+        if dialog is None or pending is None or dialog._load_failed:
+            return
+        if self.existing_merge_worker is not None and self.existing_merge_worker.isRunning():
+            return
+        self.existing_merge_worker = RegistrationExistingMergeWorkerThread(
+            generation,
+            [dict(row) for row in dialog._state.rows],
+            pending.existing_kintone_records,
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        worker = self.existing_merge_worker
+        worker.succeeded.connect(self._on_existing_result_merged)
+        worker.failed.connect(self._on_registration_load_failed)
+        worker.start()
+
+    def _on_existing_result_merged(
+        self,
+        generation: int,
+        merged_rows: list[dict[str, str]],
+        existing_by_row: list[dict[str, str]],
+        merge_metrics: dict[str, object],
+    ) -> None:
+        dialog = self._preview_dialog
+        if generation != self._registration_generation or dialog is None:
+            return
+        dialog.apply_existing_check_result(merged_rows, existing_by_row)
+        metrics = dict(self._preview_prepare_metrics or {})
+        metrics.update(merge_metrics)
+        dialog.finish_progressive_loading(metrics)
+
+    def _on_registration_load_failed(self, generation: int, message: str) -> None:
+        if generation != self._registration_generation:
+            return
+        dialog = self._preview_dialog
+        if dialog is not None:
+            dialog.fail_progressive_loading(message)
+        self.result_label.setText(f"エラー有無: あり\n{message}")
+        self._set_buttons_enabled(True)
+
+    def _cancel_registration_loading(self) -> None:
+        self._registration_generation += 1
+        for worker in (self.worker, self.prepare_worker, self.existing_merge_worker):
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+        self._preview_dialog = None
+        self._pending_registration = None
+        self._set_buttons_enabled(True)
+        self._clear_busy(context="run_olap")
+
+    def _on_preview_rejected(self) -> None:
+        pending = self._pending_registration
+        if self._preview_dialog is not None:
+            self._cancel_registration_loading()
+        if pending is not None:
             self.result_label.setText(
                 "\n".join(
                     [
@@ -2344,9 +3556,28 @@ class MainWindow(QMainWindow):
                     ]
                 )
             )
+
+    def _retry_registration_loading(self) -> None:
+        dialog = self._preview_dialog
+        self._cancel_registration_loading()
+        if dialog is not None:
+            dialog.reject()
+        QTimer.singleShot(0, self.start_run)
+
+    def _on_preview_accepted(self) -> None:
+        dialog = self._preview_dialog
+        pending = self._pending_registration
+        if (
+            dialog is None
+            or pending is None
+            or not dialog._all_rows_ready
+            or dialog._load_failed
+        ):
             return
+        self._preview_dialog = None
         self.log_view.clear()
         self._set_buttons_enabled(False)
+        self._set_busy("Kintone登録中...", context="kintone_register")
         self.register_worker = KintoneRegisterWorkerThread(
             self._effective_config(),
             dialog.registration_rows(),
@@ -2358,6 +3589,9 @@ class MainWindow(QMainWindow):
         self.register_worker.succeeded.connect(self.on_succeeded)
         self.register_worker.failed.connect(self.on_failed)
         self.register_worker.finished.connect(lambda: self._set_buttons_enabled(True))
+        self.register_worker.finished.connect(
+            lambda: self._clear_busy(context="kintone_register")
+        )
         self.register_worker.start()
 
     def _collect_input(self, require_denpyo: bool) -> RunInput:
@@ -2536,6 +3770,38 @@ class MainWindow(QMainWindow):
         self.settings_button.setEnabled(enabled)
         self.cleanup_button.setEnabled(enabled)
 
+    # ── 処理中表示（busy/進捗）────────────────────────────────────────────────
+    def _set_busy(self, message: str = "", *, context: str = "") -> None:
+        """時間がかかる処理の開始時に不定進捗バーを表示する（UI全体は無効化しない）。"""
+        self._busy_counter = getattr(self, "_busy_counter", 0) + 1
+        _log_busy_event(
+            "busy_started", busy_message=message, busy_context=context,
+            busy_counter=self._busy_counter,
+        )
+        bar = getattr(self, "_busy_progress", None)
+        if bar is not None:
+            try:
+                bar.setVisible(True)
+            except RuntimeError:
+                pass
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def _clear_busy(self, *, context: str = "") -> None:
+        """処理完了/失敗時に進捗バーを非表示へ戻す（カウンタが0になったら消す）。"""
+        self._busy_counter = max(0, getattr(self, "_busy_counter", 0) - 1)
+        _log_busy_event(
+            "busy_finished", busy_context=context, busy_counter=self._busy_counter
+        )
+        if self._busy_counter == 0:
+            bar = getattr(self, "_busy_progress", None)
+            if bar is not None:
+                try:
+                    bar.setVisible(False)
+                except RuntimeError:
+                    pass
+
     def on_succeeded(self, result: ProcessResult) -> None:
         self.result_label.setText(
             "\n".join(
@@ -2580,6 +3846,85 @@ class MainWindow(QMainWindow):
             widget.setVisible(False)
 
 
+def prepare_app_for_update() -> bool:
+    """Run existing unsaved-edit confirmation before installer launch becomes irreversible."""
+    app = QApplication.instance()
+    if app is None:
+        return True
+    running_threads: list[QThread] = []
+    seen_threads: set[int] = set()
+    for widget in list(app.topLevelWidgets()):
+        for thread in widget.findChildren(QThread):
+            if id(thread) in seen_threads:
+                continue
+            seen_threads.add(id(thread))
+            if thread.isRunning():
+                running_threads.append(thread)
+    if running_threads:
+        logging.getLogger("tks_to_kintone_app").info(
+            "event=update_cancelled reason=background_worker_running count=%s",
+            len(running_threads),
+        )
+        parent = QApplication.activeWindow()
+        QMessageBox.information(
+            parent if isinstance(parent, QWidget) else None,
+            "アップデート",
+            "実行中の処理があるため更新を開始できません。\n"
+            "処理の完了後にもう一度更新を実行してください。",
+        )
+        return False
+    for widget in list(app.topLevelWidgets()):
+        is_dirty = getattr(widget, "is_dirty", None)
+        if not callable(is_dirty):
+            continue
+        try:
+            if not is_dirty():
+                continue
+            closed = widget.close()
+            if not closed:
+                logging.getLogger("tks_to_kintone_app").info(
+                    "event=update_cancelled reason=unsaved_edit_confirmation"
+                )
+                return False
+        except Exception:  # pragma: no cover - an unknown editor must block update safely.
+            logging.getLogger("tks_to_kintone_app").exception(
+                "event=update_preflight_failed"
+            )
+            return False
+    return True
+
+
+def update_shutdown_is_committed() -> bool:
+    app = QApplication.instance()
+    return bool(app and app.property(UPDATE_SHUTDOWN_COMMITTED_PROPERTY))
+
+
+def release_single_instance_lock() -> None:
+    """Release the local-server lock before the installer needs the app to be gone."""
+    global _SINGLE_INSTANCE_SERVER
+    server = _SINGLE_INSTANCE_SERVER
+    _SINGLE_INSTANCE_SERVER = None
+    if server is not None:
+        try:
+            server.close()
+        except Exception:  # pragma: no cover - shutdown remains best-effort.
+            logging.getLogger("tks_to_kintone_app").exception(
+                "event=update_single_instance_lock_release_failed"
+            )
+    QLocalServer.removeServer(f"{SETTINGS_ORG}.{SETTINGS_APP}.single-instance")
+
+
+def commit_update_shutdown() -> None:
+    """Make shutdown irreversible only after Setup produced this attempt's log."""
+    app = QApplication.instance()
+    if app is not None:
+        app.setProperty(UPDATE_SHUTDOWN_COMMITTED_PROPERTY, True)
+    release_single_instance_lock()
+    logging.getLogger("tks_to_kintone_app").info(
+        "event=update_shutdown_committed single_instance_lock_released=true"
+    )
+
+
 def quit_app_for_update() -> None:
     """更新インストーラ起動後に本体アプリを確実に終了する。
 
@@ -2589,20 +3934,47 @@ def quit_app_for_update() -> None:
     app = QApplication.instance()
     if app is None:
         return
+    commit_update_shutdown()
+    QSettings().sync()
     for widget in list(app.topLevelWidgets()):
         try:
             widget.close()
         except Exception:  # pragma: no cover - 終了処理は best-effort
             pass
+    logging.getLogger("tks_to_kintone_app").info(
+        "event=update_application_quit_requested method=QApplication.quit"
+    )
+    for handler in logging.getLogger().handlers + logging.getLogger(
+        "tks_to_kintone_app"
+    ).handlers:
+        try:
+            handler.flush()
+        except Exception:  # pragma: no cover - best-effort during shutdown
+            pass
     app.quit()
 
 
-def run_gui() -> int:
+def run_gui(*, post_update: bool = False) -> int:
+    global _SINGLE_INSTANCE_SERVER
+    apply_app_dpi_policy()
     app = QApplication([])
     app.setOrganizationName(SETTINGS_ORG)
     app.setApplicationName(SETTINGS_APP)
     app.setApplicationVersion(VERSION_NAME)
+    app.setProperty("post_update", post_update)
+    app.setProperty(UPDATE_SHUTDOWN_COMMITTED_PROPERTY, False)
     app.setWindowIcon(QIcon(str(resource_path("assets/app_icon.ico"))))
+    # The launcher performs its update check before any feature worker starts.
+    # Initialize the normal application log now so update diagnostics are persisted.
+    try:
+        startup_config = load_app_config()
+        setup_logger(startup_config.paths.log_dir)
+    except Exception as exc:  # noqa: BLE001 - logging must not prevent startup.
+        logging.getLogger("tks_to_kintone_app").warning(
+            "event=application_log_startup_failed error_type=%s", type(exc).__name__
+        )
+    from app.context_menu import install_japanese_context_menus
+    install_japanese_context_menus(app)
 
     instance_key = f"{SETTINGS_ORG}.{SETTINGS_APP}.single-instance"
     socket = QLocalSocket()
@@ -2619,6 +3991,7 @@ def run_gui() -> int:
         QLocalServer.removeServer(instance_key)
         if not server.listen(instance_key):
             return 1
+    _SINGLE_INSTANCE_SERVER = server
 
     settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
     # QSettings 側の既定値を補完する。config.env / 加工名マスタは load_app_config() で補完する。
@@ -2636,7 +4009,7 @@ def run_gui() -> int:
         window.activate_existing_instance()
 
     server.newConnection.connect(activate_existing_window)
-    app.aboutToQuit.connect(server.close)
+    app.aboutToQuit.connect(release_single_instance_lock)
     window.show()
     return app.exec()
 
@@ -2654,6 +4027,16 @@ def _latest_debug_file(work_dir: Path) -> Path | None:
     if not files:
         return None
     return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def _log_busy_event(event_type: str, **fields: object) -> None:
+    """処理中表示のログを残す（失敗しても本処理は止めない）。"""
+    try:
+        from app import voucher_print_service
+
+        voucher_print_service.log_voucher_print_event(event_type, **fields)
+    except Exception:  # noqa: BLE001 - ログ失敗で本処理を止めない
+        pass
 
 
 def _format_error_message(exc: Exception, log_file: Path, debug_file: Path | None) -> str:
@@ -2679,13 +4062,19 @@ def split_customer_match_keywords(value: str) -> list[str]:
     return [part for part in re.split(r"[,、\s　]+", str(value or "").strip()) if part]
 
 
+def normalize_customer_name(customer_name: str) -> str:
+    """得意先名称を自動判定用に正規化する（全半角差・前後空白を吸収）。"""
+    return unicodedata.normalize("NFKC", str(customer_name or "")).strip()
+
+
 def customer_key_from_name(customer_name: str, match_patterns: dict[str, str]) -> str:
     """得意先名称に合う得意先キーを、得意先1〜4の順で返す。"""
-    name = str(customer_name or "")
+    name = normalize_customer_name(customer_name)
     if not name:
         return DEFAULT_CUSTOMER_KEY
     for key in CUSTOMER_KEYS:
         for keyword in split_customer_match_keywords(match_patterns.get(key, "")):
+            keyword = normalize_customer_name(keyword)
             if keyword and keyword in name:
                 return key
     return DEFAULT_CUSTOMER_KEY
@@ -2934,6 +4323,13 @@ QPushButton:checked, QToolButton:checked {
 QPushButton:checked:hover, QToolButton:checked:hover {
   background: #00788f;
 }
+/* 押下アニメーション: 押した瞬間だけ暗く沈める（背景色のみ変更しレイアウトはズラさない）。 */
+QPushButton:pressed, QToolButton:pressed {
+  background: #17606e;
+}
+QPushButton:checked:pressed, QToolButton:checked:pressed {
+  background: #004c5c;
+}
 QPushButton:disabled, QToolButton:disabled {
   background: #9aa7b2;
   color: #f4f6f8;
@@ -3073,6 +4469,13 @@ QPushButton:checked, QToolButton:checked {
 }
 QPushButton:checked:hover, QToolButton:checked:hover {
   background: #ffbf2e;
+}
+/* 押下アニメーション: 押した瞬間だけ暗く沈める（背景色のみ変更しレイアウトはズラさない）。 */
+QPushButton:pressed, QToolButton:pressed {
+  background: #1f7d92;
+}
+QPushButton:checked:pressed, QToolButton:checked:pressed {
+  background: #d18f00;
 }
 QPushButton:disabled, QToolButton:disabled {
   background: #52606d;

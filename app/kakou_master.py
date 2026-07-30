@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,8 @@ KAKOU_MASTER_HEADERS = [
 
 CUSTOMER_KEYS = ["得意先1", "得意先2", "得意先3", "得意先4"]
 DEFAULT_MAKER_CODE = "MK"
+_MASTER_CACHE: dict[Path, tuple[int, list[dict[str, str]]]] = {}
+_MASTER_CACHE_LOCK = threading.RLock()
 
 
 class CsvEncodingError(ValueError):
@@ -56,6 +59,21 @@ def load_master(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as fp:
         reader = csv.DictReader(fp)
         return [{h: str(row.get(h, "") or "") for h in KAKOU_MASTER_HEADERS} for row in reader]
+
+
+def load_master_cached(path: Path) -> tuple[list[dict[str, str]], bool]:
+    """変更されていない加工名マスタをプロセス内で再利用する。"""
+    resolved = path.resolve()
+    if not resolved.exists():
+        return [], False
+    mtime_ns = resolved.stat().st_mtime_ns
+    with _MASTER_CACHE_LOCK:
+        cached = _MASTER_CACHE.get(resolved)
+        if cached is not None and cached[0] == mtime_ns:
+            return [dict(row) for row in cached[1]], True
+        rows = load_master(resolved)
+        _MASTER_CACHE[resolved] = (mtime_ns, [dict(row) for row in rows])
+        return rows, False
 
 
 def save_master(path: Path, rows: list[dict[str, str]]) -> None:

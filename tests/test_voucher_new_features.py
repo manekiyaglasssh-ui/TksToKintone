@@ -170,6 +170,7 @@ def _detail_page():
                 "qty": "2枚",
                 "unit_price": "800",
                 "amount": "3,846",
+                "op_category": "00",
                 "note_lines": [],
             },
         ],
@@ -1407,12 +1408,12 @@ class TestProcessLabelFont(unittest.TestCase):
         self.assertLess(baseline_off + ascender, item_h)
 
     def test_proc_labels_frame_unchanged(self) -> None:
-        """加工名一覧の外枠（項目数13・名前12/空白1）は維持されること（要件5）。"""
+        """加工名一覧の外枠13行と名称なし13枠目を維持すること。"""
         from app.voucher_templates import PROC_LABELS
 
-        # フィルム貼・Rとり 追加後も合計13行で枠は不変、名称は12・空白1。
+        # 合計13行の枠は不変。13枠目は従来どおり名称なし。
         self.assertEqual(len(PROC_LABELS), 13)
-        self.assertEqual(len([x for x in PROC_LABELS if x]), 12)
+        self.assertEqual(PROC_LABELS[-1], "")
         self.assertIn("フィルム貼", PROC_LABELS)
         self.assertIn("Rとり", PROC_LABELS)
 
@@ -1593,7 +1594,7 @@ class TestEditorTemplateEditDelete(unittest.TestCase):
             finally:
                 self._restore_home(prev)
 
-    def test_object_target_vouchers_replaced_with_standard_after_delete(self) -> None:
+    def test_object_target_vouchers_preserved_after_template_delete(self) -> None:
         from unittest import mock
         from PySide6.QtCore import QRectF
         from app import voucher_edit_window as vew
@@ -1611,8 +1612,8 @@ class TestEditorTemplateEditDelete(unittest.TestCase):
                 with mock.patch.object(vew.QMessageBox, "question",
                                        return_value=vew.QMessageBox.StandardButton.Yes):
                     win._delete_template("使用中")
-                # 削除テンプレートを使っていたオブジェクトは「標準」へ置き換わる（要件8）。
-                self.assertEqual(item.target_vouchers, ["03", "04", "05"])
+                # テンプレート削除だけでは既存オブジェクトの保存値を変更しない。
+                self.assertEqual(item.target_vouchers, ["03", "07"])
             finally:
                 self._restore_home(prev)
 
@@ -1774,15 +1775,20 @@ class TestTemplateLockAndDelete(unittest.TestCase):
         self.assertIn("標準", win._template_actions)
         self.assertIn("標準", {t["name"] for t in vet.load_templates()})
 
-    def test_locked_context_menu_not_shown(self) -> None:
+    def test_locked_context_menu_contains_default_action_only(self) -> None:
         from unittest import mock
         from app import voucher_edit_window as vew
 
         win = self._make_editor()
         with mock.patch.object(vew, "QMenu") as menu_cls:
             win._show_template_context_menu("標準", None)
-        # 固定テンプレートはメニューを生成しない（要件7）。
-        menu_cls.assert_not_called()
+        # 固定テンプレートでも一覧専用の既定設定と並び順リセットは利用できる。
+        menu_cls.assert_called_once_with(win)
+        texts = [call.args[0] for call in menu_cls.return_value.addAction.call_args_list]
+        self.assertIn("既定に設定", texts)
+        self.assertIn("反映先を既定順に戻す", texts)
+        self.assertNotIn("編集", texts)
+        self.assertNotIn("削除", texts)
 
 
 @unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")
@@ -1795,6 +1801,16 @@ class TestWindowFinishAndAmPmNone(unittest.TestCase):
         from app.voucher_window import VoucherWindow
 
         win = VoucherWindow(olap_login_id="id", olap_password="pw")
+        win._on_add_row()
+        input_row = getattr(win, "_new_input_row", None)
+        if input_row is not None:
+            logical_index = input_row.table_row_index
+            if logical_index >= 0:
+                win._table.removeRow(logical_index)
+            win._new_input_row = None
+            for row in win._rows:
+                if row.table_row_index > logical_index:
+                    row.table_row_index -= 1
         self.addCleanup(win.deleteLater)
         return win
 
@@ -1820,6 +1836,145 @@ class TestWindowFinishAndAmPmNone(unittest.TestCase):
         rw.finish_none_check.setChecked(True)
         row = win._collect_row(rw)
         self.assertIsNone(win._row_error_message(row))
+
+
+class _WidthCanvas:
+    """stringWidth を len(text)*size*k で近似するフェイクキャンバス。
+
+    フォント自動縮小（draw_text_fit_width）の挙動を検証するために使う。
+    drawString されたテキストとその時点のフォントサイズを記録する。
+    """
+
+    def __init__(self, k: float = 0.6) -> None:
+        self.k = k
+        self.drawn: list[tuple[float, str]] = []
+        self._size: float | None = None
+
+    def setFont(self, name, size, *a):
+        self._size = size
+
+    def stringWidth(self, text, font, size):
+        return len(text) * size * self.k
+
+    def drawString(self, x, y, text):
+        self.drawn.append((self._size, str(text)))
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
+class TestProductNameFitWidth(unittest.TestCase):
+    """品名（商品名称）をフォント縮小で全文字表示する変更のテスト。"""
+
+    BASE = 10.0
+    MIN = 5.0
+    MAX_W = 50.0
+
+    def _fit(self, text, k=0.6):
+        from app.voucher_service import draw_text_fit_width
+        c = _WidthCanvas(k=k)
+        fs = draw_text_fit_width(c, text, 0.0, 0.0, self.MAX_W,
+                                 "HeiseiKakuGo-W5", self.BASE, self.MIN)
+        return c, fs
+
+    def test_short_name_keeps_base_font(self) -> None:
+        """1. 通常サイズで収まる名称はそのまま base フォントで描く。"""
+        c, fs = self._fit("ABCDE")  # 5*10*0.6=30 <= 50
+        self.assertAlmostEqual(fs, self.BASE, places=4)
+        self.assertEqual(c.drawn[-1][1], "ABCDE")
+
+    def test_long_name_font_shrinks(self) -> None:
+        """3. 品名列幅を超える名称はフォントが自動縮小される。"""
+        c, fs = self._fit("A" * 12)  # 12*10*0.6=72 > 50
+        self.assertLess(fs, self.BASE)
+        # 縮小後の幅は max_width 以内に収まる。
+        self.assertLessEqual(len("A" * 12) * fs * c.k, self.MAX_W + 1e-6)
+
+    def test_very_long_name_drops_below_min_to_fit(self) -> None:
+        """min フォントでも収まらない長い名称は下限を割ってでも全文字表示する。"""
+        c, fs = self._fit("A" * 40)  # min(5)でも 40*5*0.6=120 > 50
+        self.assertLess(fs, self.MIN)
+        self.assertLessEqual(len("A" * 40) * fs * c.k, self.MAX_W + 1e-6)
+
+    def test_full_text_never_truncated(self) -> None:
+        """1. 長い名称でも文字列が切り捨てられない（全文字描画）。"""
+        text = "非常に長い商品名称ABCDEFGHIJKLMNOP" * 2
+        c, _ = self._fit(text)
+        self.assertEqual(c.drawn[-1][1], text)
+
+    def test_no_ellipsis_in_output(self) -> None:
+        """2. 省略記号「…」を使わない。"""
+        text = "長い商品名称" * 5
+        c, _ = self._fit(text)
+        self.assertNotIn("…", c.drawn[-1][1])
+        self.assertNotIn("...", c.drawn[-1][1])
+
+    def test_leading_and_consecutive_spaces_preserved(self) -> None:
+        """4. 先頭スペース・全角/連続スペースが維持される。"""
+        text = "　 先頭  全角　 連続スペース"  # 全角＋半角混在
+        c, _ = self._fit(text)
+        self.assertEqual(c.drawn[-1][1], text)
+
+    def test_str_name_does_not_clip(self) -> None:
+        """_str_name は _clip による途中切り捨てをせずフォント縮小で全文字描く。"""
+        from app import voucher_service as vs
+        c = _WidthCanvas(k=0.6)
+        text = "A" * 40
+        vs._str_name(c, text, 0.0, 0.0, self.BASE, max_w=self.MAX_W, min_fs=self.MIN)
+        self.assertEqual(c.drawn[-1][1], text)
+        self.assertLess(c.drawn[-1][0], self.BASE)
+
+    def test_star_row_name_unchanged(self) -> None:
+        """5. 商品名称が「*」の行は従来どおり（"*" を等倍で描画）。"""
+        from app import voucher_service as vs
+        c = _WidthCanvas(k=0.6)
+        vs._str_name(c, "*", 0.0, 0.0, self.BASE, max_w=self.MAX_W, min_fs=self.MIN)
+        self.assertEqual(c.drawn[-1][1], "*")
+        self.assertAlmostEqual(c.drawn[-1][0], self.BASE, places=4)
+
+    def test_empty_name_draws_nothing(self) -> None:
+        """空の品名は何も描かない（"*"空欄処理後の空文字含む）。"""
+        from app import voucher_service as vs
+        c = _WidthCanvas(k=0.6)
+        vs._str_name(c, "", 0.0, 0.0, self.BASE, max_w=self.MAX_W)
+        self.assertEqual(c.drawn, [])
+
+    def test_min_font_constant_defined(self) -> None:
+        from app import voucher_service as vs
+        self.assertTrue(hasattr(vs, "DETAIL_NAME_MIN_FONT_SIZE"))
+        self.assertLess(vs.DETAIL_NAME_MIN_FONT_SIZE, vs.DETAIL_NAME_FONT_SIZE)
+
+    def test_all_vouchers_build_with_long_name(self) -> None:
+        """6. 長い商品名称を含むデータで 01〜08 すべて PDF 生成できる。"""
+        from app.voucher_service import build_vouchers_pdf_bytes
+        from app.voucher_templates import VOUCHER_IDS
+        import io
+        import pypdf
+        from pathlib import Path
+
+        long_name = "  超長尺ガラス特注研磨スーパーミラーガード全周面取りエッジング仕上"
+        page = {
+            "code_no": "001",
+            "customer_name": "テスト得意先",
+            "order_no": "5218869",
+            "details": [
+                {
+                    "name": long_name,
+                    "dims": "（1303 * 1061 ミリ）",
+                    "qty_spec": "510中",
+                    "qty": "2枚",
+                    "unit_price": "800",
+                    "amount": "3,846",
+                    "note_lines": ["1,580 加"],
+                },
+            ],
+        }
+        result = build_vouchers_pdf_bytes(
+            list(VOUCHER_IDS), data=page,
+            base_dir=Path(__file__).resolve().parents[1])
+        self.assertTrue(result.startswith(b"%PDF"))
+        reader = pypdf.PdfReader(io.BytesIO(result))
+        self.assertEqual(len(reader.pages), len(VOUCHER_IDS))
 
 
 if __name__ == "__main__":

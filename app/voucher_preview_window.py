@@ -2,11 +2,11 @@
 
 PDFバイト列をメモリ上で受け取り、PyMuPDF（無ければ QPdfDocument）で各ページを
 画像化して縦並びに表示する。一時PDFファイルや正式PDFは一切保存しない。
-プレビュー画面の「印刷」ボタンからは、既存の印刷処理（プリンター選択ダイアログ）
-を同じPDFバイト列で呼び出す。
+プレビュー画面の「印刷」ボタンからは、保存済み印刷設定で即時印刷する。
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -15,11 +15,14 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
 )
+
+from app.window_geometry import clamp_window_to_available_geometry
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QWidget as _QWidget
@@ -36,14 +39,30 @@ _BASE_RENDER_ZOOM = 2.0  # 1.0倍表示時の基準レンダリング解像度�
 class VoucherPrintPreviewWindow(QWidget):
     """PDFバイト列をアプリ内で表示する印刷プレビュー画面。"""
 
-    def __init__(self, pdf_bytes: bytes, parent: "_QWidget | None" = None) -> None:
+    def __init__(
+        self, pdf_bytes: bytes, parent: "_QWidget | None" = None, *,
+        edit_render_trace_id: str = "", edit_objects_sha256: str = "",
+        preview_cache_hit: bool = False,
+    ) -> None:
         super().__init__(parent, Qt.WindowType.Window)
         self.pdf_bytes = bytes(pdf_bytes or b"")
+        self.edit_render_trace_id = str(edit_render_trace_id or "")
+        self.edit_objects_sha256 = str(edit_objects_sha256 or "")
+        self.pdf_sha256 = hashlib.sha256(self.pdf_bytes).hexdigest()
+        self.preview_cache_hit = bool(preview_cache_hit)
         self._zoom = 1.0
         self._page_labels: list[QLabel] = []
+        self._print_in_progress = False
+        self._print_workers: set[object] = set()
 
         self.setWindowTitle("印刷プレビュー")
-        self.resize(900, 1000)
+        clamp_window_to_available_geometry(
+            self,
+            desired_width=900,
+            desired_height=1000,
+            min_width=720,
+            min_height=560,
+        )
         self._build_ui()
         self._render_pages()
 
@@ -79,6 +98,11 @@ class VoucherPrintPreviewWindow(QWidget):
 
         root.addLayout(toolbar)
 
+        # 印刷状態はモーダルダイアログではなくステータスラベルへ表示する。
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("previewPrintStatusLabel")
+        root.addWidget(self.status_label)
+
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._pages_container = QWidget()
@@ -95,6 +119,13 @@ class VoucherPrintPreviewWindow(QWidget):
             label.deleteLater()
         self._page_labels = []
 
+        _LOGGER.info(
+            "event=voucher_preview_png_rasterize trace_id=%s pdf_sha256=%s "
+            "edit_objects_sha256=%s cache_hit=%s zoom=%s",
+            self.edit_render_trace_id, self.pdf_sha256,
+            self.edit_objects_sha256, self.preview_cache_hit,
+            _BASE_RENDER_ZOOM,
+        )
         self._base_pixmaps = self._build_base_pixmaps(self.pdf_bytes)
         if not self._base_pixmaps:
             placeholder = QLabel("プレビューを表示できませんでした。")
@@ -110,6 +141,13 @@ class VoucherPrintPreviewWindow(QWidget):
             self._pages_layout.addWidget(label)
             self._page_labels.append(label)
         self._apply_zoom()
+        _LOGGER.info(
+            "event=voucher_preview_pixmap_shown trace_id=%s pdf_sha256=%s "
+            "edit_objects_sha256=%s cache_hit=%s page_count=%s",
+            self.edit_render_trace_id, self.pdf_sha256,
+            self.edit_objects_sha256, self.preview_cache_hit,
+            len(self._base_pixmaps),
+        )
 
     @staticmethod
     def _build_base_pixmaps(pdf_bytes: bytes) -> list[QPixmap]:
@@ -130,15 +168,135 @@ class VoucherPrintPreviewWindow(QWidget):
         self.page_label.setText(f"{len(self._base_pixmaps)} ページ  {int(round(self._zoom * 100))}%")
 
     # ── 操作 ─────────────────────────────────────────────────────────────────
+    def _set_status(self, text: str) -> None:
+        """印刷状態をステータスラベルへ表示する（モーダルダイアログは出さない）。"""
+        self.status_label.setText(text)
+
     def _on_print(self) -> None:
         from app import voucher_print_service
 
+        voucher_print_service.log_preview_print_event("preview_print_clicked")
+        # 印刷要求送信前の連打のみ抑止する。
+        if self._print_in_progress:
+            self._set_status("印刷処理中です")
+            return
         try:
-            voucher_print_service.print_pdf_with_dialog(self.pdf_bytes, self)
-        except Exception as exc:  # 印刷失敗はプレビューを閉じずに通知する。
-            from PySide6.QtWidgets import QMessageBox
+            from app.voucher_settings import (
+                PRINT_BACKEND_ACROBAT,
+                PRINT_BACKEND_SUMATRA,
+                load_voucher_printer_settings,
+            )
 
-            QMessageBox.critical(self, "印刷エラー", f"印刷中にエラーが発生しました:\n{exc}")
+            settings = load_voucher_printer_settings()
+
+            self._print_in_progress = True
+            self.print_button.setEnabled(False)
+            voucher_print_service.log_preview_print_event("preview_print_button_disabled")
+            self._set_status("印刷要求を送信中...")
+
+            if settings.print_backend not in (PRINT_BACKEND_ACROBAT, PRINT_BACKEND_SUMATRA):
+                voucher_print_service.print_pdf_direct(self.pdf_bytes, self)
+                self._print_in_progress = False
+                self.print_button.setEnabled(True)
+                voucher_print_service.log_preview_print_event("preview_print_button_enabled")
+                self._set_status("印刷要求を送信しました")
+                return
+
+            def _status_for(event: str, message: str = "") -> str:
+                if settings.print_backend == PRINT_BACKEND_ACROBAT:
+                    return {
+                        "enqueued": "Acrobat Reader印刷ジョブを登録しました",
+                        "request_sent": "Acrobat Readerへ印刷要求を送信しました",
+                        "finished": "Acrobat Reader印刷処理完了",
+                        "error": f"Acrobat Reader印刷でエラーが発生しました: {message}",
+                    }[event]
+                return {
+                    "enqueued": "SumatraPDF印刷ジョブを登録しました",
+                    "request_sent": "SumatraPDFへ印刷要求を送信しました",
+                    "finished": "SumatraPDF印刷処理完了",
+                    "error": f"SumatraPDF印刷でエラーが発生しました: {message}",
+                }[event]
+
+            worker = voucher_print_service.start_print_pdf_background(
+                self.pdf_bytes,
+                self,
+                job_name="preview",
+                source_type="preview",
+                selected_count=1,
+                generated_pdf_count=1,
+                merged_pdf_created=False,
+            )
+            voucher_print_service.log_preview_print_event("preview_print_worker_started")
+            if worker is None:
+                self._print_in_progress = False
+                self.print_button.setEnabled(True)
+                voucher_print_service.log_preview_print_event("preview_print_button_enabled")
+                self._set_status(_status_for("request_sent"))
+                return
+            self._print_workers.add(worker)
+
+            def _on_status_changed(message: str) -> None:
+                self._set_status(message)
+
+            def _on_request_sent(_payload: dict) -> None:
+                # Popen成功＝印刷要求送信済み。終了確認は裏で継続するが、
+                # ここで印刷中ガードを解除し次の印刷を止めない。
+                self._print_in_progress = False
+                self.print_button.setEnabled(True)
+                voucher_print_service.log_preview_print_event("preview_print_request_sent_signal")
+                voucher_print_service.log_preview_print_event("preview_print_button_enabled")
+                self._set_status(_status_for("request_sent"))
+
+            def _on_finished(_payload: dict) -> None:
+                self._print_workers.discard(worker)
+                self._print_in_progress = False
+                self.print_button.setEnabled(True)
+                voucher_print_service.log_preview_print_event("preview_print_finished_signal")
+                self._set_status(_status_for("finished"))
+
+            def _on_error(message: str, _payload: dict) -> None:
+                # Popen前エラー（request_sent が来ない）でも error signal で必ず復帰させる。
+                self._print_workers.discard(worker)
+                self._print_in_progress = False
+                self.print_button.setEnabled(True)
+                voucher_print_service.log_preview_print_event(
+                    "preview_print_failed_signal", error=str(message)
+                )
+                voucher_print_service.log_print_recovery_event(
+                    "ui_error_received",
+                    trigger="error",
+                    source="preview",
+                    ui_error_received=True,
+                    ui_print_guard_released=True,
+                    ui_button_enabled=True,
+                    error_message=str(message),
+                )
+                # モーダルダイアログを出すとプレビューが固まるため、ステータス表示のみ。
+                self._set_status(_status_for("error", str(message)))
+
+            worker.status_changed.connect(_on_status_changed)
+            worker.request_sent.connect(_on_request_sent)
+            worker.finished.connect(_on_finished)
+            worker.error.connect(_on_error)
+            self._print_in_progress = False
+            self.print_button.setEnabled(True)
+            voucher_print_service.log_preview_print_event("preview_print_job_enqueued")
+            self._set_status(_status_for("enqueued"))
+        except Exception as exc:  # 印刷失敗はプレビューを閉じずにステータス表示のみで通知する。
+            self._print_in_progress = False
+            self.print_button.setEnabled(True)
+            voucher_print_service.log_preview_print_event(
+                "preview_print_failed_signal", error=str(exc)
+            )
+            self._set_status(f"印刷失敗: {exc}")
+
+    def closeEvent(self, event) -> None:
+        for worker in list(getattr(self, "_print_workers", set())):
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+        super().closeEvent(event)
 
     def _on_zoom_in(self) -> None:
         self._set_zoom(self._zoom + _ZOOM_STEP)

@@ -45,15 +45,22 @@ from app.config import (
     user_config_path,
 )
 from app.credential_store import (
+    load_update_debug_kintone_api_token,
     load_saved_credentials,
     save_kintone_credentials,
     save_olap_credentials,
+    save_update_debug_kintone_api_token,
 )
 from app.build_features import updates_enabled
 from app.kintone_client import KintoneClient
 from app.models import RunInput
 from app.tks_client import create_tks_client
 from app.theme_utils import apply_windows_title_bar_theme, current_title_bar_is_dark
+from app.update_kintone_config import (
+    SETTINGS_UPDATE_DEBUG_KINTONE_APP_ID,
+    normalize_update_kintone_api_token,
+    normalize_update_kintone_app_id,
+)
 from app.version import VERSION_CODE, VERSION_NAME
 
 _LOGGER = logging.getLogger("tks_to_kintone_app")
@@ -91,6 +98,13 @@ def _update_client_module():
     return importlib.import_module("app." + "update_client")
 
 
+def _run_update_and_quit(parent: QWidget, info: object) -> None:
+    """Start the controller; it alone commits shutdown after launch confirmation."""
+    from app.update_progress import start_update
+
+    start_update(parent, info, Path(sys.executable).resolve())
+
+
 class LauncherSettingsDialog(QDialog):
     """機能選択画面から開くアプリ共通設定。"""
 
@@ -116,9 +130,37 @@ class LauncherSettingsDialog(QDialog):
         self.debug_visible.toggled.connect(self._on_debug_visible_toggled)
         _LOGGER.info("debug_visible loaded=%s", _checked)
 
+        self.update_kintone_app_id = QLineEdit(
+            str(settings.value(SETTINGS_UPDATE_DEBUG_KINTONE_APP_ID, "") or "")
+        )
+        self.update_kintone_app_id.setPlaceholderText("未設定時は本番（250）")
+        self.update_kintone_api_token = QLineEdit(
+            load_update_debug_kintone_api_token()
+        )
+        self.update_kintone_api_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.update_kintone_api_token.setPlaceholderText(
+            "未設定時は本番用トークン"
+        )
+        self.show_update_kintone_api_token = QCheckBox("APIトークンを表示")
+        self.show_update_kintone_api_token.toggled.connect(
+            self._set_update_kintone_api_token_visible
+        )
+
         form = QFormLayout()
         form.addRow("テーマカラー", self.theme)
         form.addRow("デバッグ表示", self.debug_visible)
+
+        self.update_kintone_group = QGroupBox("更新確認先（デバッグ）")
+        update_kintone_form = QFormLayout()
+        update_kintone_form.addRow(
+            "KintoneアプリID", self.update_kintone_app_id
+        )
+        update_kintone_form.addRow(
+            "Kintone APIトークン", self.update_kintone_api_token
+        )
+        update_kintone_form.addRow("", self.show_update_kintone_api_token)
+        self.update_kintone_group.setLayout(update_kintone_form)
+        self.update_kintone_group.setVisible(bool(_checked))
 
         version = QGroupBox("バージョン情報")
         version_form = QFormLayout()
@@ -137,18 +179,26 @@ class LauncherSettingsDialog(QDialog):
 
         root = QVBoxLayout()
         root.addLayout(form)
+        root.addWidget(self.update_kintone_group)
         root.addWidget(version)
         root.addStretch(1)
         root.addWidget(buttons)
         self.setLayout(root)
         self.update_button.clicked.connect(self.check_update)
 
+    def _set_update_kintone_api_token_visible(self, visible: bool) -> None:
+        self.update_kintone_api_token.setEchoMode(
+            QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        )
+
     def _on_debug_visible_toggled(self, checked: bool) -> None:
         if self._prompting_debug_password:
             return
         if not checked:
+            self.update_kintone_group.setVisible(False)
             return
         if self._initial_debug_visible:
+            self.update_kintone_group.setVisible(True)
             return
         password, ok = QInputDialog.getText(
             self,
@@ -157,12 +207,14 @@ class LauncherSettingsDialog(QDialog):
             QLineEdit.EchoMode.Password,
         )
         if ok and password == _DEBUG_VISIBLE_PASSWORD:
+            self.update_kintone_group.setVisible(True)
             return
         self._prompting_debug_password = True
         try:
             self.debug_visible.setChecked(False)
         finally:
             self._prompting_debug_password = False
+            self.update_kintone_group.setVisible(False)
 
     def check_update(self) -> None:
         if not updates_enabled():
@@ -192,29 +244,7 @@ class LauncherSettingsDialog(QDialog):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        try:
-            update_client = _update_client_module()
-            launch_external_update = update_client.launch_external_update
-            default_update_dir = update_client.default_update_dir
-            started = launch_external_update(
-                info,
-                default_update_dir(),
-                Path(sys.executable).resolve(),
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "更新失敗", str(exc))
-            return
-        if not started:
-            QMessageBox.warning(
-                self,
-                "更新失敗",
-                "更新インストーラを起動できませんでした。\n"
-                "ログフォルダの update_installer.log を確認してください。",
-            )
-            return
-        from app.gui import quit_app_for_update
-
-        quit_app_for_update()
+        _run_update_and_quit(self, info)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -223,6 +253,30 @@ class LauncherSettingsDialog(QDialog):
     def accept(self) -> None:
         self.settings.setValue(_SETTINGS_THEME, self.theme.currentData())
         checked = self.debug_visible.isChecked()
+        if checked:
+            try:
+                update_app_id = normalize_update_kintone_app_id(
+                    self.update_kintone_app_id.text()
+                )
+                update_api_token = normalize_update_kintone_api_token(
+                    self.update_kintone_api_token.text()
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "設定エラー", str(exc))
+                return
+            if bool(update_app_id) != bool(update_api_token):
+                QMessageBox.warning(
+                    self,
+                    "設定エラー",
+                    "更新確認先を変更する場合は、KintoneアプリIDと"
+                    "APIトークンの両方を入力してください。",
+                )
+                return
+            self.settings.setValue(
+                SETTINGS_UPDATE_DEBUG_KINTONE_APP_ID, update_app_id
+            )
+            save_update_debug_kintone_api_token(update_api_token)
+
         self.settings.setValue(_SETTINGS_DEBUG_VISIBLE, "1" if checked else "0")
         self.settings.sync()
         try:
@@ -239,14 +293,18 @@ class LauncherWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        app = QApplication.instance()
+        post_update = bool(app and app.property("post_update"))
         self.setWindowTitle(f"TKS OLAP to kintone {VERSION_NAME}")
         self.setWindowIcon(QIcon(str(resource_path("assets/app_icon.ico"))))
         self.resize(420, 380)
 
         self._main_window: object | None = None
         self._voucher_window: object | None = None
+        self._capture_window: object | None = None
         self._closing = False
-        self._update_checked = False
+        # A post-update relaunch must not immediately enter the update-check loop again.
+        self._update_checked = post_update
         self._update_check_thread: _UpdateCheckThread | None = None
         self._settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         self._base_dir = default_base_dir()
@@ -278,6 +336,13 @@ class LauncherWindow(QMainWindow):
         self._open_config_btn = QPushButton("設定フォルダを開く")
         self._open_log_btn = QPushButton("ログフォルダを開く")
         self._open_work_btn = QPushButton("workフォルダを開く")
+        # TKS受注No取込（小画面の起動ボタン）。デバッグ表示ON/OFFに関わらず常に表示する（要件5）。
+        # 設定（歯車）ボタンの左隣にコンパクト表示する（要件2）。
+        self._tks_capture_btn = QPushButton("TKS取込")
+        self._tks_capture_btn.setToolTip("TKS受注No取込")
+        self._tks_capture_btn.setAccessibleName("TKS受注No取込")
+        self._tks_capture_btn.setMinimumHeight(40)
+        self._tks_capture_btn.setStyleSheet("QPushButton { font-size: 12px; padding: 4px 10px; }")
 
         self._apply_saved_theme()
         self._build_layout()
@@ -294,7 +359,22 @@ class LauncherWindow(QMainWindow):
         self._open_config_btn.clicked.connect(lambda: self.open_folder("config"))
         self._open_log_btn.clicked.connect(lambda: self.open_folder("log"))
         self._open_work_btn.clicked.connect(lambda: self.open_folder("work"))
+        self._tks_capture_btn.clicked.connect(self._open_tks_capture)
         self._apply_debug_visibility()
+        if post_update:
+            QTimer.singleShot(0, self._show_post_update_status)
+
+    def _show_post_update_status(self) -> None:
+        _LOGGER.info(
+            "event=update_relaunch_completed version=%s version_code=%s",
+            VERSION_NAME,
+            VERSION_CODE,
+        )
+        QMessageBox.information(
+            self,
+            "アップデート完了",
+            f"TksToKintoneを更新しました。\nバージョン {VERSION_NAME}",
+        )
 
     def _build_layout(self) -> None:
         olap_group = QGroupBox("OLAPアカウント")
@@ -318,8 +398,10 @@ class LauncherWindow(QMainWindow):
         folder_row.addWidget(self._open_log_btn)
         folder_row.addWidget(self._open_work_btn)
 
+        # 「TKS受注No取込」は設定（歯車）ボタンの左隣にコンパクト表示する（要件2）。
         top_row = QHBoxLayout()
         top_row.addStretch(1)
+        top_row.addWidget(self._tks_capture_btn)
         top_row.addWidget(self._settings_btn)
 
         root = QVBoxLayout()
@@ -394,31 +476,7 @@ class LauncherWindow(QMainWindow):
         # ユーザーが「はい（更新する）」を選んだ場合だけ更新インストーラを開始する。
         if answer != QMessageBox.StandardButton.Yes:
             return
-        try:
-            update_client = _update_client_module()
-            launch_external_update = update_client.launch_external_update
-            default_update_dir = update_client.default_update_dir
-            started = launch_external_update(
-                info,
-                default_update_dir(),
-                Path(sys.executable).resolve(),
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "更新失敗", str(exc))
-            return
-        if not started:
-            # インストーラ起動失敗を握りつぶさない。本体は終了せず、原因を案内する。
-            QMessageBox.warning(
-                self,
-                "更新失敗",
-                "更新インストーラを起動できませんでした。\n"
-                "ログフォルダの update_installer.log を確認してください。",
-            )
-            return
-        # インストーラ起動が成功したので本体を速やかに終了する。
-        from app.gui import quit_app_for_update
-
-        quit_app_for_update()
+        _run_update_and_quit(self, info)
 
     def _apply_saved_theme(self) -> None:
         from app.gui import apply_theme
@@ -439,6 +497,8 @@ class LauncherWindow(QMainWindow):
         self._open_config_btn.setVisible(visible)
         self._open_log_btn.setVisible(visible)
         self._open_work_btn.setVisible(visible)
+        # TKS受注No取込ボタンはデバッグ表示ON/OFFに関わらず常に表示する（要件5）。
+        self._tks_capture_btn.setVisible(True)
         _LOGGER.info("launcher folder buttons visible=%s", visible)
 
     def open_folder(self, target: str) -> None:
@@ -518,14 +578,97 @@ class LauncherWindow(QMainWindow):
         self._voucher_btn.setEnabled(olap_ok and self._voucher_window is None)
         self._kintone_btn.setEnabled(kintone_ok and self._main_window is None)
 
+    def _open_tks_capture(self) -> None:
+        """TKS受注No取込の小画面を開く。複数起動せず、既存があれば取込画面だけ前面化する。
+
+        取込画面はトップレベルの独立ウィンドウ（parent=None）とし、機能選択画面（自分）は
+        前面化しない。既存があるときも取込画面だけを raise_/activateWindow する。
+        """
+        if self._capture_window is not None:
+            self._capture_window.showNormal()
+            self._capture_window.show()
+            self._capture_window.raise_()
+            self._capture_window.activateWindow()
+            return
+        from app.tks_order_capture_window import TksOrderCaptureWindow
+
+        # Qt の親子関係は作らず、Python 参照としてのみ保持する（親の前面化に引きずられない）。
+        win = TksOrderCaptureWindow(
+            # 開いている伝票作成・印刷画面を都度参照する（未起動なら None）。
+            voucher_window_provider=lambda: self._voucher_window,
+        )
+        win.closed.connect(self._on_tks_capture_closed)
+        self._capture_window = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _on_tks_capture_closed(self, *_args: object) -> None:
+        """TKS受注No取込の小画面が閉じられたときに参照を解放する。"""
+        self._capture_window = None
+
+    def _refresh_capture_voucher_state(self) -> None:
+        """伝票画面の開閉に合わせて小画面の「伝票一覧に追加」ボタン状態を更新する。"""
+        win = self._capture_window
+        if win is not None and hasattr(win, "refresh_voucher_state"):
+            win.refresh_voucher_state()
+
     def _open_voucher(self) -> None:
+        import time
+
+        _LOGGER.info("launcher_voucher_button_clicked")
+        # 既に開いている場合は新規生成せず既存ウィンドウを前面へ出す（多重起動防止・要件4）。
         if self._voucher_window is not None:
-            self._voucher_window.show()
+            if hasattr(self._voucher_window, "isVisible") and not self._voucher_window.isVisible():
+                self._voucher_window.show()
             self._voucher_window.raise_()
+            if hasattr(self._voucher_window, "activateWindow"):
+                self._voucher_window.activateWindow()
             return
-        if not self._authorize_olap():
+        # 画面生成中は二重押下を防ぐためボタンを無効化する。
+        self._voucher_btn.setEnabled(False)
+        total_started = time.perf_counter()
+        _LOGGER.info("launcher_voucher_open_started")
+        try:
+            # OLAP認証は画面を開く前に行う（既存仕様・要件1）。認証は起動遅延の主因では
+            # なかったため元に戻したが、所要時間を計測して重い場合はログで特定できるようにする。
+            _auth_start = time.perf_counter()
+            _LOGGER.info("launcher_voucher_auth_started")
+            authorized = self._authorize_olap()
+            _auth_ms = int((time.perf_counter() - _auth_start) * 1000)
+            _LOGGER.info("launcher_voucher_auth_finished %s", {"authorized": authorized})
+            _LOGGER.info("launcher_voucher_auth_elapsed_ms %s", {"elapsed_ms": _auth_ms})
+            if _auth_ms >= 1000:
+                _LOGGER.warning(
+                    "launcher_voucher_slow_step_detected %s",
+                    {"step": "auth", "elapsed_ms": _auth_ms},
+                )
+            if not authorized:
+                # 認証失敗時はボタンを再度押せる状態へ戻す（既存仕様）。
+                self._update_buttons()
+                return
+            self._launch_voucher_window()
+            total_ms = int((time.perf_counter() - total_started) * 1000)
+            _LOGGER.info("launcher_voucher_open_finished %s", {"elapsed_ms": total_ms})
+            _LOGGER.info("launcher_voucher_open_total_elapsed_ms %s", {"elapsed_ms": total_ms})
+            if total_ms >= 1000:
+                _LOGGER.warning(
+                    "launcher_voucher_slow_step_detected %s",
+                    {"step": "open_total", "elapsed_ms": total_ms},
+                )
+        except Exception:
+            # 例外を握りつぶさず、ログと画面メッセージに出し、ボタンを再押下可能に戻す（要件4）。
+            _LOGGER.exception("launcher_voucher_open_failed")
+            self._voucher_window = None
+            QMessageBox.warning(
+                self,
+                "エラー",
+                "伝票作成・印刷画面を開けませんでした。ログを確認してください。",
+            )
+            self._update_buttons()
             return
-        self._launch_voucher_window()
+        # 生成成功。ボタン状態は _update_buttons が _voucher_window の有無で制御する。
+        self._update_buttons()
 
     def _open_kintone(self) -> None:
         if self._main_window is not None:
@@ -603,23 +746,62 @@ class LauncherWindow(QMainWindow):
         return True
 
     def _launch_voucher_window(self) -> None:
+        import time
+
+        _import_start = time.perf_counter()
+        _LOGGER.info("launcher_voucher_import_started")
+        _LOGGER.info("voucher_window_import_started")
         from app.voucher_window import VoucherWindow
 
+        _import_ms = int((time.perf_counter() - _import_start) * 1000)
+        _LOGGER.info("voucher_window_import_finished %s", {"elapsed_ms": _import_ms})
+        _LOGGER.info("launcher_voucher_import_finished %s", {"elapsed_ms": _import_ms})
+        _LOGGER.info("launcher_voucher_import_elapsed_ms %s", {"elapsed_ms": _import_ms})
+        if _import_ms >= 1000:
+            _LOGGER.warning(
+                "launcher_voucher_slow_step_detected %s",
+                {"step": "import", "elapsed_ms": _import_ms},
+            )
+
+        _construct_start = time.perf_counter()
+        _LOGGER.info("launcher_voucher_construct_started")
         win = VoucherWindow(
             olap_login_id=self._olap_id.text().strip(),
             olap_password=self._olap_password.text(),
             # 伝票画面から都度ランチャー保持のKintone登録処理画面を参照できるようにする。
             kintone_window_provider=lambda: self._main_window,
         )
+        _construct_ms = int((time.perf_counter() - _construct_start) * 1000)
+        _LOGGER.info("launcher_voucher_construct_finished %s", {"elapsed_ms": _construct_ms})
+        _LOGGER.info("launcher_voucher_construct_elapsed_ms %s", {"elapsed_ms": _construct_ms})
+        if _construct_ms >= 1000:
+            _LOGGER.warning(
+                "launcher_voucher_slow_step_detected %s",
+                {"step": "construct", "elapsed_ms": _construct_ms},
+            )
         win.back_requested.connect(self._on_voucher_closed)
+        # 生成した VoucherWindow の参照を保持し、すぐ破棄されないようにする（要件4）。
         self._voucher_window = win
+        _LOGGER.info("launcher_voucher_window_reference_stored")
         self._update_credential_locks()
         self._update_buttons()
         # Kintone登録処理画面が既に開いている場合は受注No変更シグナルを接続し、
         # 現在の起動状態を反映する（要件3・6）。
         self._connect_kintone_voucher_sync()
         self._notify_voucher_kintone_state()
+        # TKS受注No取込の小画面が開いていれば「伝票一覧に追加」ボタンを有効化する。
+        self._refresh_capture_voucher_state()
+        _show_start = time.perf_counter()
+        _LOGGER.info("launcher_voucher_show_started")
         win.show()
+        _show_ms = int((time.perf_counter() - _show_start) * 1000)
+        _LOGGER.info("launcher_voucher_show_finished %s", {"elapsed_ms": _show_ms})
+        _LOGGER.info("launcher_voucher_show_elapsed_ms %s", {"elapsed_ms": _show_ms})
+        if _show_ms >= 1000:
+            _LOGGER.warning(
+                "launcher_voucher_slow_step_detected %s",
+                {"step": "show", "elapsed_ms": _show_ms},
+            )
 
     def _launch_kintone_window(self) -> None:
         from app.gui import MainWindow, apply_theme, SETTINGS_THEME, THEME_SYSTEM
@@ -699,6 +881,8 @@ class LauncherWindow(QMainWindow):
         self._disconnect_kintone_voucher_sync()
         self._voucher_window = None
         self._update_credential_locks()
+        # 伝票画面が閉じたので小画面の「伝票一覧に追加」ボタンを無効化する。
+        self._refresh_capture_voucher_state()
         self._bring_launcher_front()
 
     def _on_kintone_closed(self, *_args: object) -> None:
@@ -715,9 +899,9 @@ class LauncherWindow(QMainWindow):
         """入口画面を閉じたら子画面も閉じてアプリ全体を終了する。"""
         self._closing = True
         if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            self._update_check_thread.requestInterruption()
             self._update_check_thread.quit()
-            self._update_check_thread.wait(1000)
-        for win in (self._voucher_window, self._main_window):
+        for win in (self._voucher_window, self._main_window, self._capture_window):
             if win is not None and hasattr(win, "close"):
                 win.close()
         QApplication.quit()

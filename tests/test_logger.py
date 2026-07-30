@@ -4,10 +4,21 @@ import time
 import unittest
 from pathlib import Path
 
-from app.logger import cleanup_old_logs
+from app.logger import cleanup_old_logs, setup_logger
 
 
 class LoggerCleanupTest(unittest.TestCase):
+    def test_setup_logs_actual_application_log_path(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger, log_file = setup_logger(Path(temp_dir))
+            for handler in logger.handlers:
+                handler.flush()
+            content = log_file.read_text(encoding="utf-8")
+            self.assertIn("event=application_log_ready", content)
+            self.assertIn(str(log_file.resolve()), content)
+
     def test_cleanup_old_logs_deletes_only_expired_app_logs(self) -> None:
         import tempfile
 

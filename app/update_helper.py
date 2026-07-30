@@ -27,7 +27,7 @@ POLL_INTERVAL_SECONDS = 0.5
 # 親プロセスが終了しないまま放置されても無限ループしないための上限。
 PARENT_WAIT_TIMEOUT_SECONDS = 60
 # Inno Setup のサイレントインストール引数。権限昇格はインストーラ側に任せる。
-INSTALLER_SILENT_ARGS = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]
+INSTALLER_SILENT_ARGS = ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]
 # 通常起動（インストーラ画面を表示する）。DeepInstinct 確認やテスト時に使う。
 INSTALLER_NORMAL_ARGS: list[str] = []
 # ヘルパーログの保存先（本体アプリのログとは別ファイルにする）。

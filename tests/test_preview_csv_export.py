@@ -22,6 +22,7 @@ from app.csv_processor import (
     export_registration_records_to_csv,
     unique_timestamp_csv_path,
 )
+from app.csv_column_settings import CsvColumnSetting, STANDARD_CSV_COLUMNS, save_csv_column_settings
 
 try:
     from PySide6.QtCore import QDate, QSettings
@@ -214,6 +215,22 @@ class PreviewCsvExportDialogTest(unittest.TestCase):
         dlg = self._dialog([_row("1000")])
         path = self._create_csv(dlg)
         self.assertTrue(path.read_bytes().startswith(b"\xef\xbb\xbf"))
+
+    def test_saved_column_order_and_visibility_control_dialog_csv(self) -> None:
+        """確認画面のCSV作成がQSettingsの列順・出力対象を使用する。"""
+        settings = [CsvColumnSetting("product_name", True), CsvColumnSetting("order_no", True)]
+        settings.extend(
+            CsvColumnSetting(column.key, False)
+            for column in STANDARD_CSV_COLUMNS
+            if column.key not in {"product_name", "order_no"}
+        )
+        save_csv_column_settings(QSettings("Manekiya", "TksToKintone"), settings)
+        dlg = self._dialog([_row("1000")])
+        path = self._create_csv(dlg)
+        with path.open(encoding="utf-8-sig", newline="") as fp:
+            csv_rows = list(csv.reader(fp))
+        self.assertEqual(csv_rows[0], ["商品名称", "受注No"])
+        self.assertEqual(csv_rows[1], ["品", "1000"])
 
     def test_all_rows_output_even_when_filtered(self) -> None:
         """絞り込み中でも非表示行を含めて全件出力される。"""

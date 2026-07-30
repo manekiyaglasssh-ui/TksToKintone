@@ -32,6 +32,52 @@ def get_voucher_edit_objects_dir() -> Path:
     return get_app_data_dir() / "work" / "voucher_edit_objects"
 
 
+def get_test_print_dir() -> Path:
+    """テスト印刷用の一時PDFを置くディレクトリ（work配下）。"""
+    return get_app_data_dir() / "work" / "test_print"
+
+
+def cleanup_old_test_print_pdfs(max_keep: int = 5) -> None:
+    """古いテスト印刷用一時PDF（test_print_*.pdf）を掃除する。
+
+    直近 max_keep 件だけ残し、それ以外は削除する。失敗しても致命的でないため
+    例外は握りつぶす（掃除は best-effort）。
+    """
+    directory = get_test_print_dir()
+    try:
+        pdfs = sorted(
+            directory.glob("test_print_*.pdf"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for stale in pdfs[max(0, max_keep):]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def get_captured_order_numbers_path() -> Path:
+    """TKS受注No取込で保管する受注NoのJSON保存先（work配下）。"""
+    return get_app_data_dir() / "work" / "captured_order_numbers.json"
+
+
+def get_order_capture_debug_dir() -> Path:
+    """TKS受注No取込の診断JSON（デバッグ時のみ）の保存ディレクトリ（work配下）。"""
+    return get_app_data_dir() / "work" / "debug"
+
+
+def get_comtypes_gen_dir() -> Path:
+    """comtypes が COM ラッパを生成する書き込み可能ディレクトリ（work配下）。
+
+    EXE配布ではパッケージ内 comtypes.gen が読み取り専用になり GetModule が失敗するため、
+    ProgramData 配下の書き込み可能パスへ明示的に向ける。
+    """
+    return get_app_data_dir() / "work" / "comtypes_gen"
+
+
 def get_default_voucher_output_dir(base_dir: Path | None = None) -> Path:
     """Return the default voucher PDF output directory.
 

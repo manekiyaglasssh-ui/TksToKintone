@@ -234,10 +234,13 @@ class TestVoucherEditFreehand(unittest.TestCase):
         from app.voucher_edit_window import TOOL_RECT
 
         win = self._make_window()
-        # 通常ツールバーには従来どおりのツールがある。
+        # 通常ツールバーには従来どおりのツールがある（図形は「図形」メニューへ統合・要件5）。
         labels = [a.text() for a in win._main_toolbar.actions()]
-        for t in ("選択", "テキスト", "線", "四角", "丸"):
+        for t in ("選択", "テキスト"):
             self.assertIn(t, labels)
+        shape_labels = [a.text() for a in win._shape_menu.actions()]
+        for t in ("線", "四角", "丸"):
+            self.assertIn(t, shape_labels)
         # 既存の図形追加が動作する。
         win.set_tool(TOOL_RECT)
         win.add_rect(QRectF(10, 10, 40, 30))

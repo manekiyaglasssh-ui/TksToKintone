@@ -21,6 +21,7 @@ if _QT_AVAILABLE:
         PREVIEW_ROW_HEADERS,
         KakouTypeEdit,
         RegistrationPreviewDialog,
+        _COL_KAKOU,
         _COL_KAKURITSU_CODE,
         _COL_ORDER_NO,
         _COL_PRODUCT,
@@ -82,7 +83,10 @@ class PreviewColumnTest(unittest.TestCase):
                     dlg.table.columnWidth(c) for c in range(dlg.table.columnCount())
                 )
                 self.assertGreater(total, 1000)
-                self.assertGreaterEqual(dlg.width(), 1200)
+                screen = dlg.screen() or QApplication.primaryScreen()
+                if screen is not None:
+                    self.assertLessEqual(dlg.width(), screen.availableGeometry().width())
+                self.assertGreaterEqual(dlg.width(), min(760, total))
             finally:
                 dlg.deleteLater()
 
@@ -114,16 +118,167 @@ class PreviewColumnTest(unittest.TestCase):
             dlg.deleteLater()
 
     def test_dialog_width_widened(self) -> None:
-        """登録前確認画面の初期幅・最小幅が拡張されている（要件8）。"""
+        """登録前確認画面は画面外にはみ出さない範囲で広く表示する。"""
         dlg = RegistrationPreviewDialog(
             rows=[_row("1000", "2", "品")], master=[], shukka_options=[],
             customer_labels={},
         )
         try:
-            self.assertGreaterEqual(dlg.width(), 1650)
-            self.assertGreaterEqual(dlg.minimumWidth(), 1500)
+            screen = dlg.screen() or QApplication.primaryScreen()
+            available_width = dlg.width()
+            if screen is not None:
+                available = screen.availableGeometry()
+                available_width = available.width()
+                self.assertLessEqual(dlg.width(), available.width())
+                self.assertLessEqual(dlg.minimumWidth(), available.width())
+            self.assertGreaterEqual(dlg.minimumWidth(), min(760, available_width))
             # 右端の未登録警告列も列順の末尾にある。
             self.assertEqual(_COL_WARNING, dlg.table.columnCount() - 1)
+        finally:
+            dlg.deleteLater()
+
+    def test_confirm_window_height_reduced(self) -> None:
+        """登録前確認画面の初期高さが従来（700px）より約1.5cm狭い（要件1）。"""
+        dlg = RegistrationPreviewDialog(
+            rows=[_row("1000", "2", "品")], master=[], shukka_options=[],
+            customer_labels={},
+        )
+        try:
+            screen = dlg.screen() or QApplication.primaryScreen()
+            # 従来の初期高さ700pxより明確に小さい（画面が十分広ければ約55px減）。
+            self.assertLess(dlg.height(), 700)
+            if screen is not None:
+                available = screen.availableGeometry()
+                # 125%相当（availableGeometry）を超えない。
+                self.assertLessEqual(dlg.height(), available.height())
+                self.assertLessEqual(dlg.minimumHeight(), available.height())
+        finally:
+            dlg.deleteLater()
+
+    def test_confirm_window_width_matches_table_content(self) -> None:
+        """初期ウィンドウ幅が表の実列幅合計に近く、右側に大きな余白を残さない（要件1）。"""
+        rows = [_row(str(1000 + i), "2", "強化 長2 磨き") for i in range(6)]
+        dlg = RegistrationPreviewDialog(
+            rows=rows, master=[], shukka_options=["AM", "PM"], customer_labels={},
+        )
+        try:
+            header_length = dlg.table.horizontalHeader().length()
+            screen = dlg.screen() or QApplication.primaryScreen()
+            # 表の実幅に対して右側の余白が大きく残らない（実幅＋わずかな余白以内）。
+            self.assertLessEqual(dlg.width() - header_length, 60)
+            # 旧固定初期幅（1520px）より狭い。
+            self.assertLess(dlg.width(), 1520)
+            # availableGeometry（125%相当を含む）を超えない。
+            if screen is not None:
+                self.assertLessEqual(dlg.width(), screen.availableGeometry().width())
+            # 下部ボタン・CSV欄・参照ボタンが見切れない最小幅は確保する。
+            self.assertGreaterEqual(dlg.minimumWidth(), min(760, dlg.width()))
+            # 判定加工名・未登録警告列の縮小は維持される。
+            self.assertLess(dlg.table.columnWidth(_COL_KAKOU), 280)
+            self.assertLess(dlg.table.columnWidth(_COL_WARNING), 185)
+        finally:
+            dlg.deleteLater()
+
+    def test_detected_process_and_warning_columns_narrowed(self) -> None:
+        """判定加工名・未登録警告列が以前より狭く、他列より広がりすぎない（要件2）。"""
+        dlg = RegistrationPreviewDialog(
+            rows=[_row("1000", "2", "品")], master=[], shukka_options=[],
+            customer_labels={},
+        )
+        try:
+            kakou_w = dlg.table.columnWidth(_COL_KAKOU)
+            warn_w = dlg.table.columnWidth(_COL_WARNING)
+            # 判定加工名: 旧Stretch(約280)より狭い。
+            self.assertLess(kakou_w, 280)
+            self.assertGreaterEqual(kakou_w, 150)
+            # 未登録警告: 旧185より狭い。
+            self.assertLess(warn_w, 185)
+            self.assertGreaterEqual(warn_w, 90)
+            # 商品名称列(270)は潰れず、狭めた2列より広いまま。
+            self.assertGreater(dlg.table.columnWidth(_COL_PRODUCT), warn_w)
+        finally:
+            dlg.deleteLater()
+
+    def test_startup_emits_timing_logs(self) -> None:
+        """登録前確認画面の起動ステップ所要時間ログが出力される（要件3）。"""
+        import logging
+
+        rows = [_row(str(1000 + i), "2", "強化 長2 磨き") for i in range(4)]
+        logger = logging.getLogger("tks_to_kintone_app")
+        with self.assertLogs(logger, level="INFO") as logs:
+            dlg = RegistrationPreviewDialog(
+                rows=rows, master=[], shukka_options=["AM", "PM"], customer_labels={},
+            )
+        try:
+            text = "\n".join(logs.output)
+            for event in (
+                "kintone_confirm_init_started",
+                "kintone_confirm_init_elapsed_ms",
+                "kintone_confirm_existing_check_elapsed_ms",
+                "kintone_confirm_table_populate_elapsed_ms",
+                "kintone_confirm_cell_widgets_elapsed_ms",
+                "kintone_confirm_build_ui_elapsed_ms",
+                "kintone_confirm_geometry_elapsed_ms",
+                "kintone_confirm_resize_applied",
+                "kintone_confirm_target_dialog_width",
+            ):
+                self.assertIn(event, text)
+        finally:
+            dlg.deleteLater()
+
+    def test_populate_suppresses_table_updates(self) -> None:
+        """テーブル生成中は setUpdatesEnabled(False)→(True) で再描画が抑制される（要件3）。"""
+        # populate 完了後は updates 有効に戻っている（生成中のみ抑制）。
+        dlg = RegistrationPreviewDialog(
+            rows=[_row("1000", "2", "品")], master=[], shukka_options=[],
+            customer_labels={},
+        )
+        try:
+            self.assertTrue(dlg.table.updatesEnabled())
+            # セルウィジェット数が記録され、全セルに widget を敷き詰めていない。
+            # 12列 × 行数の総セル数より十分少ない（表示専用列は QTableWidgetItem）。
+            total_cells = dlg.table.rowCount() * dlg.table.columnCount()
+            self.assertLess(dlg._cell_widget_count, total_cells)
+        finally:
+            dlg.deleteLater()
+
+    def test_initial_width_forced_and_released_after_show(self) -> None:
+        """初期表示中は maximumWidth で幅を強制し、show後に解除する（要件4）。"""
+        rows = [_row(str(1000 + i), "2", "強化 長2 磨き") for i in range(6)]
+        dlg = RegistrationPreviewDialog(
+            rows=rows, master=[], shukka_options=["AM", "PM"], customer_labels={},
+        )
+        try:
+            column_sum = sum(
+                dlg.table.columnWidth(c) for c in range(dlg.table.columnCount())
+            )
+            # 初期は maximumWidth が有限（幅を強制している）。
+            self.assertLess(dlg.maximumWidth(), 16777215)
+            # 旧固定幅1520pxより明確に狭い。
+            self.assertLess(dlg.width(), 1520)
+            # 右側余白（ウィンドウ幅 − 列幅合計）が小さい。
+            screen = dlg.screen() or QApplication.primaryScreen()
+            if screen is not None and dlg.width() >= column_sum:
+                self.assertLessEqual(dlg.width() - column_sum, 80)
+            dlg.show()
+            # show 後は maximumWidth 制約が解除され、手動で広げられる。
+            self.assertEqual(dlg.maximumWidth(), 16777215)
+            self.assertFalse(dlg.isMaximized())
+        finally:
+            dlg.deleteLater()
+
+    def test_narrowed_columns_have_tooltip(self) -> None:
+        """狭めた列は長い内容をtooltipで確認できる（要件2）。"""
+        rows = [_row("1000", "2", "強化 長2 磨き")]
+        master = [{"掛率集計コード": "9999", "加工名": "特殊加工"}]
+        dlg = RegistrationPreviewDialog(
+            rows=[{**rows[0], "掛率集計コード": "9999"}],
+            master=master, shukka_options=[], customer_labels={},
+        )
+        try:
+            kakou_label = dlg._kakou_labels[0]
+            # 判定加工名ラベルにtooltip（本文と一致）が設定されている。
+            self.assertEqual(kakou_label.toolTip(), kakou_label.text())
         finally:
             dlg.deleteLater()
 

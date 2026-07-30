@@ -38,10 +38,12 @@ _KEY_OLAP_ID = "olap/login_id"
 _KEY_OLAP_PASSWORD = "olap/password"
 _KEY_KINTONE_ID = "kintone/login_id"
 _KEY_KINTONE_PASSWORD = "kintone/password"
+_KEY_UPDATE_DEBUG_KINTONE_API_TOKEN = "update/debug_kintone_api_token"
 
 # keyring 上のユーザー名（パスワード保存先の識別子）。
 _KR_OLAP_PASSWORD = "olap_password"
 _KR_KINTONE_PASSWORD = "kintone_password"
+_KR_UPDATE_DEBUG_KINTONE_API_TOKEN = "update_debug_kintone_api_token"
 
 
 @dataclass
@@ -55,7 +57,7 @@ class SavedCredentials:
 
 
 def _settings() -> QSettings:
-    return QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    return QSettings(QSettings.defaultFormat(), QSettings.UserScope, _SETTINGS_ORG, _SETTINGS_APP)
 
 
 def load_saved_credentials() -> SavedCredentials:
@@ -96,15 +98,63 @@ def save_kintone_credentials(login_id: str, password: str) -> None:
         _LOGGER.warning("kintoneログイン情報の保存に失敗しました。")
 
 
+def load_update_debug_kintone_api_token() -> str:
+    """更新確認用デバッグAPIトークンを秘密ストアから読み込む。"""
+    try:
+        return _load_password(
+            _KR_UPDATE_DEBUG_KINTONE_API_TOKEN,
+            _KEY_UPDATE_DEBUG_KINTONE_API_TOKEN,
+        ).strip()
+    except Exception:
+        _LOGGER.warning("更新確認用デバッグ資格情報の読み込みに失敗しました。")
+        return ""
+
+
+def save_update_debug_kintone_api_token(api_token: str) -> None:
+    """更新確認用デバッグAPIトークンを保存する。空文字なら保存値を削除する。"""
+    value = str(api_token or "").strip()
+    try:
+        if value:
+            _store_password(
+                _KR_UPDATE_DEBUG_KINTONE_API_TOKEN,
+                _KEY_UPDATE_DEBUG_KINTONE_API_TOKEN,
+                value,
+            )
+            return
+        settings = _settings()
+        settings.remove(_KEY_UPDATE_DEBUG_KINTONE_API_TOKEN)
+        settings.sync()
+        if keyring is not None:
+            try:
+                keyring.delete_password(
+                    _KEYRING_SERVICE, _KR_UPDATE_DEBUG_KINTONE_API_TOKEN
+                )
+            except Exception:
+                pass
+    except Exception:
+        # 例外本文には秘密値が含まれる可能性があるため記録しない。
+        _LOGGER.warning("更新確認用デバッグ資格情報の保存に失敗しました。")
+
+
 def clear_saved_credentials() -> None:
     """保存済みのログイン情報をすべて削除する。"""
     try:
         settings = _settings()
-        for key in (_KEY_OLAP_ID, _KEY_OLAP_PASSWORD, _KEY_KINTONE_ID, _KEY_KINTONE_PASSWORD):
+        for key in (
+            _KEY_OLAP_ID,
+            _KEY_OLAP_PASSWORD,
+            _KEY_KINTONE_ID,
+            _KEY_KINTONE_PASSWORD,
+            _KEY_UPDATE_DEBUG_KINTONE_API_TOKEN,
+        ):
             settings.remove(key)
         settings.sync()
         if keyring is not None:
-            for user in (_KR_OLAP_PASSWORD, _KR_KINTONE_PASSWORD):
+            for user in (
+                _KR_OLAP_PASSWORD,
+                _KR_KINTONE_PASSWORD,
+                _KR_UPDATE_DEBUG_KINTONE_API_TOKEN,
+            ):
                 try:
                     keyring.delete_password(_KEYRING_SERVICE, user)
                 except Exception:
