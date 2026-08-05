@@ -353,6 +353,38 @@ class TestVoucherEditFontFavorites(unittest.TestCase):
             families[1],
         )
 
+    def test_font_popup_is_wider_than_combo_and_bounded(self) -> None:
+        win = self.window("POPUP-WIDTH")
+        combo = win._font_family_combo
+        combo._ensure_all_fonts_loaded()
+        combo._resize_font_popup()
+        self.assertIsNotNone(combo.view())
+        self.assertGreaterEqual(
+            combo.view().minimumWidth(), combo.FONT_POPUP_MIN_WIDTH)
+        self.assertGreater(combo.view().minimumWidth(), combo.width())
+        self.assertLessEqual(
+            combo.view().minimumWidth(), combo.FONT_POPUP_MAX_WIDTH)
+        self.assertEqual(
+            combo.view().horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+
+    def test_font_popup_accounts_for_long_font_name_and_keeps_font_role(self) -> None:
+        win = self.window("POPUP-LONG-NAME")
+        combo = win._font_family_combo
+        long_name = "A very long font family name for popup width testing"
+        combo.addItem(long_name, long_name)
+        index = combo.count() - 1
+        combo.setItemData(index, QFont("Sans"), Qt.ItemDataRole.FontRole)
+        combo._resize_font_popup()
+        self.assertGreaterEqual(
+            combo.view().minimumWidth(), combo.FONT_POPUP_MIN_WIDTH)
+        self.assertLessEqual(
+            combo.view().minimumWidth(), combo.FONT_POPUP_MAX_WIDTH)
+        self.assertEqual(combo.itemData(index), long_name)
+        self.assertEqual(
+            combo.itemData(index, Qt.ItemDataRole.FontRole).family(), "Sans")
+
     def test_favorites_are_not_part_of_edit_data(self) -> None:
         families = self.available_families()
         self.assertTrue(families)

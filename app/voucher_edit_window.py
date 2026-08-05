@@ -65,6 +65,7 @@ from PySide6.QtGui import (
     QFont,
     QFontDatabase,
     QDoubleValidator,
+    QFontMetrics,
     QFontMetricsF,
     QGuiApplication,
     QDrag,
@@ -1445,6 +1446,8 @@ class _FontFamilyComboBox(QComboBox):
     """お気に入りと全フォントを1つの見出し付き一覧で表示するコンボ。"""
 
     currentFontChanged = Signal(QFont)
+    FONT_POPUP_MIN_WIDTH = 260
+    FONT_POPUP_MAX_WIDTH = 480
 
     def __init__(self, favorites: list[str], current_family: str = "",
                  parent: QWidget | None = None) -> None:
@@ -1453,6 +1456,12 @@ class _FontFamilyComboBox(QComboBox):
         self.setToolTip("フォント名")
         self.setMinimumWidth(150)
         self.setMaximumWidth(210)
+        # Popupだけは本体より広くし、長いフォント名を一覧で読めるようにする。
+        # 実幅はshowPopup直前にモデル内容から再計算する。
+        self.view().setMinimumWidth(self.FONT_POPUP_MIN_WIDTH)
+        self.view().setMaximumWidth(self.FONT_POPUP_MAX_WIDTH)
+        self.view().setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._all_fonts_loaded = False
         self.currentIndexChanged.connect(self._emit_current_font_changed)
         self.rebuild(favorites, current_family=current_family)
@@ -1507,7 +1516,23 @@ class _FontFamilyComboBox(QComboBox):
 
     def showPopup(self) -> None:  # noqa: N802
         self._ensure_all_fonts_loaded()
+        self._resize_font_popup()
         super().showPopup()
+
+    def _resize_font_popup(self) -> None:
+        """フォント名とdelegateのFontRoleを考慮してPopup幅を決める。"""
+        view = self.view()
+        max_text_width = 0
+        for index in range(self.model().rowCount()):
+            text = str(self.itemData(index, Qt.ItemDataRole.DisplayRole) or "")
+            item_font = self.itemData(index, Qt.ItemDataRole.FontRole)
+            font = item_font if isinstance(item_font, QFont) else view.font()
+            max_text_width = max(max_text_width, QFontMetrics(font).horizontalAdvance(text))
+        scrollbar_width = view.verticalScrollBar().sizeHint().width()
+        popup_width = max_text_width + scrollbar_width + 32
+        popup_width = max(self.FONT_POPUP_MIN_WIDTH,
+                          min(self.FONT_POPUP_MAX_WIDTH, popup_width))
+        view.setMinimumWidth(popup_width)
 
     def _set_family_index(self, family: str) -> None:
         target = str(family or "").strip()
