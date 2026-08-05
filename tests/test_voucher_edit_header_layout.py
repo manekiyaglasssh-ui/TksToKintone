@@ -33,6 +33,8 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                 self.assertGreaterEqual(win._favorite_font_button.width(),
                                         win._favorite_font_button.sizeHint().width())
                 self.assertTrue(win._favorite_font_button.toolTip())
+                self.assertIn("background: transparent", win._favorite_font_button.styleSheet())
+                self.assertIn("border: none", win._favorite_font_button.styleSheet())
                 self.assertIsInstance(win._line_width_spin, QDoubleSpinBox)
                 self.assertEqual(win._line_width_group.layout().itemAt(1).widget(),
                                  win._line_width_spin)
@@ -82,6 +84,8 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                 self.assertIn("background: transparent", win._main_toolbar.styleSheet())
                 self.assertIn("color: #F2B705", win._main_toolbar.styleSheet())
                 self.assertTrue(button.toolTip())
+                self.assertIn("background-color: transparent", button.styleSheet())
+                self.assertNotIn("background-color: #", button.styleSheet())
             finally:
                 if previous is None:
                     os.environ.pop("TKS_TO_KINTONE_HOME", None)

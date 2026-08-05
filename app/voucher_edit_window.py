@@ -953,7 +953,29 @@ FAVORITE_FONT_UNREGISTERED_DARK_COLOR = FAVORITE_FONT_ICON_COLOR
 FAVORITE_FONT_DISABLED_COLOR = "#999999"
 FAVORITE_FONT_REGISTERED_DISABLED_COLOR = "#B88A00"
 FAVORITE_FONT_ICON_SIZE_PX = 24
-FAVORITE_FONT_BUTTON_WIDTH_PX = 48
+FAVORITE_FONT_BUTTON_WIDTH_PX = 64
+
+# このボタンは共通の QToolButton テーマから分離する。親ヘッダーのテーマや
+# Windows のネイティブスタイルが再適用されても、星だけを表示する。
+FAVORITE_FONT_BUTTON_STYLE = """
+QToolButton#favoriteFontButton,
+QToolButton#favoriteFontButton:hover,
+QToolButton#favoriteFontButton:pressed,
+QToolButton#favoriteFontButton:checked,
+QToolButton#favoriteFontButton:focus,
+QToolButton#favoriteFontButton:disabled {
+    background-color: transparent;
+    background: transparent;
+    border: none;
+    border-radius: 0px;
+    padding: 0px;
+    margin: 0px;
+    color: #F2B705;
+    min-height: 34px;
+    max-height: 34px;
+    font-size: 24px;
+}
+"""
 
 # ツールバーのボタン幅・余白を広げ、削除=警告色/保存=安全色を割り当てる（要件2-5・2-6・2-7・3）。
 # ライト/ダーク両モードで文字が読めるよう、警告色・安全色は白文字＋濃色背景にする。
@@ -5407,6 +5429,7 @@ class VoucherEditWindow(QMainWindow):
         self._favorite_font_button.setObjectName("favoriteFontButton")
         self._favorite_font_button.setCheckable(True)
         self._favorite_font_button.setAutoRaise(True)
+        self._favorite_font_button.setStyleSheet(FAVORITE_FONT_BUTTON_STYLE)
         self._favorite_font_button.setFixedWidth(FAVORITE_FONT_BUTTON_WIDTH_PX)
         self._favorite_font_button.clicked.connect(self._toggle_current_font_favorite)
         bar.addWidget(self._favorite_font_button)
@@ -6138,6 +6161,9 @@ class VoucherEditWindow(QMainWindow):
             return
         favorite = "true" if button.property("favorite") == "true" else "false"
         button.setProperty("favorite", favorite)
+        # 親ヘッダーのテーマ再適用後も、対象ボタン自身へ最後に専用スタイルを
+        # 設定して、共通の checked/hover 背景が入り込む経路を遮断する。
+        button.setStyleSheet(FAVORITE_FONT_BUTTON_STYLE)
         style = button.style()
         if style is not None:
             style.unpolish(button)

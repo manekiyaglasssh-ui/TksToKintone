@@ -13,6 +13,7 @@ dist/
 installer/Output/
 installer/*.exe
 installer/*.log
+installer/*.exe.sha256
 
 # Runtime and local data
 logs/

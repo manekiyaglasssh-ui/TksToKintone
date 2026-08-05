@@ -123,7 +123,7 @@ if not exist "%VARIANT_DIR%" mkdir "%VARIANT_DIR%"
 set "PYINSTALLER_UPDATE_ARGS=--hidden-import app.update_client"
 if /I "%BUILD_VARIANT%"=="no-update" set "PYINSTALLER_UPDATE_ARGS=--exclude-module app.update_client --exclude-module app.update_helper"
 REM Build the main application EXE. Keep the command on one line.
-python -m PyInstaller --noconfirm --clean --onedir --windowed --name TksToKintone --icon assets\app_icon.ico --version-file installer\version_info.txt --add-data "templates;templates" --add-data "docs\olap;docs\olap" --add-data "assets;assets" --add-data "%VARIANT_FILE%;." %PYINSTALLER_UPDATE_ARGS% app\main.py
+python -m PyInstaller --noconfirm --clean --specpath "%VARIANT_DIR%" --onedir --windowed --name TksToKintone --icon assets\app_icon.ico --version-file installer\version_info.txt --add-data "templates;templates" --add-data "docs\olap;docs\olap" --add-data "assets;assets" --add-data "%VARIANT_FILE%;." %PYINSTALLER_UPDATE_ARGS% app\main.py
 if errorlevel 1 (
   echo ERROR: TksToKintone build failed for %BUILD_VARIANT%.
   exit /b 1
@@ -131,7 +131,7 @@ if errorlevel 1 (
 
 :build_helper
 REM Build the update helper EXE onefile console. Avoids PowerShell during updates.
-python -m PyInstaller --noconfirm --clean --onefile --console --name tks_update_helper app\update_helper.py
+python -m PyInstaller --noconfirm --clean --specpath "%VARIANT_DIR%" --onefile --console --name tks_update_helper app\update_helper.py
 if errorlevel 1 (
   echo ERROR: tks_update_helper build failed.
   exit /b 1

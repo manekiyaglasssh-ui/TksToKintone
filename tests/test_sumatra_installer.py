@@ -65,6 +65,10 @@ class TestSumatraInstaller(unittest.TestCase):
         self.assertIn('set "PROJECT_ROOT=%~dp0"', self.build)
         self.assertIn('set "PYTHONPATH=%PROJECT_ROOT%;%PYTHONPATH%"', self.build)
 
+    def test_build_writes_pyinstaller_specs_under_build_variant(self) -> None:
+        self.assertGreaterEqual(self.build.count('--specpath "%VARIANT_DIR%"'), 2)
+        self.assertIn("installer/*.exe.sha256", (ROOT / ".gitignore").read_text())
+
     def test_allow_missing_sumatra_remains_a_development_only_success_path(self) -> None:
         self.assertIn('if /I "%~1"=="--allow-missing-sumatra" goto set_allow_flag', self.build)
         self.assertIn('if "%ALLOW_MISSING_SUMATRA%"=="1" goto sumatra_dev_skip', self.build)
