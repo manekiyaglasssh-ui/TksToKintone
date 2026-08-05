@@ -126,6 +126,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from app.text_style_resolver import TextStyle, line_height_pt
 
 from app.config import resource_path
 from app.path_utils import get_app_data_dir
@@ -1200,13 +1201,16 @@ def make_text_font(font_size: float, family: str | None = None,
                    bold: bool = False, italic: bool = False,
                    underline: bool = False, strikeout: bool = False) -> QFont:
     """通常テキスト用 QFont を生成する。"""
-    family = resolve_text_font_family(family)
-    font = QFont(family) if family else QFont()
-    font.setPointSizeF(float(font_size))
-    font.setBold(bool(bold))
-    font.setItalic(bool(italic))
-    font.setUnderline(bool(underline))
-    font.setStrikeOut(bool(strikeout))
+    style = TextStyle(
+        family=resolve_text_font_family(family), size_pt=float(font_size),
+        bold=bool(bold), italic=bool(italic), underline=bool(underline),
+        strikeout=bool(strikeout))
+    font = QFont(style.family) if style.family else QFont()
+    font.setPointSizeF(style.size_pt)
+    font.setBold(style.bold)
+    font.setItalic(style.italic)
+    font.setUnderline(style.underline)
+    font.setStrikeOut(style.strikeout)
     return font
 
 
@@ -1505,7 +1509,7 @@ def _text_content_size(text: str, font: QFont, font_size: float) -> tuple[float,
     metrics = QFontMetricsF(font)
     lines = text.splitlines() or [""]
     width = max((metrics.horizontalAdvance(line) for line in lines), default=0.0)
-    line_h = float(font_size) * 1.2
+    line_h = line_height_pt(font_size)
     return float(width), float(len(lines) * line_h)
 
 
@@ -1540,7 +1544,9 @@ def fit_font_size_to_text_box(
         # boundingRectはitalic/boldの左右への張り出しも含む。
         measured_w = max(
             (metrics.boundingRect(line or " ").width() for line in lines), default=0.0)
-        measured_h = metrics.lineSpacing() * max(len(lines), 1)
+        # 保存される論理サイズはPDF側と同じpt行送りにする。QtのDPI依存
+        # lineSpacing()は画面表示用の補助値として幅の計測には使わない。
+        measured_h = line_height_pt(size) * max(len(lines), 1)
         return measured_w <= available_w and measured_h <= available_h
 
     low, high = 4.0, 200.0

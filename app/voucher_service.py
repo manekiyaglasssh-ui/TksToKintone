@@ -38,6 +38,11 @@ import pypdf
 
 from app.config import resource_path
 from app.line_decorations import line_segments, normalize_line_type
+from app.text_style_resolver import (
+    TEXT_SYNTHETIC_ITALIC_SHEAR,
+    decoration_geometry,
+    line_height_pt,
+)
 from app.path_utils import ensure_voucher_output_dir, get_default_voucher_output_dir
 from app.processing_display_names import (
     load_processing_display_names,
@@ -186,7 +191,6 @@ DATA_BOLD_FONT_NAME = "HeiseiKakuGo-W5-DataBold"
 # _FONT_NAME を微小オフセットで重ね描きするのみ。今後の調整用に定数化する。
 TEXT_SYNTHETIC_BOLD_OFFSET_PT = 0.15
 # 正式Italicフェイスが無い場合に文字だけへ適用する横シアー。
-TEXT_SYNTHETIC_ITALIC_SHEAR = 0.20
 # 既存の帳票データ太字テスト／外部参照との互換名。値の責務は上の文字描画共通定数に集約する。
 DATA_BOLD_OFFSET_PT = TEXT_SYNTHETIC_BOLD_OFFSET_PT
 
@@ -3476,7 +3480,7 @@ def draw_text_in_scene_rect(
     if rgb is not None:
         c.setFillColorRGB(*rgb)
     lines = text.splitlines() or [""]
-    line_h = font_size * 1.2
+    line_h = line_height_pt(font_size)
     total_h = len(lines) * line_h
     vertical_align = vertical_align if vertical_align in {"top", "middle", "bottom"} else "middle"
     text_align = text_align if text_align in {"left", "center", "right"} else "center"
@@ -3576,11 +3580,12 @@ def _draw_pdf_text_decorations(
         x2 = anchor_x + base_width + right_overhang
     if color is not None:
         c.setStrokeColorRGB(*color)
-    c.setLineWidth(max(0.45, font_size * 0.045))
+    line_width, underline_offset, strikeout_offset = decoration_geometry(font_size)
+    c.setLineWidth(line_width)
     if underline:
-        c.line(x1, baseline_y - font_size * 0.12, x2, baseline_y - font_size * 0.12)
+        c.line(x1, baseline_y + underline_offset, x2, baseline_y + underline_offset)
     if strikeout:
-        c.line(x1, baseline_y + font_size * 0.30, x2, baseline_y + font_size * 0.30)
+        c.line(x1, baseline_y + strikeout_offset, x2, baseline_y + strikeout_offset)
 
 
 def _draw_pdf_text_run_decorations(
@@ -3621,13 +3626,14 @@ def _draw_pdf_text_run_decorations(
         x1, x2 = anchor_x, anchor_x + decorated_width
     if color is not None:
         c.setStrokeColorRGB(*color)
-    c.setLineWidth(max(0.45, font_size * 0.045))
+    line_width, underline_offset, strikeout_offset = decoration_geometry(font_size)
+    c.setLineWidth(line_width)
     if underline:
-        c.line(x1, baseline_y - font_size * 0.12, x2,
-               baseline_y - font_size * 0.12)
+        c.line(x1, baseline_y + underline_offset, x2,
+               baseline_y + underline_offset)
     if strikeout:
-        c.line(x1, baseline_y + font_size * 0.30, x2,
-               baseline_y + font_size * 0.30)
+        c.line(x1, baseline_y + strikeout_offset, x2,
+               baseline_y + strikeout_offset)
 
 
 def draw_symbol_text(canvas: rl_canvas.Canvas, obj: dict[str, Any]) -> None:
