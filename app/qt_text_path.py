@@ -9,6 +9,19 @@ from PySide6.QtGui import QFont, QFontMetricsF, QPainterPath, QGuiApplication
 _HEADLESS_QT_APP: QGuiApplication | None = None
 
 
+def decoration_positions(metrics: QFontMetricsF, baseline_y: float) -> tuple[float, float]:
+    """Return Qt logical underline/strikeout Y positions.
+
+    QFontMetricsF positions are distances from the baseline. Underline is
+    below the baseline in Qt's downwards-Y coordinates; strikeout is a
+    distance above it, hence the subtraction.
+    """
+    return (
+        float(baseline_y) + float(metrics.underlinePos()),
+        float(baseline_y) - float(metrics.strikeOutPos()),
+    )
+
+
 def ensure_qt_application() -> QGuiApplication:
     """Return the process Qt application, creating one for headless PDF tests."""
     global _HEADLESS_QT_APP

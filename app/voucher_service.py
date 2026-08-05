@@ -43,7 +43,11 @@ from app.text_style_resolver import (
     decoration_geometry,
     line_height_pt,
 )
-from app.qt_text_path import draw_qt_text_path_on_pdf, ensure_qt_application
+from app.qt_text_path import (
+    decoration_positions,
+    draw_qt_text_path_on_pdf,
+    ensure_qt_application,
+)
 from app.path_utils import ensure_voucher_output_dir, get_default_voucher_output_dir
 from app.processing_display_names import (
     load_processing_display_names,
@@ -3538,23 +3542,33 @@ def draw_text_in_scene_rect(
     # QFont underline/strikeOutの実装はQt/PDFで差が出るため、同じ論理pt
     # 位置で明示線を引く。ここでは装飾線の回転も既存のオブジェクト状態へ
     # 同じく委譲される。
+    first_baseline = path_y + float(metrics.ascent())
+    logical_underline_y, logical_strikeout_y = decoration_positions(
+        metrics, first_baseline)
+    mapped_underline_y = PAGE_H - logical_underline_y
+    mapped_strikeout_y = PAGE_H - logical_strikeout_y
+    _log.debug(
+        "event=voucher_edit_qt_decoration_metrics object_id=%s text=%r "
+        "point_size=%s baseline_y=%s ascent=%s descent=%s underlinePos=%s "
+        "strikeOutPos=%s logical_underline_y=%s logical_strikeout_y=%s "
+        "mapped_pdf_underline_y=%s mapped_pdf_strikeout_y=%s scale=%s rotation=%s",
+        object_id, text, qt_font.pointSizeF(), first_baseline,
+        metrics.ascent(), metrics.descent(), metrics.underlinePos(),
+        metrics.strikeOutPos(), logical_underline_y, logical_strikeout_y,
+        mapped_underline_y, mapped_strikeout_y, 1.0, 0.0)
     if underline or strikeout:
         line_width, _underline_offset, _strikeout_offset = decoration_geometry(font_size)
         c.setLineWidth(line_width)
         c.setStrokeColorRGB(*(_coerce_rgb(color) or (0.0, 0.0, 0.0)))
         line_x1, line_x2 = path_x, path_x + raw_width
-        # QPainterPath.addText() uses the same Qt baseline as the editor. Qt's
-        # metrics are in the path's logical coordinates, so using these values
-        # avoids confusing the below-baseline underline with the strikeout.
-        first_baseline = path_y + float(metrics.ascent())
-        if underline:
-            sx = line_x1; sy = first_baseline + float(metrics.underlinePos())
-            ex = line_x2; ey = sy
-            c.line(sx, PAGE_H - sy, ex, PAGE_H - ey)
-        if strikeout:
-            sx = line_x1; sy = first_baseline + float(metrics.strikeOutPos())
-            ex = line_x2; ey = sy
-            c.line(sx, PAGE_H - sy, ex, PAGE_H - ey)
+    if underline:
+        sx = line_x1; sy = logical_underline_y
+        ex = line_x2; ey = sy
+        c.line(sx, PAGE_H - sy, ex, PAGE_H - ey)
+    if strikeout:
+        sx = line_x1; sy = logical_strikeout_y
+        ex = line_x2; ey = sy
+        c.line(sx, PAGE_H - sy, ex, PAGE_H - ey)
     return
 
     # Kept below for reference compatibility with callers that monkeypatch the

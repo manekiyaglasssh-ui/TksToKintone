@@ -58,7 +58,7 @@ class QtTextPathTests(unittest.TestCase):
             if expected == 2:
                 # The two metric positions remain distinct after the PDF
                 # Y-axis inversion; the first line is the requested underline.
-                self.assertGreater(canvas.lines[0][1], canvas.lines[1][1])
+                self.assertLess(canvas.lines[0][1], canvas.lines[1][1])
 
 
 if __name__ == "__main__":
