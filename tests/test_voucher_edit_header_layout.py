@@ -65,7 +65,8 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                     [widget.geometry().x() for widget in widgets],
                     sorted(widget.geometry().x() for widget in widgets),
                 )
-                self.assertGreaterEqual(header.minimumWidth(), header.sizeHint().width())
+                self.assertEqual(header.minimumWidth(), 0)
+                self.assertLessEqual(header.sizeHint().width(), 1280)
             finally:
                 if previous is None:
                     os.environ.pop("TKS_TO_KINTONE_HOME", None)
@@ -86,6 +87,40 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                 self.assertTrue(button.toolTip())
                 self.assertIn("background-color: transparent", button.styleSheet())
                 self.assertNotIn("background-color: #", button.styleSheet())
+            finally:
+                if previous is None:
+                    os.environ.pop("TKS_TO_KINTONE_HOME", None)
+                else:
+                    os.environ["TKS_TO_KINTONE_HOME"] = previous
+
+    def test_header_fits_100_125_and_150_percent_logical_widths(self) -> None:
+        """標準的な1920px画面の論理幅（150%では1280px）でも右端を切らない。"""
+        with tempfile.TemporaryDirectory() as home:
+            previous = os.environ.get("TKS_TO_KINTONE_HOME")
+            os.environ["TKS_TO_KINTONE_HOME"] = home
+            try:
+                win = VoucherEditWindow(order_no="dpi-header", background_pdf_bytes=b"")
+                self.addCleanup(win.deleteLater)
+                header = win._main_toolbar
+                win.show()
+                self.app.processEvents()
+                for scale, logical_width in ((1.0, 1920), (1.25, 1536), (1.5, 1280)):
+                    header.setFixedWidth(logical_width)
+                    header.layout().activate()
+                    self.app.processEvents()
+                    visible = [header.widgetForAction(action) for action in header.actions()]
+                    visible = [widget for widget in visible if widget is not None and widget.isVisible()]
+                    self.assertLessEqual(
+                        max(widget.geometry().right() for widget in visible),
+                        header.width() - 1,
+                        f"right edge clipped at {scale * 100:.0f}%",
+                    )
+                self.assertLessEqual(header.layout().sizeHint().width(), 1280)
+                line = win._line_width_group.geometry()
+                label = win._line_width_group.layout().itemAt(0).widget().geometry()
+                spin = win._line_width_spin.geometry()
+                self.assertLessEqual(spin.left() - label.right(), 8)
+                self.assertLessEqual(line.width(), 120)
             finally:
                 if previous is None:
                     os.environ.pop("TKS_TO_KINTONE_HOME", None)
