@@ -5325,17 +5325,17 @@ class VoucherEditWindow(QMainWindow):
         bar = getattr(self, "_main_toolbar", None)
         if bar is not None:
             if dark:
-                bar.setStyleSheet((EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_DARK_STYLE).replace("QToolBar", "#mainEditHeader"))
+                bar.setStyleSheet((EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_DARK_STYLE).replace("QToolBar", "#voucher_edit_header"))
             else:
-                bar.setStyleSheet((EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_LIGHT_STYLE).replace("QToolBar", "#mainEditHeader"))
+                bar.setStyleSheet((EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_LIGHT_STYLE).replace("QToolBar", "#voucher_edit_header"))
                 _log.info("voucher_edit_toolbar_dark_style_cleared_for_light")
             # 全体テーマの後に dynamic property を再設定して再 polish し、
             # favorite 専用のテーマ色を確実に反映する。
             self._refresh_favorite_font_button_style()
         container = getattr(self, "_main_toolbar_container", None)
-        if container is not None:
+        if container is not None and container is not bar:
             bg = EDIT_TOOLBAR_CONTAINER_DARK_BG if dark else EDIT_TOOLBAR_CONTAINER_LIGHT_BG
-            container.setStyleSheet(f"#mainEditHeader {{ background-color: {bg}; }}")
+            container.setStyleSheet(f"#voucher_edit_header {{ background-color: {bg}; }}")
         menu = getattr(self, "_shape_menu", None)
         if menu is not None:
             menu.setStyleSheet(
@@ -5382,7 +5382,10 @@ class VoucherEditWindow(QMainWindow):
 
     def _build_toolbar(self) -> None:
         bar = _WrappedActionHeader(self)
+        bar.setObjectName("voucher_edit_header")
         self._main_toolbar = bar
+        self._edit_header_widget = bar
+        self._edit_action_widgets = bar._action_widgets
         # アンドゥ・リドゥ（曲がった矢印アイコン・全端末でアイコン表示: 要件4）。
         # OS/theme/フォント非依存。SVGが読めない端末では描画フォールバックを使う。
         self._undo_action = bar.addAction("↶", self.undo)
@@ -5500,7 +5503,7 @@ class VoucherEditWindow(QMainWindow):
         self._style_action_widget(bar, save_action, "successButton")
         self._style_action_widget(bar, save_close_action, "successButton")
         # ツールバー全体のボタン幅・余白を広げ、警告色/安全色を割り当てる（要件2-5）。
-        bar.setStyleSheet(EDIT_TOOLBAR_STYLE.replace("QToolBar", "#mainEditHeader"))
+        bar.setStyleSheet(EDIT_TOOLBAR_STYLE.replace("QToolBar", "#voucher_edit_header"))
         bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         bar.setMinimumHeight(42)
         self._main_toolbar_container = bar
@@ -5740,6 +5743,7 @@ class VoucherEditWindow(QMainWindow):
         QScrollArea に載せて横スクロールできるようにする（2段表示には戻さない: 要件3）。
         """
         bar = QToolBar("タブレット編集ツール")
+        bar.setObjectName("voucher_tablet_toolbar")
         bar.setObjectName("tabletToolBar")
         bar.setMovable(False)
         bar.setFloatable(False)

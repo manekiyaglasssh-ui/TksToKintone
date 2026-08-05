@@ -52,9 +52,10 @@ class TestVoucherEditWindow(unittest.TestCase):
         win = VoucherEditWindow(order_no="5218869", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
         self.assertIn("指図書編集", win.windowTitle())
-        toolbars = win.findChildren(QToolBar)
-        self.assertTrue(toolbars)
-        actions = [a.text() for tb in toolbars for a in tb.actions()]
+        header = win._edit_header_widget
+        self.assertIsNotNone(header)
+        self.assertNotIsInstance(header, QToolBar)
+        actions = [a.text() for a in header.actions()]
         # 図形6種は「図形」ボタン1つへまとめたため、個別ラベルはヘッダー直下に無い（要件5）。
         for label in ("選択", "テキスト", "削除", "保存", "閉じる"):
             self.assertIn(label, actions)
@@ -878,8 +879,7 @@ class TestVoucherEditWindow(unittest.TestCase):
 
         win = VoucherEditWindow(order_no="t1", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
-        from PySide6.QtWidgets import QToolBar as _TB
-        actions = [a.text() for tb in win.findChildren(_TB) for a in tb.actions()]
+        actions = [a.text() for a in win._edit_header_widget.actions()]
         for label in ("選択", "テキスト", "保存", "保存して閉じる", "閉じる"):
             self.assertIn(label, actions)
         # 図形6種は「図形」メニューへまとめた（要件5）。
@@ -1067,7 +1067,7 @@ class TestVoucherEditWindow(unittest.TestCase):
 
         win = VoucherEditWindow(order_no="ths1", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
-        bar = win.findChildren(QToolBar)[0]
+        bar = win._edit_header_widget
         text_button = bar.widgetForAction(win._tool_actions[TOOL_TEXT])
         self.assertIsInstance(text_button, QToolButton)
         self.assertTrue(text_button.property("editToolButton"))
@@ -1095,12 +1095,12 @@ class TestVoucherEditWindow(unittest.TestCase):
         ):
             win = VoucherEditWindow(order_no="drk1", background_pdf_bytes=b"")
             self.addCleanup(win.deleteLater)
-            bar = win.findChildren(QToolBar)[0]
+            bar = win._edit_header_widget
             # 通常状態の文字色が背景色と別に指定されている。
             self.assertIn("color: #f0f0f0", EDIT_TOOLBAR_DARK_STYLE)
             self.assertIn("background-color: #3a4047", EDIT_TOOLBAR_DARK_STYLE)
             # ダーク用の配色がツールバーへ適用されている。
-            self.assertIn(EDIT_TOOLBAR_DARK_STYLE.strip()[:20], bar.styleSheet())
+            self.assertIn(EDIT_TOOLBAR_DARK_STYLE.replace("QToolBar", "#voucher_edit_header").strip()[:20], bar.styleSheet())
             # コンテナ背景・図形メニューもダーク配色。
             self.assertIn(
                 EDIT_TOOLBAR_CONTAINER_DARK_BG,
@@ -1136,9 +1136,9 @@ class TestVoucherEditWindow(unittest.TestCase):
             self.assertEqual(win._shape_menu.styleSheet(), EDIT_SHAPE_MENU_LIGHT_STYLE)
             self.assertIn("#ffffff", EDIT_SHAPE_MENU_LIGHT_STYLE)
             # ツールバー本体にライト配色が適用され、ダーク配色は含まれない。
-            bar = win.findChildren(QToolBar)[0]
+            bar = win._edit_header_widget
             bar_ss = bar.styleSheet()
-            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.strip()[:20], bar_ss)
+            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.replace("QToolBar", "#voucher_edit_header").strip()[:20], bar_ss)
             self.assertNotIn("#3a4047", bar_ss)  # ダーク用ボタン背景が残っていない
             self.assertNotIn("#2b2f33", bar_ss)  # ダーク用ツールバー背景が残っていない
             # ライト用のボタン文字色・背景色が明示されている。
@@ -1160,7 +1160,7 @@ class TestVoucherEditWindow(unittest.TestCase):
         ):
             win = VoucherEditWindow(order_no="sw1", background_pdf_bytes=b"")
             self.addCleanup(win.deleteLater)
-            bar = win.findChildren(QToolBar)[0]
+            bar = win._edit_header_widget
             self.assertIn("#3a4047", bar.styleSheet())  # 初期はダーク
 
         # テーマをライトへ切り替えて再適用する。
@@ -1171,7 +1171,7 @@ class TestVoucherEditWindow(unittest.TestCase):
             win._apply_toolbar_theme()
             bar_ss = bar.styleSheet()
             self.assertNotIn("#3a4047", bar_ss)  # ダーク配色は消えている
-            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.strip()[:20], bar_ss)
+            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.replace("QToolBar", "#voucher_edit_header").strip()[:20], bar_ss)
 
     def test_reflect_target_highlight_switches_exclusively(self) -> None:
         """反映先を切り替えると青背景が1ボタンだけへ移る。"""
@@ -2201,12 +2201,10 @@ class TestVoucherEditWindow(unittest.TestCase):
 
         win = VoucherEditWindow(order_no="ts1", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
-        actions = [a.text() for tb in win.findChildren(QToolBar) for a in tb.actions()]
+        actions = [a.text() for a in win._edit_header_widget.actions()]
         for label in ("画像挿入", "貼り付け", "全画面", "保存して閉じる"):
             self.assertIn(label, actions)
-        scroll = win.findChild(QScrollArea, "mainEditToolBarContainer")
-        self.assertIsNotNone(scroll)
-        self.assertEqual(scroll.widget(), win._main_toolbar)
+        self.assertIs(win._edit_header_widget, win._main_toolbar)
 
     def test_toolbar_scroll_area_does_not_require_horizontal_scroll(self) -> None:
         from PySide6.QtWidgets import QScrollArea
@@ -2215,17 +2213,10 @@ class TestVoucherEditWindow(unittest.TestCase):
 
         win = VoucherEditWindow(order_no="ts-scroll", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
-        scroll = win.findChild(QScrollArea, "mainEditToolBarContainer")
-        self.assertIsNotNone(scroll)
-        self.assertFalse(scroll.widgetResizable())
-        self.assertEqual(
-            scroll.horizontalScrollBarPolicy(),
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
-        )
-        self.assertEqual(
-            scroll.verticalScrollBarPolicy(),
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
-        )
+        scroll = win._edit_header_widget
+        self.assertTrue(scroll.widgetResizable())
+        self.assertEqual(scroll.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.assertEqual(scroll.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.assertEqual(win._main_toolbar.minimumWidth(), 0)
 
     def test_left_pane_is_vertical_scroll_area(self) -> None:
@@ -2316,7 +2307,7 @@ class TestVoucherEditWindow(unittest.TestCase):
 
         win = VoucherEditWindow(order_no="ts4", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
-        bar = win.findChildren(QToolBar)[0]
+        bar = win._edit_header_widget
         names = {b.objectName() for b in bar.findChildren(QToolButton)}
         self.assertIn("dangerButton", names)
         self.assertIn("successButton", names)
@@ -2334,7 +2325,7 @@ class TestVoucherEditWindow(unittest.TestCase):
 
         win = VoucherEditWindow(order_no="cm1", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
-        actions = [a.text() for tb in win.findChildren(QToolBar) for a in tb.actions()]
+        actions = [a.text() for a in win._edit_header_widget.actions()]
         self.assertNotIn("座標マーカー", actions)
         # 内部関数はテスト用に残る。
         self.assertTrue(hasattr(win, "add_debug_markers"))
@@ -2346,7 +2337,7 @@ class TestVoucherEditWindow(unittest.TestCase):
 
         win = VoucherEditWindow(order_no="cm2", background_pdf_bytes=b"")
         self.addCleanup(win.deleteLater)
-        style = win.findChildren(QToolBar)[0].styleSheet()
+        style = win._edit_header_widget.styleSheet()
         self.assertIn("border", style)
         self.assertIn("border-radius", style)
         self.assertIn(":checked", style)
@@ -3152,7 +3143,7 @@ class TestVoucherEditShapeMenu(unittest.TestCase):
         from PySide6.QtWidgets import QToolBar
 
         win = self._make()
-        actions = [a.text() for tb in win.findChildren(QToolBar) for a in tb.actions()]
+        actions = [a.text() for a in win._edit_header_widget.actions()]
         for label in ("線", "矢印", "両矢印", "二重線", "四角", "丸"):
             self.assertNotIn(label, actions)
 

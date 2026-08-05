@@ -52,7 +52,7 @@ class TestVoucherEditTabletMode(unittest.TestCase):
         from PySide6.QtWidgets import QToolBar
 
         win = self._make_window()
-        actions = [a.text() for tb in win.findChildren(QToolBar) for a in tb.actions()]
+        actions = [a.text() for a in win._edit_header_widget.actions()]
         self.assertIn("タブレット", actions)
 
     def test_enter_sets_tablet_mode_true(self) -> None:

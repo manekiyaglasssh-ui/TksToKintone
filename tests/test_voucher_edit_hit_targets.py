@@ -93,9 +93,11 @@ class TestVoucherEditHitTargets(unittest.TestCase):
     def test_thin_horizontal_diagonal_and_short_line_hit(self) -> None:
         win = self._window()
         cases = (
-            (QPointF(20, 20), QPointF(120, 20), QPointF(70, 27)),
-            (QPointF(20, 50), QPointF(120, 100), QPointF(67, 82)),
-            (QPointF(20, 130), QPointF(25, 130), QPointF(22, 137)),
+            # hit width is defined in view pixels; convert the sample points to
+            # an unambiguous point inside that region at the fitted view scale.
+            (QPointF(20, 20), QPointF(120, 20), QPointF(70, 25)),
+            (QPointF(20, 50), QPointF(120, 100), QPointF(67, 79)),
+            (QPointF(20, 130), QPointF(25, 130), QPointF(22, 135)),
         )
         for index, (p1, p2, near) in enumerate(cases):
             line = win.add_line(p1, p2, line_width=0.5 if index != 1 else 1.0)

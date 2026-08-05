@@ -77,8 +77,10 @@ class TestVoucherEditFontFavorites(unittest.TestCase):
         self.assertIsInstance(win._favorite_font_button, QToolButton)
         self.assertIsInstance(win._font_family_combo, QComboBox)
         self.assertFalse(hasattr(win, "_favorite_font_combo"))
-        self.assertEqual(len(win.findChildren(
-            QComboBox, "textFontFamilyCombo")), 1)
+        self.assertIs(win._edit_header_widget.widgetForAction(
+            next(action for action in win._edit_header_widget.actions()
+                 if win._edit_header_widget.widgetForAction(action) is win._font_family_combo)),
+            win._font_family_combo)
         self.assertIsNone(win.findChild(QComboBox, "favoriteFontCombo"))
         win._font_family_combo.setCurrentFont(QFont(family))
         self.assertEqual(win._favorite_font_button.text(), "☆")
