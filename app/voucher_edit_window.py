@@ -77,6 +77,7 @@ from PySide6.QtGui import (
     QPainterPathStroker,
     QPen,
     QPixmap,
+    QCursor,
     QRawFont,
     QShortcut,
     QStandardItem,
@@ -5717,17 +5718,48 @@ class VoucherEditWindow(QMainWindow):
 
     # ── ツール状態 ───────────────────────────────────────────────────────────
     def set_tool(self, tool: str) -> None:
+        self._set_edit_tool_mode(tool)
+
+    def _set_edit_tool_mode(self, tool: str) -> None:
+        """編集ツールの実状態と全UI表現を一度に切り替える。
+
+        選択/テキストは通常ヘッダーの defaultAction、図形はメニュー内の
+        QActionGroup と別実体のボタンなので、ここを唯一の同期点にする。
+        """
+        previous = getattr(self, "current_tool", None)
+        if previous != tool:
+            # 図形・テキストのプレビューを次のツールへ持ち越すと、次のクリックで
+            # 古い作成処理が確定するため、ツール変更時は未確定状態を破棄する。
+            scene = getattr(self, "_scene", None)
+            if scene is not None:
+                scene.cancel_temp_item()
         self.current_tool = tool
-        # 選択モードはドラッグ選択、掴むモードは手のひらでパン、それ以外は描画優先。
+
+        # 選択モードはラバーバンド、掴むモードはパン、それ以外は描画。
         if tool == TOOL_SELECT:
             self._view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+            self._view.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         elif tool == TOOL_GRAB:
-            # ScrollHandDrag: ドラッグでプレビューをスクロール／パンする（手のひらカーソル）。
             self._view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self._view.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
         else:
             self._view.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self._view.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+
+        # ツールボタンは作り直されても QAction を正とし、表示ボタンへも明示同期する。
         self._update_tool_highlight()
-        # ツール切替でも背景は消さない（要件1・4）。
+        for mode in (TOOL_SELECT, TOOL_TEXT):
+            action = getattr(self, "_tool_actions", {}).get(mode)
+            if action is None:
+                continue
+            action.setEnabled(True)
+            widget = getattr(self, "_edit_action_widgets", {}).get(action)
+            if isinstance(widget, QToolButton):
+                widget.setEnabled(True)
+                widget.setChecked(mode == tool)
+        # 選択へ戻ったときは既存選択を使える状態にする。作成済みオブジェクトは維持する。
+        if tool == TOOL_SELECT:
+            self._scene.setFocus()
         self.ensure_background_visible()
 
     def _update_tool_highlight(self) -> None:
