@@ -88,10 +88,10 @@ class TestResizeHandles(unittest.TestCase):
         obj = win.serialize_objects()[0]
         self.assertGreater(obj["width"], 80.0)
         self.assertGreater(obj["height"], 24.0)
-        self.assertEqual(obj["font_size"], item.font_size)
+        self.assertGreater(obj["font_size"], 4.0)
 
-    def test_scene_handle_press_keeps_same_handle_alive_and_preserves_font_size(self) -> None:
-        """実イベント経路でpress時にハンドルを再生成せず、文字サイズを維持する。"""
+    def test_scene_handle_press_keeps_same_handle_alive_and_scales_font_size(self) -> None:
+        """実イベント経路でハンドルを再生成せず、開始時基準で文字も拡大する。"""
         from PySide6.QtWidgets import QGraphicsSceneMouseEvent
 
         win = self._make_window()
@@ -114,13 +114,30 @@ class TestResizeHandles(unittest.TestCase):
         self.assertIs(handle.source_item, item)
 
         handle.setPos(QPointF(240.0, 140.0))
-        self.assertEqual(item.font_size, before)
+        self.assertGreater(item.font_size, before)
         release = QGraphicsSceneMouseEvent(
             QGraphicsSceneMouseEvent.Type.GraphicsSceneMouseRelease)
         release.setScenePos(handle.pos())
         release.setButton(Qt.MouseButton.LeftButton)
         win._scene.mouseReleaseEvent(release)
-        self.assertEqual(item.font_size, before)
+        self.assertGreater(item.font_size, before)
+
+    def test_text_resize_uses_start_snapshot_without_cumulative_error(self) -> None:
+        win = self._make_window()
+        item = win.add_text_rect(
+            QRectF(40.0, 50.0, 80.0, 40.0), text="123",
+            font_size=20.0, auto_edit=False, auto_fit=False)
+        handle = self._select_resize_handle(win, item)
+        start_size = item.font_size
+        handle._resize_start_rect = QRectF(item.box_rect_scene())
+        handle._font_size_before = start_size
+        start_rect = handle._resize_start_rect
+        handle._resize_target(QPointF(start_rect.right() * 2.0 - start_rect.left(),
+                                      start_rect.bottom() * 2.0 - start_rect.top()))
+        expanded_size = item.font_size
+        handle._resize_target(start_rect.bottomRight())
+        self.assertAlmostEqual(item.font_size, start_size * 1.0, delta=0.01)
+        self.assertGreater(expanded_size, start_size)
 
     def test_handles_after_symbol_conversion_reference_new_text_item(self) -> None:
         """symbol_text昇格後の8ハンドルが、削除済みsymbolではなく新itemを指す。"""

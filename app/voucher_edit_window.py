@@ -2136,7 +2136,26 @@ class _EditTextItem(QGraphicsTextItem):
         self.setTextWidth(self.box_w)
         self._refresh_text_layout()
 
-    def set_manual_box_size(self, width: float, height: float) -> None:
+    def set_manual_box_size(self, width: float, height: float, *,
+                            original_width: float | None = None,
+                            original_height: float | None = None,
+                            original_font_size: float | None = None,
+                            scale: float | None = None) -> None:
+        """手動リサイズを、操作開始時の状態から適用する。
+
+        自動枠調整とは別経路で、枠の倍率を文字へ反映する。各mouseMoveで
+        現在のフォントへ倍率を掛けないため、往復ドラッグでも誤差が累積しない。
+        """
+        if (scale is None and original_width and original_height
+                and original_font_size is not None):
+            scale = min(float(width) / max(float(original_width), 0.1),
+                        float(height) / max(float(original_height), 0.1))
+        if scale is not None and original_font_size is not None:
+            self.font_size = max(4.0, min(200.0,
+                                           float(original_font_size) * float(scale)))
+            self.setFont(make_text_font(
+                self.font_size, self.font_family, self.font_bold,
+                self.font_italic, self.font_underline, self.font_strikeout))
         self.set_box_size(width, height)
 
     def box_rect_scene(self) -> QRectF:
@@ -3475,7 +3494,19 @@ class _ResizeHandle(QGraphicsRectItem):
                                new_rect.width(), new_rect.height()))
         elif isinstance(tgt, _EditTextItem):
             tgt.setPos(new_rect.topLeft())
-            tgt.set_manual_box_size(new_rect.width(), new_rect.height())
+            start = self._resize_start_rect or new_rect
+            if self._position in self.EDGES:
+                # 辺だけの操作では従来の自然な挙動（操作軸の倍率）を使う。
+                scale = ((new_rect.width() / max(start.width(), 0.1))
+                         if self._position in {"left", "right"}
+                         else (new_rect.height() / max(start.height(), 0.1)))
+            else:
+                scale = min(new_rect.width() / max(start.width(), 0.1),
+                            new_rect.height() / max(start.height(), 0.1))
+            tgt.set_manual_box_size(
+                new_rect.width(), new_rect.height(),
+                original_width=start.width(), original_height=start.height(),
+                original_font_size=self._font_size_before, scale=scale)
             scene = self.scene()
             window = getattr(scene, "_window", None) if scene is not None else None
             if window is not None:
