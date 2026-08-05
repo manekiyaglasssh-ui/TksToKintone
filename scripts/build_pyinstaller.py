@@ -1,4 +1,4 @@
-"""Build TksToKintone executables with an explicit subprocess argv list."""
+"""Build TksToKintone executables with paths resolved inside Python."""
 
 from __future__ import annotations
 
@@ -8,61 +8,54 @@ import sys
 from pathlib import Path
 
 
-def _common(project_root: Path, variant_dir: Path, dist_dir: Path, work_dir: Path) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "PyInstaller",
-        "--noconfirm",
-        "--clean",
-        "--specpath",
-        str(variant_dir),
-        "--distpath",
-        str(dist_dir),
-        "--workpath",
-        str(work_dir),
-        "--paths",
-        str(project_root),
-    ]
+SCRIPT_PATH = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT_PATH.parent.parent
+BUILD_ROOT = PROJECT_ROOT / "build"
+VARIANT_DIR = BUILD_ROOT / "variant"
+DIST_DIR = PROJECT_ROOT / "dist"
 
 
-def normal_args(project_root: Path, variant: str, variant_dir: Path, dist_dir: Path, work_dir: Path) -> list[str]:
-    variant_file = variant_dir / "build_variant.txt"
-    args = _common(project_root, variant_dir, dist_dir, work_dir) + [
-        "--onedir",
-        "--windowed",
-        "--name",
-        "TksToKintone",
-        "--icon",
-        str(project_root / "assets" / "app_icon.ico"),
-        "--version-file",
-        str(project_root / "installer" / "version_info.txt"),
-        "--add-data",
-        f"{project_root / 'templates'};templates",
-        "--add-data",
-        f"{project_root / 'docs' / 'olap'};docs/olap",
-        "--add-data",
-        f"{project_root / 'assets'};assets",
-        "--add-data",
-        f"{variant_file};.",
+def _common(variant_dir: Path, dist_dir: Path, work_dir: Path) -> list[str]:
+    return [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+            "--specpath", str(variant_dir), "--distpath", str(dist_dir),
+            "--workpath", str(work_dir), "--paths", str(PROJECT_ROOT)]
+
+
+def normal_args(variant: str, work_dir: Path) -> list[str]:
+    variant_file = VARIANT_DIR / "build_variant.txt"
+    args = _common(VARIANT_DIR, DIST_DIR, work_dir) + [
+        "--onedir", "--windowed", "--name", "TksToKintone",
+        "--icon", str(PROJECT_ROOT / "assets" / "app_icon.ico"),
+        "--version-file", str(PROJECT_ROOT / "installer" / "version_info.txt"),
+        "--add-data", f"{PROJECT_ROOT / 'templates'};templates",
+        "--add-data", f"{PROJECT_ROOT / 'docs' / 'olap'};docs/olap",
+        "--add-data", f"{PROJECT_ROOT / 'assets'};assets",
+        "--add-data", f"{variant_file};.",
     ]
     if variant == "no-update":
-        args.extend(["--exclude-module", "app.update_client", "--exclude-module", "app.update_helper"])
+        args += ["--exclude-module", "app.update_client", "--exclude-module", "app.update_helper"]
     else:
-        args.extend(["--hidden-import", "app.update_client"])
-    args.append(str(project_root / "app" / "main.py"))
+        args += ["--hidden-import", "app.update_client"]
+    args.append(str(PROJECT_ROOT / "app" / "main.py"))
     return args
 
 
-def helper_args(project_root: Path, variant_dir: Path, dist_dir: Path, work_dir: Path) -> list[str]:
-    args = _common(project_root, variant_dir, dist_dir, work_dir) + [
-        "--onefile",
-        "--console",
-        "--name",
-        "tks_update_helper",
+def helper_args(work_dir: Path) -> list[str]:
+    return _common(VARIANT_DIR, DIST_DIR, work_dir) + [
+        "--onefile", "--console", "--name", "tks_update_helper",
+        "--icon", str(PROJECT_ROOT / "assets" / "app_icon.ico"),
+        "--version-file", str(PROJECT_ROOT / "installer" / "version_info.txt"),
+        str(PROJECT_ROOT / "app" / "update_helper.py"),
     ]
-    args.append(str(project_root / "app" / "update_helper.py"))
-    return args
+
+
+def _required(mode: str, variant_file: Path) -> list[Path]:
+    paths = [PROJECT_ROOT / "templates", PROJECT_ROOT / "assets", PROJECT_ROOT / "docs" / "olap",
+             PROJECT_ROOT / "assets" / "app_icon.ico", PROJECT_ROOT / "installer" / "version_info.txt"]
+    paths.append(PROJECT_ROOT / "app" / ("main.py" if mode == "normal" else "update_helper.py"))
+    if mode == "normal":
+        paths.append(variant_file)
+    return paths
 
 
 def run_command(args: list[str]) -> int:
@@ -74,31 +67,26 @@ def run_command(args: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project-root", required=True, type=Path)
-    parser.add_argument("--variant-dir", required=True, type=Path)
-    parser.add_argument("--dist-dir", required=True, type=Path)
-    parser.add_argument("--work-dir", required=True, type=Path)
-    parser.add_argument("--variant", required=True)
-    parser.add_argument("--mode", choices=("normal", "helper"), required=True)
+    parser.add_argument("mode", choices=("normal", "helper"))
+    parser.add_argument("--dry-run", action="store_true")
     options = parser.parse_args(argv)
-
-    project_root = options.project_root.resolve()
-    variant_dir = options.variant_dir.resolve()
-    dist_dir = options.dist_dir.resolve()
-    work_dir = options.work_dir.resolve()
-    script = project_root / "app" / ("main.py" if options.mode == "normal" else "update_helper.py")
-    print(f"variant=[{options.variant}]")
-    print(f"project_root=[{project_root}]")
-    print(f"script=[{script}]")
-    print(f"script_exists=[{script.is_file()}]")
-    print(f"specpath=[{variant_dir}]")
-    print(f"distpath=[{dist_dir}]")
-    print(f"workpath=[{work_dir}]")
-    if not script.is_file():
-        print(f"ERROR: script not found: {script}")
+    variant_file = VARIANT_DIR / "build_variant.txt"
+    variant = variant_file.read_text(encoding="utf-8").strip() if variant_file.is_file() else "normal"
+    work_dir = BUILD_ROOT / ("work" if options.mode == "normal" else "helper-work")
+    script = PROJECT_ROOT / "app" / ("main.py" if options.mode == "normal" else "update_helper.py")
+    args = normal_args(variant, work_dir) if options.mode == "normal" else helper_args(work_dir)
+    print(f"Build mode: {options.mode}\nBuild script: {SCRIPT_PATH}\nProject root: {PROJECT_ROOT}")
+    print(f"Variant dir: {VARIANT_DIR}\nDist dir: {DIST_DIR}\nWork dir: {work_dir}")
+    print(f"Input script: {script}\nInput script exists: {script.is_file()}\nSpecpath: {VARIANT_DIR}")
+    missing = [path for path in _required(options.mode, variant_file) if not path.exists()]
+    if missing:
+        for path in missing:
+            print(f"ERROR: required path not found: {path}")
         return 1
-    args = normal_args(project_root, options.variant, variant_dir, dist_dir, work_dir) if options.mode == "normal" else helper_args(project_root, variant_dir, dist_dir, work_dir)
-    return run_command(args)
+    print("PyInstaller argv:")
+    for index, value in enumerate(args):
+        print(f"  argv[{index}] = {value!r}")
+    return 0 if options.dry_run else int(subprocess.run(args, check=False, shell=False).returncode)
 
 
 if __name__ == "__main__":

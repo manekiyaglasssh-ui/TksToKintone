@@ -127,15 +127,15 @@ if exist "%APP_DIR%" rmdir /S /Q "%APP_DIR%"
 if not exist "%VARIANT_DIR%" mkdir "%VARIANT_DIR%"
 > "%VARIANT_FILE%" echo %BUILD_VARIANT%
 
-python scripts\build_pyinstaller.py --project-root "%PROJECT_ROOT%" --variant-dir "%VARIANT_DIR%" --dist-dir "%DIST_DIR%" --work-dir "%CD%\build\work" --variant "%BUILD_VARIANT%" --mode normal
+python scripts\build_pyinstaller.py normal
 if errorlevel 1 (
   echo ERROR: TksToKintone build failed for %BUILD_VARIANT%.
   exit /b 1
 )
 
 :build_helper
-REM Build the update helper EXE onefile console. Avoids PowerShell during updates.
-python scripts\build_pyinstaller.py --project-root "%PROJECT_ROOT%" --variant-dir "%VARIANT_DIR%" --dist-dir "%DIST_DIR%" --work-dir "%CD%\build\helper-work" --variant "%BUILD_VARIANT%" --mode helper
+REM Build the update helper EXE onefile console.
+python scripts\build_pyinstaller.py helper
 if errorlevel 1 (
   echo ERROR: tks_update_helper build failed.
   exit /b 1
