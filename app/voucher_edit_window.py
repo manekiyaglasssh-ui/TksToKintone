@@ -182,8 +182,8 @@ class _WrappedActionHeader(QWidget):
         super().__init__(parent)
         self.setObjectName("mainEditHeader")
         self._layout = QHBoxLayout(self)
-        self._layout.setContentsMargins(8, 4, 8, 4)
-        self._layout.setSpacing(4)
+        self._layout.setContentsMargins(4, 4, 4, 4)
+        self._layout.setSpacing(2)
         self._entries: list[QWidget] = []
         self._actions: list[QAction] = []
         self._action_widgets: dict[QAction, QWidget] = {}
@@ -256,7 +256,10 @@ class _WrappedActionHeader(QWidget):
             self._layout.addWidget(widget)
             widget.show()
         self._layout.activate()
-        self.setMinimumWidth(self._layout.sizeHint().width())
+        # sizeHint の合計を minimumWidth に固定すると、Windows のDPI倍率上昇時に
+        # ヘッダーだけが論理画面幅を超えて右端を切り落とす。配置は一列のまま、
+        # 各コントロールの実幅はレイアウトに任せ、親ウィンドウへ収まれるようにする。
+        self.setMinimumWidth(0)
         self.setMinimumHeight(max(42, self._layout.sizeHint().height()))
 
 # 左ペインの基準幅（100%表示時。125%以上はDPIに応じて広げる・要件9）。
@@ -984,13 +987,13 @@ QToolBar { spacing: 2px; padding: 2px; }
 QToolBar QToolButton {
     border: 1px solid #666666;
     border-radius: 5px;
-    padding-left: 7px;
-    padding-right: 7px;
+    padding-left: 3px;
+    padding-right: 3px;
     padding-top: 5px;
     padding-bottom: 5px;
     min-height: 34px;
     margin: 0px;
-    font-size: 11pt;
+    font-size: 10pt;
     color: #202124;
 }
 QToolBar QToolButton:disabled { color: #707070; background: #eeeeee; }
@@ -5437,7 +5440,7 @@ class VoucherEditWindow(QMainWindow):
         self._font_family_combo = _FontFamilyComboBox(
             self._favorite_fonts, self.current_font_family)
         self._font_family_combo.setMinimumWidth(100)
-        self._font_family_combo.setMaximumWidth(130)
+        self._font_family_combo.setMaximumWidth(110)
         self._font_family_combo.currentFontChanged.connect(
             self._on_font_family_changed)
         bar.addWidget(self._font_family_combo)
