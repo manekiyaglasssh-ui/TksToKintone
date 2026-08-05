@@ -30,13 +30,11 @@ class TestVersion160(unittest.TestCase):
     def test_pyinstaller_version_info(self) -> None:
         version_info = (ROOT / "installer" / "version_info.txt").read_text(encoding="utf-8")
         spec = (ROOT / "TksToKintone.spec").read_text(encoding="utf-8")
-        build_script = (ROOT / "build_exe.bat").read_text(encoding="utf-8")
         self.assertIn("filevers=(1, 6, 0, 44)", version_info)
         self.assertIn("prodvers=(1, 6, 0, 44)", version_info)
         self.assertIn("StringStruct('FileVersion', '1.6.0.44')", version_info)
         self.assertIn("StringStruct('ProductVersion', '1.6.0.44')", version_info)
         self.assertIn("version='installer/version_info.txt'", spec)
-        self.assertIn("--version-file installer\\version_info.txt", build_script)
 
     def test_release_history_is_preserved(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")

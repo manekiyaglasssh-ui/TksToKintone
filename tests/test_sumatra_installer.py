@@ -66,7 +66,8 @@ class TestSumatraInstaller(unittest.TestCase):
         self.assertIn('set "PYTHONPATH=%PROJECT_ROOT%;%PYTHONPATH%"', self.build)
 
     def test_build_writes_pyinstaller_specs_under_build_variant(self) -> None:
-        self.assertGreaterEqual(self.build.count('--specpath "%VARIANT_DIR%"'), 2)
+        self.assertGreaterEqual(self.build.count('--variant-dir "%VARIANT_DIR%"'), 2)
+        self.assertIn('scripts\\build_pyinstaller.py', self.build)
         self.assertIn("installer/*.exe.sha256", (ROOT / ".gitignore").read_text())
 
     def test_allow_missing_sumatra_remains_a_development_only_success_path(self) -> None:
