@@ -7,6 +7,8 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPoint
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QToolBar, QToolButton
 
 from app.voucher_edit_window import VoucherEditWindow
@@ -29,16 +31,14 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                 self.assertNotIsInstance(header, QToolBar)
                 win.show()
                 self.app.processEvents()
-                self.assertGreaterEqual(win._favorite_font_button.width(), 32)
-                self.assertGreaterEqual(win._favorite_font_button.width(),
-                                        win._favorite_font_button.sizeHint().width())
+                self.assertEqual(win._favorite_font_button.width(), 64)
                 self.assertTrue(win._favorite_font_button.toolTip())
                 self.assertIn("background: transparent", win._favorite_font_button.styleSheet())
                 self.assertIn("border: none", win._favorite_font_button.styleSheet())
                 self.assertIsInstance(win._line_width_spin, QDoubleSpinBox)
                 self.assertEqual(win._line_width_group.layout().itemAt(1).widget(),
                                  win._line_width_spin)
-                self.assertEqual(win._line_width_spin.width(), 74)
+                self.assertGreaterEqual(win._line_width_spin.width(), 64)
                 self.assertEqual(win._line_width_spin.sizePolicy().horizontalPolicy().name,
                                  "Fixed")
                 labels = [action.text() for action in header.actions() if action.text()]
@@ -66,7 +66,7 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                     sorted(widget.geometry().x() for widget in widgets),
                 )
                 self.assertEqual(header.minimumWidth(), 0)
-                self.assertLessEqual(header.sizeHint().width(), 1280)
+                self.assertEqual(header.minimumSizeHint().width(), 0)
             finally:
                 if previous is None:
                     os.environ.pop("TKS_TO_KINTONE_HOME", None)
@@ -93,35 +93,80 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                 else:
                     os.environ["TKS_TO_KINTONE_HOME"] = previous
 
-    def test_header_fits_100_125_and_150_percent_logical_widths(self) -> None:
-        """標準的な1920px画面の論理幅（150%では1280px）でも右端を切らない。"""
+    def test_header_fits_actual_contents_rect_at_all_target_window_widths(self) -> None:
+        """配置確定後の実 contentsRect に全文表示の全要素が安全余裕付きで収まる。"""
         with tempfile.TemporaryDirectory() as home:
             previous = os.environ.get("TKS_TO_KINTONE_HOME")
+            previous_font = QFont(self.app.font())
+            test_font = QFont(previous_font)
+            test_font.setPointSize(9)
+            self.app.setFont(test_font)
             os.environ["TKS_TO_KINTONE_HOME"] = home
             try:
                 win = VoucherEditWindow(order_no="dpi-header", background_pdf_bytes=b"")
                 self.addCleanup(win.deleteLater)
                 header = win._main_toolbar
-                win.show()
+                win._default_maximize_applied = True
+                win.showNormal()
                 self.app.processEvents()
-                for scale, logical_width in ((1.0, 1920), (1.25, 1536), (1.5, 1280)):
-                    header.setFixedWidth(logical_width)
+                expected_modes = {1920: "NORMAL", 1536: "NORMAL", 1280: "COMPACT", 1260: "COMPACT"}
+                for target_width in (1920, 1536, 1280, 1260):
+                    win.resize(target_width, 800)
+                    self.app.processEvents()
                     header.layout().activate()
                     self.app.processEvents()
-                    visible = [header.widgetForAction(action) for action in header.actions()]
-                    visible = [widget for widget in visible if widget is not None and widget.isVisible()]
-                    self.assertLessEqual(
-                        max(widget.geometry().right() for widget in visible),
-                        header.width() - 1,
-                        f"right edge clipped at {scale * 100:.0f}%",
-                    )
-                self.assertLessEqual(header.layout().sizeHint().width(), 1280)
-                line = win._line_width_group.geometry()
+                    rect = header.contentsRect()
+                    widgets = [header.widgetForAction(action) for action in header.actions()]
+                    widgets = [widget for widget in widgets if widget is not None]
+                    with self.subTest(target_width=target_width):
+                        self.assertEqual(win.width(), target_width)
+                        self.assertEqual(win.centralWidget().width(), target_width)
+                        self.assertEqual(header.width(), target_width)
+                        self.assertEqual(win._toolbar_mode, expected_modes[target_width])
+                        self.assertTrue(all(widget.isVisible() for widget in widgets))
+                        self.assertTrue(all(widget.width() > 0 for widget in widgets))
+
+                        geometries = []
+                        for widget in widgets:
+                            top_left = widget.mapTo(header, QPoint(0, 0))
+                            bottom_right = widget.mapTo(header, widget.rect().bottomRight())
+                            geometries.append((top_left.x(), top_left.y(), bottom_right.x(), bottom_right.y()))
+                            self.assertGreaterEqual(top_left.x(), rect.left())
+                            self.assertLessEqual(bottom_right.x(), rect.right() - 8)
+                            self.assertGreaterEqual(top_left.y(), rect.top())
+                            self.assertLessEqual(bottom_right.y(), rect.bottom())
+                        for previous_widget, next_widget in zip(geometries, geometries[1:]):
+                            self.assertLess(previous_widget[2], next_widget[0])
+                            self.assertLessEqual(previous_widget[1], next_widget[3])
+                            self.assertLessEqual(next_widget[1], previous_widget[3])
+
+                        rightmost = max(geometry[2] for geometry in geometries)
+                        overflow = rightmost - (rect.right() - 8)
+                        self.assertLessEqual(overflow, 0)
+                        self.assertGreaterEqual(rect.right() - rightmost, 8)
+
+                        for action in header.actions():
+                            if action.text() not in (
+                                "プレビュー", "保存", "保存して閉じる", "閉じる", "全画面", "タブレット"
+                            ):
+                                continue
+                            button = header.widgetForAction(action)
+                            left = button.mapTo(header, QPoint(0, 0)).x()
+                            right = button.mapTo(header, button.rect().topRight()).x()
+                            self.assertGreaterEqual(left, rect.left())
+                            self.assertLessEqual(right, rect.right() - 8)
+                            readable = header.fontMetrics().horizontalAdvance(button.text()) + 8
+                            self.assertGreaterEqual(button.width(), readable)
+
                 label = win._line_width_group.layout().itemAt(0).widget().geometry()
                 spin = win._line_width_spin.geometry()
-                self.assertLessEqual(spin.left() - label.right(), 8)
-                self.assertLessEqual(line.width(), 120)
+                gap = spin.left() - label.right() - 1
+                self.assertGreaterEqual(gap, 2)
+                self.assertLessEqual(gap, 4)
+                self.assertEqual(win._line_width_group.sizePolicy().horizontalPolicy().name, "Fixed")
+                self.assertEqual(win._line_width_spin.sizePolicy().horizontalPolicy().name, "Fixed")
             finally:
+                self.app.setFont(previous_font)
                 if previous is None:
                     os.environ.pop("TKS_TO_KINTONE_HOME", None)
                 else:

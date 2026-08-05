@@ -108,6 +108,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QGridLayout,
     QHBoxLayout,
+    QLayout,
     QLabel,
     QLineEdit,
     QInputDialog,
@@ -182,6 +183,9 @@ class _WrappedActionHeader(QWidget):
         super().__init__(parent)
         self.setObjectName("mainEditHeader")
         self._layout = QHBoxLayout(self)
+        # 子の sizeHint 合計をトップレベルウィンドウの最小幅へ伝播させない。
+        # 実幅に合わせる処理は VoucherEditWindow 側で行う。
+        self._layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         self._layout.setContentsMargins(4, 4, 4, 4)
         self._layout.setSpacing(2)
         self._entries: list[QWidget] = []
@@ -235,6 +239,11 @@ class _WrappedActionHeader(QWidget):
 
     def widget(self):  # noqa: N802
         return self
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        # 一列の子要素合計を親ウィンドウの最小幅にはしない。resizeEvent 後に
+        # compact profile が各要素を可読最小幅へ設定する。
+        return QSize(0, max(42, self._layout.minimumSize().height()))
 
     def _relayout(self) -> None:
         if self._relayout_pending:
@@ -957,6 +966,7 @@ FAVORITE_FONT_DISABLED_COLOR = "#999999"
 FAVORITE_FONT_REGISTERED_DISABLED_COLOR = "#B88A00"
 FAVORITE_FONT_ICON_SIZE_PX = 24
 FAVORITE_FONT_BUTTON_WIDTH_PX = 64
+EDIT_HEADER_RIGHT_SAFETY_PX = 10
 
 # このボタンは共通の QToolButton テーマから分離する。親ヘッダーのテーマや
 # Windows のネイティブスタイルが再適用されても、星だけを表示する。
@@ -1013,8 +1023,8 @@ QToolBar QToolButton#favoriteFontButton:focus {
     border: none;
     padding: 0px;
     margin: 0px;
-    min-width: 48px;
-    max-width: 48px;
+    min-width: 64px;
+    max-width: 64px;
     font-size: 24px;
     color: #F2B705;
 }
@@ -5546,7 +5556,9 @@ class VoucherEditWindow(QMainWindow):
         self._main_toolbar_container = bar
         # ライト/ダークテーマに合わせて上部メニューの配色を適用する（要件6）。
         self._apply_toolbar_theme()
-        bar.setMinimumWidth(bar.sizeHint().width())
+        # 親の実 contentsRect より大きい minimumWidth を設定しない。表示後の
+        # resizeEvent で利用可能幅に応じた密度を選び、必ず一列のまま収める。
+        bar.setMinimumWidth(0)
         logging.getLogger("tks_to_kintone_app").info(
             "voucher_edit_toolbar_content_width %s",
             {"width": bar.sizeHint().width()},
@@ -9549,8 +9561,6 @@ class VoucherEditWindow(QMainWindow):
             logging.getLogger("tks_to_kintone_app").info("voucher_edit_geometry_restored_or_maximized")
             QTimer.singleShot(0, self.showMaximized)
         if self._main_toolbar_container is not None:
-            if self._main_toolbar is not None:
-                self._main_toolbar.setMinimumWidth(self._main_toolbar.sizeHint().width())
             needed = max(72, self._main_toolbar.sizeHint().height() + 22 if self._main_toolbar is not None else 72)
             if self._main_toolbar_container.minimumHeight() < needed:
                 self._main_toolbar_container.setMinimumHeight(needed)
@@ -9575,39 +9585,92 @@ class VoucherEditWindow(QMainWindow):
         self.fit_page_to_view()
 
     def _reevaluate_toolbar_mode(self) -> None:
-        """論理DPIと利用可能幅からツールバー密度を決める。"""
+        """実際のヘッダー contentsRect 幅から一列表示の密度を決める。"""
         bar = getattr(self, "_main_toolbar", None)
         container = getattr(self, "_main_toolbar_container", None)
         if bar is None or container is None:
             return
         screen = self.screen() or QGuiApplication.primaryScreen()
         dpi = float(screen.logicalDotsPerInch()) if screen else 96.0
-        available = int(screen.availableGeometry().width()) if screen else self.width()
+        available = max(0, bar.contentsRect().width())
         standard = QFont(self.font())
         standard.setPointSize(max(11, self.font().pointSize()))
         bar.setFont(standard)
-        # DPI変更時も操作順と表示段数を変えず、必要幅を持つ一列を維持する。
-        bar.setFont(standard)
-        mode = "ONE_ROW"
-        # 文字を縮めず、各QToolButtonがsizeHint以上になることを保証する。
-        self._ensure_toolbar_button_sizes(bar)
+        # 画面幅ではなく、レイアウト先そのものの実幅で段階的に余剰幅を削る。
+        # 10pt以上の文字と全文を維持し、ボタン非表示・折返しは行わない。
+        mode = self._apply_toolbar_density(bar, available)
         bar.setProperty("headerMode", mode)
-        bar.setStyleSheet(EDIT_TOOLBAR_STYLE)
         container.setMinimumHeight(max(48, bar.sizeHint().height() + 12))
         self._toolbar_mode = mode
-        _log.debug("voucher_edit_toolbar_mode mode=%s dpi=%.1f width=%s", mode, dpi, available)
+        QTimer.singleShot(0, self._log_toolbar_geometry_metrics)
+        _log.debug("voucher_edit_toolbar_mode mode=%s dpi=%.1f available_header_width=%s", mode, dpi, available)
 
-    @staticmethod
-    def _ensure_toolbar_button_sizes(bar: QToolBar) -> None:
+    def _apply_toolbar_density(self, bar: _WrappedActionHeader, available: int) -> str:
+        """幅の優先順位に従い、各部品の余剰幅だけを段階的に縮める。"""
+        if available >= 1450:
+            mode, margins, spacing, family, size, line, extra = (
+                "NORMAL", (4, 4, 10, 4), 2, 110, 72, 74, 14)
+        elif available >= 1350:
+            mode, margins, spacing, family, size, line, extra = (
+                "MEDIUM", (3, 4, 10, 4), 1, 104, 68, 70, 12)
+        else:
+            mode, margins, spacing, family, size, line, extra = (
+                "COMPACT", (1, 4, 10, 4), 0, 92, 60, 64, 8)
+        bar.layout().setContentsMargins(*margins)
+        bar.layout().setSpacing(spacing)
+        self._font_family_combo.setFixedWidth(family)
+        self._font_size_spin.setFixedWidth(size)
+        self._line_width_spin.setFixedWidth(line)
+        self._line_width_group.layout().setSpacing(3)
+
+        metrics = bar.fontMetrics()
         for action in bar.actions():
             widget = bar.widgetForAction(action)
             if widget is None:
                 continue
             if widget.objectName() == "favoriteFontButton":
                 continue
-            hint = widget.sizeHint()
-            widget.setMinimumWidth(max(widget.minimumWidth(), hint.width()))
-            widget.setMinimumHeight(max(widget.minimumHeight(), hint.height()))
+            if isinstance(widget, QToolButton):
+                menu_allowance = 14 if widget.menu() is not None else 0
+                text_width = metrics.horizontalAdvance(widget.text())
+                width = max(34, text_width + extra + menu_allowance)
+                widget.setFixedWidth(width)
+                widget.setMinimumHeight(max(34, widget.minimumSizeHint().height()))
+                widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            else:
+                widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        bar.setMinimumWidth(0)
+        bar.layout().activate()
+        return mode
+
+    def _log_toolbar_geometry_metrics(self) -> None:
+        """配置確定後の実 geometry と overflow を診断ログへ出す。"""
+        header = getattr(self, "_main_toolbar", None)
+        if header is None:
+            return
+        rect = header.contentsRect()
+        widgets = [header.widgetForAction(action) for action in header.actions()]
+        widgets = [widget for widget in widgets if widget is not None and widget.isVisible()]
+        if not widgets:
+            return
+        rightmost = max(widget.mapTo(header, widget.rect().topRight()).x() for widget in widgets)
+        margins = header.layout().contentsMargins()
+        total_required = header.layout().sizeHint().width()
+        _log.info(
+            "voucher_edit_header_geometry %s",
+            {
+                "window_width": self.width(),
+                "central_widget_width": self.centralWidget().width() if self.centralWidget() else 0,
+                "header_width": header.width(),
+                "available_header_width": rect.width(),
+                "total_required_width": total_required,
+                "rightmost_control_right": rightmost,
+                "overflow_pixels": rightmost - (rect.right() - EDIT_HEADER_RIGHT_SAFETY_PX),
+                "contents_margins": (margins.left(), margins.top(), margins.right(), margins.bottom()),
+                "spacing": header.layout().spacing(),
+                "tablet_right": header.widgetForAction(self._tablet_action).geometry().right(),
+            },
+        )
 
     # ── 終了処理 ──────────────────────────────────────────────────────────────
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt命名)

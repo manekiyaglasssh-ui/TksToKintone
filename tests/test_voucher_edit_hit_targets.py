@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PySide6.QtCore import QPointF, QRectF, Qt
     from PySide6.QtGui import QFocusEvent, QTransform
-    from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsSceneMouseEvent
+    from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsSceneMouseEvent, QToolButton
 
     PYSIDE_AVAILABLE = True
 except Exception:  # pragma: no cover
@@ -60,8 +60,9 @@ class TestVoucherEditHitTargets(unittest.TestCase):
         win = self._window()
         for action in win._main_toolbar.actions():
             widget = win._main_toolbar.widgetForAction(action)
-            if widget is not None and widget.objectName() != "favoriteFontButton":
-                self.assertGreaterEqual(widget.minimumWidth(), widget.sizeHint().width())
+            if isinstance(widget, QToolButton) and widget.objectName() != "favoriteFontButton":
+                readable = win._main_toolbar.fontMetrics().horizontalAdvance(widget.text()) + 8
+                self.assertGreaterEqual(widget.minimumWidth(), readable)
         self.assertEqual(
             win._main_toolbar_container.horizontalScrollBarPolicy(),
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,

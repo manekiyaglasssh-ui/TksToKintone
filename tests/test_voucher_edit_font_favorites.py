@@ -193,8 +193,8 @@ class TestVoucherEditFontFavorites(unittest.TestCase):
         self.assertIn("background: transparent", edit.EDIT_TOOLBAR_STYLE)
         self.assertIn("border: none", edit.EDIT_TOOLBAR_STYLE)
         self.assertIn("font-size: 24px", edit.EDIT_TOOLBAR_STYLE)
-        self.assertIn("min-width: 48px", edit.EDIT_TOOLBAR_STYLE)
-        self.assertIn("max-width: 48px", edit.EDIT_TOOLBAR_STYLE)
+        self.assertIn("min-width: 64px", edit.EDIT_TOOLBAR_STYLE)
+        self.assertIn("max-width: 64px", edit.EDIT_TOOLBAR_STYLE)
         combined_styles = (
             edit.EDIT_TOOLBAR_STYLE
             + edit.EDIT_TOOLBAR_LIGHT_STYLE
