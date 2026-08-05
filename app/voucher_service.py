@@ -3481,16 +3481,30 @@ def draw_text_in_scene_rect(
     # 持つため、実生成では必ずQt輪郭経路へ入る。
     if object_id is None or font_metadata is None or not hasattr(c, "beginPath"):
         c.setFont(font_name, font_size)
+        x, y, w, h = _scene_rect_to_pdf_rect(scene_x, scene_y, width, height)
+        lines = str(text or "").splitlines() or [""]
+        line_h = line_height_pt(font_size)
+        total_h = line_h * len(lines)
         if text_align == "right":
+            draw_x = x + w
             draw_method = c.drawRightString
         elif text_align == "center":
+            draw_x = x + w / 2.0
             draw_method = c.drawCentredString
         else:
+            draw_x = x
             draw_method = c.drawString
-        baseline = PAGE_H - scene_y - font_size
-        draw_method(scene_x, baseline, text)
+        if vertical_align == "top":
+            baseline = y + h - font_size
+        elif vertical_align == "bottom":
+            baseline = y + total_h - font_size
+        else:
+            baseline = y + (h + total_h) / 2.0 - font_size
+        if _voucher_edit_debug_boxes_enabled():
+            _draw_debug_text_guides(c, x, y, w, h, baseline)
+        draw_method(draw_x, baseline, text)
         if bold and font_name == _FONT_NAME:
-            draw_method(scene_x + TEXT_SYNTHETIC_BOLD_OFFSET_PT, baseline, text)
+            draw_method(draw_x + TEXT_SYNTHETIC_BOLD_OFFSET_PT, baseline, text)
         if underline or strikeout:
             line_width, underline_offset, strikeout_offset = decoration_geometry(font_size)
             c.setLineWidth(line_width)
@@ -3505,6 +3519,14 @@ def draw_text_in_scene_rect(
     # 同じQt QFontから作った輪郭をPDFへ転送することで、HGP等のWindows
     # フォントをPDF側で別familyへ置換する余地をなくす。
     ensure_qt_application()
+    if trace_id and object_id is not None:
+        _log.info(
+            "event=draw_styled_pdf_text trace_id=%s object_id=%s "
+            "font_italic=%s synthetic_bold_used=%s synthetic_italic_used=%s "
+            "edit_objects_sha256=%s",
+            trace_id, object_id, italic, bool(bold), bool(italic),
+            edit_objects_sha256,
+        )
     from app.voucher_edit_window import make_text_font
     qt_font = make_text_font(font_size, (font_metadata or {}).get(
         "requested_family", ""), bold, italic, False, False)

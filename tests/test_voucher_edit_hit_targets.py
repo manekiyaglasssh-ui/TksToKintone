@@ -207,9 +207,11 @@ class TestVoucherEditHitTargets(unittest.TestCase):
                 pos = item.mapToScene(
                     QPointF(hit.right() - 0.5, hit.center().y()))
             double_click_at(pos)
-            self.assertTrue(item.textInteractionFlags()
+            editable = win._scene.focusItem()
+            self.assertIsNotNone(editable)
+            self.assertTrue(editable.textInteractionFlags()
                             & Qt.TextInteractionFlag.TextEditorInteraction)
-            item.clearFocus()
+            editable.clearFocus()
             QApplication.processEvents()
 
         # 右クリック「編集」。

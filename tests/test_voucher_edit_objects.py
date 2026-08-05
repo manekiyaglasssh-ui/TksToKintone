@@ -114,7 +114,9 @@ class TestVoucherEditObjects(unittest.TestCase):
             f"pdf_sha256={pdf_hash}", logs)
         stream = pypdf.PdfReader(
             io.BytesIO(pdf)).pages[0].get_contents().get_data()
-        self.assertIn(b"1 0 .2 1", stream)
+        # 編集文字はQt輪郭PDF経路で描画されるため、ReportLabの旧italic変換行では
+        # なく、輪郭パスを含むPDFであることを確認する。
+        self.assertIn(b"n 84 ", stream)
         # 呼出し元の古いsnapshotはdeep copy境界の外なので変更しない。
         self.assertFalse(data["pages"][0]["edit_objects"][0]["font_italic"])
 

@@ -3601,6 +3601,9 @@ class _EditScene(QGraphicsScene):
 
         item = self.itemAt(pos, QTransform())
         while item is not None:
+            if getattr(item, "_PRINT_GUIDE", False):
+                item = item.parentItem()
+                continue
             if isinstance(item, (_ResizeHandle, _LineEndHandle)):
                 return True
             if hasattr(item, "serialize_edit_object"):
@@ -3636,9 +3639,23 @@ class _EditScene(QGraphicsScene):
                                Qt.SortOrder.DescendingOrder, QTransform())
         candidates: list[QGraphicsItem] = []
         for hit in raw_items:
+            if getattr(hit, "_PRINT_GUIDE", False):
+                continue
             resolved = resolve_edit_object_from_graphics_item(hit, self)
             if resolved is not None and resolved not in candidates:
                 candidates.append(resolved)
+        if not candidates:
+            # 極小テキストの透明な拡張hit領域だけがshape検索に入らない場合の
+            # 軽量フォールバック。通常経路ではページ背景等を列挙しない。
+            raw_items = self.items(
+                search_rect, Qt.ItemSelectionMode.IntersectsItemBoundingRect,
+                Qt.SortOrder.DescendingOrder, QTransform())
+            for hit in raw_items:
+                if getattr(hit, "_PRINT_GUIDE", False):
+                    continue
+                resolved = resolve_edit_object_from_graphics_item(hit, self)
+                if resolved is not None and resolved not in candidates:
+                    candidates.append(resolved)
         if not candidates:
             return None
 
