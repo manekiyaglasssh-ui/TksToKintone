@@ -964,7 +964,7 @@ FAVORITE_FONT_UNREGISTERED_DARK_COLOR = "#E6E6E6"
 FAVORITE_FONT_DISABLED_COLOR = "#999999"
 FAVORITE_FONT_REGISTERED_DISABLED_COLOR = "#B88A00"
 FAVORITE_FONT_ICON_SIZE_PX = 18
-FAVORITE_FONT_BUTTON_WIDTH_PX = 24
+FAVORITE_FONT_BUTTON_WIDTH_PX = 48
 
 # ツールバーのボタン幅・余白を広げ、削除=警告色/保存=安全色を割り当てる（要件2-5・2-6・2-7・3）。
 # ライト/ダーク両モードで文字が読めるよう、警告色・安全色は白文字＋濃色背景にする。
@@ -999,8 +999,8 @@ QToolBar QToolButton#favoriteFontButton:focus {
     border: none;
     padding: 0px;
     margin: 0px;
-    min-width: 24px;
-    max-width: 24px;
+    min-width: 48px;
+    max-width: 48px;
     font-size: 18px;
 }
 QToolBar QToolButton[editToolButton="true"]:checked {
@@ -5332,6 +5332,13 @@ class VoucherEditWindow(QMainWindow):
             # 全体テーマの後に dynamic property を再設定して再 polish し、
             # favorite 専用のテーマ色を確実に反映する。
             self._refresh_favorite_font_button_style()
+            favorite = getattr(self, "_favorite_font_button", None)
+            if favorite is not None:
+                width = max(FAVORITE_FONT_BUTTON_WIDTH_PX,
+                            favorite.sizeHint().width())
+                favorite.setMinimumWidth(width)
+                favorite.setMaximumWidth(width)
+                favorite.setFixedWidth(width)
         container = getattr(self, "_main_toolbar_container", None)
         if container is not None and container is not bar:
             bg = EDIT_TOOLBAR_CONTAINER_DARK_BG if dark else EDIT_TOOLBAR_CONTAINER_LIGHT_BG
@@ -5424,8 +5431,11 @@ class VoucherEditWindow(QMainWindow):
         self._sync_favorite_font_controls()
 
         self._font_size_spin = _FontSizeComboBox()
-        self._font_size_spin.setMinimumWidth(48)
-        self._font_size_spin.setMaximumWidth(64)
+        self._font_size_spin.setMinimumWidth(72)
+        self._font_size_spin.setMaximumWidth(72)
+        self._font_size_spin.setFixedWidth(72)
+        self._font_size_spin.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._font_size_spin.setToolTip("文字サイズ (4～200pt)")
         self._font_size_spin.setValue(self.current_font_size)
         self._font_size_spin.valueChanged.connect(self._on_font_size_changed)
@@ -5462,15 +5472,26 @@ class VoucherEditWindow(QMainWindow):
         self._sync_text_decoration_actions()
         bar.addSeparator()
 
-        # 線幅変更UI（要件9）。
-        bar.addWidget(QLabel(" 線幅: "))
+        # 線幅変更UI（要件9）。ラベルと入力欄を1つの折り返し単位にする。
+        line_width_group = QWidget()
+        line_width_group.setObjectName("lineWidthGroup")
+        line_width_layout = QHBoxLayout(line_width_group)
+        line_width_layout.setContentsMargins(0, 0, 0, 0)
+        line_width_layout.setSpacing(2)
+        line_width_layout.addWidget(QLabel("線幅:"))
         self._line_width_spin = QDoubleSpinBox()
         self._line_width_spin.setRange(0.1, 20.0)
-        self._line_width_spin.setMaximumWidth(60)
+        self._line_width_spin.setMinimumWidth(74)
+        self._line_width_spin.setMaximumWidth(74)
+        self._line_width_spin.setFixedWidth(74)
+        self._line_width_spin.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._line_width_spin.setSingleStep(0.5)
         self._line_width_spin.setValue(self.current_line_width)
         self._line_width_spin.valueChanged.connect(self._on_line_width_changed)
-        bar.addWidget(self._line_width_spin)
+        line_width_layout.addWidget(self._line_width_spin)
+        self._line_width_group = line_width_group
+        bar.addWidget(line_width_group)
 
         # 反映先テンプレートは左側の縦並びパネルへ表示する（要件5）。ツールバーには置かない。
         # 画像挿入・貼り付け（要件2-3・2-4）。

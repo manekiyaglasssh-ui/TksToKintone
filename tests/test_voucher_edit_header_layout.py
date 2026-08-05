@@ -7,7 +7,7 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QToolBar, QToolButton
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QToolBar, QToolButton
 
 from app.voucher_edit_window import VoucherEditWindow
 
@@ -27,6 +27,18 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                 header = win._main_toolbar
                 self.assertIsNotNone(header)
                 self.assertNotIsInstance(header, QToolBar)
+                win.show()
+                self.app.processEvents()
+                self.assertGreaterEqual(win._favorite_font_button.width(), 32)
+                self.assertGreaterEqual(win._favorite_font_button.width(),
+                                        win._favorite_font_button.sizeHint().width())
+                self.assertTrue(win._favorite_font_button.toolTip())
+                self.assertIsInstance(win._line_width_spin, QDoubleSpinBox)
+                self.assertEqual(win._line_width_group.layout().itemAt(1).widget(),
+                                 win._line_width_spin)
+                self.assertEqual(win._line_width_spin.width(), 74)
+                self.assertEqual(win._line_width_spin.sizePolicy().horizontalPolicy().name,
+                                 "Fixed")
                 labels = [action.text() for action in header.actions() if action.text()]
                 labels += [button.text() for button in header.findChildren(QToolButton)]
                 labels.append(win._shape_tool_button.text())
