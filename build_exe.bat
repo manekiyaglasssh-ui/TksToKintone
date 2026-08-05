@@ -99,6 +99,24 @@ set "DIST_DIR=%CD%\dist"
 set "APP_DIR=%CD%\dist\TksToKintone"
 set "VARIANT_DIR=%CD%\build\variant"
 set "VARIANT_FILE=%VARIANT_DIR%\build_variant.txt"
+set "MAIN_SCRIPT=%PROJECT_ROOT%app\main.py"
+set "UPDATE_HELPER_SCRIPT=%PROJECT_ROOT%app\update_helper.py"
+
+echo(
+echo Build diagnostics:
+echo PROJECT_ROOT=[%PROJECT_ROOT%]
+echo VARIANT_DIR=[%VARIANT_DIR%]
+echo MAIN_SCRIPT=[%MAIN_SCRIPT%]
+echo UPDATE_HELPER_SCRIPT=[%UPDATE_HELPER_SCRIPT%]
+echo BUILD_VARIANT=[%BUILD_VARIANT%]
+if not exist "%MAIN_SCRIPT%" (
+  echo ERROR: Main script not found: "%MAIN_SCRIPT%"
+  exit /b 1
+)
+if not exist "%UPDATE_HELPER_SCRIPT%" (
+  echo ERROR: Update helper script not found: "%UPDATE_HELPER_SCRIPT%"
+  exit /b 1
+)
 
 if not exist .venv (
   py -3.11 -m venv .venv
@@ -124,8 +142,13 @@ if not exist "%VARIANT_DIR%" mkdir "%VARIANT_DIR%"
 
 set "PYINSTALLER_UPDATE_ARGS=--hidden-import app.update_client"
 if /I "%BUILD_VARIANT%"=="no-update" set "PYINSTALLER_UPDATE_ARGS=--exclude-module app.update_client --exclude-module app.update_helper"
-REM Build the main application EXE. Keep the command on one line.
-python -m PyInstaller --noconfirm --clean --specpath "%VARIANT_DIR%" --paths "%PROJECT_ROOT%" --onedir --windowed --name TksToKintone --icon "%PROJECT_ROOT%assets\app_icon.ico" --version-file "%PROJECT_ROOT%installer\version_info.txt" --add-data "%PROJECT_ROOT%templates;templates" --add-data "%PROJECT_ROOT%docs\olap;docs\olap" --add-data "%PROJECT_ROOT%assets;assets" --add-data "%VARIANT_FILE%;." %PYINSTALLER_UPDATE_ARGS% "%PROJECT_ROOT%app\main.py"
+REM Keep each PyInstaller invocation on one physical line.  In particular,
+REM the scriptname must be the final positional argument; do not put it in
+REM an option variable or on a continued line.
+REM The version-file option is rooted at PROJECT_ROOT below (historically
+REM documented as: --version-file installer\version_info.txt).
+echo PyInstaller normal command: python -m PyInstaller --noconfirm --clean --specpath "%VARIANT_DIR%" --paths "%PROJECT_ROOT%" --onedir --windowed --name TksToKintone --icon "%PROJECT_ROOT%assets\app_icon.ico" --version-file "%PROJECT_ROOT%installer\version_info.txt" --add-data "%PROJECT_ROOT%templates;templates" --add-data "%PROJECT_ROOT%docs\olap;docs\olap" --add-data "%PROJECT_ROOT%assets;assets" --add-data "%VARIANT_FILE%;." %PYINSTALLER_UPDATE_ARGS% "%MAIN_SCRIPT%"
+python -m PyInstaller --noconfirm --clean --specpath "%VARIANT_DIR%" --paths "%PROJECT_ROOT%" --onedir --windowed --name TksToKintone --icon "%PROJECT_ROOT%assets\app_icon.ico" --version-file "%PROJECT_ROOT%installer\version_info.txt" --add-data "%PROJECT_ROOT%templates;templates" --add-data "%PROJECT_ROOT%docs\olap;docs\olap" --add-data "%PROJECT_ROOT%assets;assets" --add-data "%VARIANT_FILE%;." %PYINSTALLER_UPDATE_ARGS% "%MAIN_SCRIPT%"
 if errorlevel 1 (
   echo ERROR: TksToKintone build failed for %BUILD_VARIANT%.
   exit /b 1
@@ -133,7 +156,8 @@ if errorlevel 1 (
 
 :build_helper
 REM Build the update helper EXE onefile console. Avoids PowerShell during updates.
-python -m PyInstaller --noconfirm --clean --specpath "%VARIANT_DIR%" --paths "%PROJECT_ROOT%" --onefile --console --name tks_update_helper "%PROJECT_ROOT%app\update_helper.py"
+echo PyInstaller helper command: python -m PyInstaller --noconfirm --clean --specpath "%VARIANT_DIR%" --paths "%PROJECT_ROOT%" --onefile --console --name tks_update_helper "%UPDATE_HELPER_SCRIPT%"
+python -m PyInstaller --noconfirm --clean --specpath "%VARIANT_DIR%" --paths "%PROJECT_ROOT%" --onefile --console --name tks_update_helper "%UPDATE_HELPER_SCRIPT%"
 if errorlevel 1 (
   echo ERROR: tks_update_helper build failed.
   exit /b 1
