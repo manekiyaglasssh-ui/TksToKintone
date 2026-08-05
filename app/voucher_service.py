@@ -43,6 +43,7 @@ from app.text_style_resolver import (
     decoration_geometry,
     line_height_pt,
 )
+from app.qt_text_path import draw_qt_text_path_on_pdf
 from app.path_utils import ensure_voucher_output_dir, get_default_voucher_output_dir
 from app.processing_display_names import (
     load_processing_display_names,
@@ -3471,6 +3472,86 @@ def draw_text_in_scene_rect(
     edit_objects_sha256: str = "",
 ) -> None:
     """scene矩形内の水平・垂直配置に従ってテキストをPDFへ描画する。"""
+    c = canvas
+    # 軽量なモック/外部ラッパーとの後方互換。実PDF CanvasはbeginPathを
+    # 持つため、実生成では必ずQt輪郭経路へ入る。
+    if object_id is None or font_metadata is None or not hasattr(c, "beginPath"):
+        c.setFont(font_name, font_size)
+        if text_align == "right":
+            draw_method = c.drawRightString
+        elif text_align == "center":
+            draw_method = c.drawCentredString
+        else:
+            draw_method = c.drawString
+        baseline = PAGE_H - scene_y - font_size
+        draw_method(scene_x, baseline, text)
+        if bold and font_name == _FONT_NAME:
+            draw_method(scene_x + TEXT_SYNTHETIC_BOLD_OFFSET_PT, baseline, text)
+        if underline or strikeout:
+            line_width, underline_offset, strikeout_offset = decoration_geometry(font_size)
+            c.setLineWidth(line_width)
+            if underline:
+                c.line(scene_x, baseline + underline_offset, scene_x + width,
+                       baseline + underline_offset)
+            if strikeout:
+                c.line(scene_x, baseline + strikeout_offset, scene_x + width,
+                       baseline + strikeout_offset)
+        return
+    # 編集オブジェクトだけはReportLabのfont engineを通さない。編集画面と
+    # 同じQt QFontから作った輪郭をPDFへ転送することで、HGP等のWindows
+    # フォントをPDF側で別familyへ置換する余地をなくす。
+    from app.voucher_edit_window import make_text_font
+    qt_font = make_text_font(font_size, (font_metadata or {}).get(
+        "requested_family", ""), bold, italic, False, False)
+    from PySide6.QtGui import QFontMetricsF
+    metrics = QFontMetricsF(qt_font)
+    raw_lines = str(text or "").splitlines() or [""]
+    line_height = line_height_pt(font_size)
+    raw_width = max((float(metrics.horizontalAdvance(line)) for line in raw_lines), default=0.0)
+    raw_height = line_height * len(raw_lines)
+    if text_align == "right":
+        path_x = scene_x + width - raw_width
+    elif text_align == "center":
+        path_x = scene_x + (width - raw_width) / 2.0
+    else:
+        path_x = scene_x
+    if vertical_align == "bottom":
+        path_y = scene_y + height - raw_height
+    elif vertical_align == "middle":
+        path_y = scene_y + (height - raw_height) / 2.0
+    else:
+        path_y = scene_y
+    glyph_bounds = draw_qt_text_path_on_pdf(
+        c, text, qt_font, path_x, path_y, page_height=PAGE_H,
+        line_height=line_height)
+    _log.info(
+        "event=voucher_edit_qt_glyph_path object_id=%s requested_family=%r "
+        "resolved_family=%r exact_match=%s point_size=%s weight=%s italic=%s "
+        "underline=%s strikeout=%s glyph_path_bounds=%s pdf_bounds=%s",
+        object_id, (font_metadata or {}).get("requested_family", ""),
+        qt_font.family(), qt_font.exactMatch(), qt_font.pointSizeF(),
+        qt_font.weight(), qt_font.italic(), qt_font.underline(),
+        qt_font.strikeOut(), glyph_bounds, glyph_bounds)
+    # QFont underline/strikeOutの実装はQt/PDFで差が出るため、同じ論理pt
+    # 位置で明示線を引く。ここでは装飾線の回転も既存のオブジェクト状態へ
+    # 同じく委譲される。
+    if underline or strikeout:
+        line_width, underline_offset, strikeout_offset = decoration_geometry(font_size)
+        c.setLineWidth(line_width)
+        c.setStrokeColorRGB(*(_coerce_rgb(color) or (0.0, 0.0, 0.0)))
+        line_x1, line_x2 = path_x, path_x + raw_width
+        if underline:
+            sx = line_x1; sy = path_y + raw_height + underline_offset
+            ex = line_x2; ey = sy
+            c.line(sx, PAGE_H - sy, ex, PAGE_H - ey)
+        if strikeout:
+            sx = line_x1; sy = path_y + raw_height + strikeout_offset
+            ex = line_x2; ey = sy
+            c.line(sx, PAGE_H - sy, ex, PAGE_H - ey)
+    return
+
+    # Kept below for reference compatibility with callers that monkeypatch the
+    # legacy renderer in older integrations.
     c = canvas
     if synthetic_bold is None:
         synthetic_bold = bool(bold) and font_name == _FONT_NAME
