@@ -43,7 +43,7 @@ from app.text_style_resolver import (
     decoration_geometry,
     line_height_pt,
 )
-from app.qt_text_path import draw_qt_text_path_on_pdf
+from app.qt_text_path import draw_qt_text_path_on_pdf, ensure_qt_application
 from app.path_utils import ensure_voucher_output_dir, get_default_voucher_output_dir
 from app.processing_display_names import (
     load_processing_display_names,
@@ -3500,6 +3500,7 @@ def draw_text_in_scene_rect(
     # 編集オブジェクトだけはReportLabのfont engineを通さない。編集画面と
     # 同じQt QFontから作った輪郭をPDFへ転送することで、HGP等のWindows
     # フォントをPDF側で別familyへ置換する余地をなくす。
+    ensure_qt_application()
     from app.voucher_edit_window import make_text_font
     qt_font = make_text_font(font_size, (font_metadata or {}).get(
         "requested_family", ""), bold, italic, False, False)

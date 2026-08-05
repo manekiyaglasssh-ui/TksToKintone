@@ -556,7 +556,7 @@ class TestVoucherPdfTextStyles(unittest.TestCase):
         stream = pypdf.PdfReader(io.BytesIO(combined_pdf)).pages[0].get_contents().get_data()
         self.assertIn(b"1 0 .2 1", stream)
 
-    def test_edit_object_e2e_bold_italic_and_italic_both_shear(self) -> None:
+    def test_edit_object_e2e_bold_italic_and_italic_use_qt_glyph_paths(self) -> None:
         import fitz
         from reportlab.pdfgen.canvas import Canvas
 
@@ -583,19 +583,16 @@ class TestVoucherPdfTextStyles(unittest.TestCase):
         upper_log = next(line for line in captured.output if "object_id=upper" in line)
         lower_log = next(line for line in captured.output if "object_id=lower" in line)
         self.assertIn("font_bold=True", upper_log)
-        self.assertIn("synthetic_bold_used=True", upper_log)
-        self.assertIn("synthetic_italic_used=True", upper_log)
-        self.assertIn("font_run_count=1", upper_log)
+        self.assertIn("event=voucher_edit_qt_glyph_path", logs)
+        self.assertIn("weight=", logs)
+        self.assertIn("italic=True", logs)
         self.assertIn("font_bold=False", lower_log)
-        self.assertIn("synthetic_bold_used=False", lower_log)
-        self.assertIn("synthetic_italic_used=True", lower_log)
+        self.assertIn("italic=True", lower_log)
         self.assertEqual(logs.count("object_id=upper"), 2)
         self.assertEqual(logs.count("object_id=lower"), 2)
-        self.assertIn("run_contains_cjk=true", upper_log + logs)
-        self.assertIn("italic_strategy=synthetic_cjk", upper_log + logs)
-        self.assertIn("native_italic_face_used=false", logs)
         stream = pypdf.PdfReader(io.BytesIO(pdf)).pages[0].get_contents().get_data()
-        self.assertGreaterEqual(stream.count(b"1 0 .2 1"), 2)
+        self.assertNotIn(b"1 0 .2 1", stream)
+        self.assertIn(b"f*", stream)
         with fitz.open(stream=pdf, filetype="pdf") as document:
             upper = document[0].get_pixmap(
                 matrix=fitz.Matrix(3, 3), clip=fitz.Rect(70, 65, 320, 125),
@@ -636,7 +633,8 @@ class TestVoucherPdfTextStyles(unittest.TestCase):
             hashlib.sha256(normal_pdf).digest(), hashlib.sha256(italic_pdf).digest())
         self.assertNotEqual(self._dark_pixels(normal_pdf), self._dark_pixels(italic_pdf))
         stream = pypdf.PdfReader(io.BytesIO(italic_pdf)).pages[0].get_contents().get_data()
-        self.assertIn(b"1 0 .2 1 50", stream)
+        self.assertNotIn(b"1 0 .2 1", stream)
+        self.assertIn(b"f*", stream)
 
     def test_sfnt_inspection_distinguishes_upright_and_formal_italic(self) -> None:
         upright = Path(
@@ -848,7 +846,7 @@ class TestVoucherPdfTextStyles(unittest.TestCase):
         reader = pypdf.PdfReader(io.BytesIO(pdf))
         self.assertEqual(len(reader.pages), 8)
         content = b"\n".join(page.get_contents().get_data() for page in reader.pages)
-        self.assertIn(b"1 0 .2 1", content)
+        self.assertIn(b"f*", content)
 
     def test_file_creation_uses_same_style_generation_path(self) -> None:
         data = {"pages": [_page_with_styles()]}

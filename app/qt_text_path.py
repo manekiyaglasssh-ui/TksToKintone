@@ -4,7 +4,24 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import QPointF
-from PySide6.QtGui import QFont, QFontMetricsF, QPainterPath
+from PySide6.QtGui import QFont, QFontMetricsF, QPainterPath, QGuiApplication
+
+_HEADLESS_QT_APP: QGuiApplication | None = None
+
+
+def ensure_qt_application() -> QGuiApplication:
+    """Return the process Qt application, creating one for headless PDF tests."""
+    global _HEADLESS_QT_APP
+    existing = QGuiApplication.instance()
+    if existing is not None:
+        return existing
+    # QFontDatabase aborts the process when used without a QGuiApplication.
+    # Production GUI/PDF workers already share the application; this branch is
+    # for CLI/tests that generate a PDF without opening the editor.
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    _HEADLESS_QT_APP = QGuiApplication([])
+    return _HEADLESS_QT_APP
 
 
 def build_text_path(text: str, font: QFont, *, line_height: float | None = None) -> tuple[QPainterPath, QRectF]:
@@ -14,6 +31,7 @@ def build_text_path(text: str, font: QFont, *, line_height: float | None = None)
     the top-left and a baseline per line. Font decorations are deliberately
     disabled by the caller; they are drawn as shared logical geometry.
     """
+    ensure_qt_application()
     # Local import keeps the module usable in lightweight geometry tests.
     from PySide6.QtCore import QRectF
     result = QPainterPath()
