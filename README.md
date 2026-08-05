@@ -1,10 +1,10 @@
 # TksToKintone
 
-TKS OLAPから加工CSV・素板CSVを取得し、既存Excel VBA相当の加工を行って `outputTksToKintone.csv` を作成し、必要に応じてkintoneへ登録するWindows向けGUIアプリです。現在のバージョンネームは `1.6.0`、バージョンコードは `44` です。
+ TKS OLAPから加工CSV・素板CSVを取得し、既存Excel VBA相当の加工を行って `outputTksToKintone.csv` を作成し、必要に応じてkintoneへ登録するWindows向けGUIアプリです。現在のバージョンネームは `1.6.1`、バージョンコードは `45` です。
 
 ユーザー向けの操作手順は [docs/ユーザー向け簡易マニュアル.md](docs/ユーザー向け簡易マニュアル.md) を参照してください。
 
-## バージョン 1.6.0 の変更点
+## バージョン 1.6.1 の変更点
 
 - SumatraPDFをアプリへ同梱する方式から、Windowsへ独立インストールする方式へ変更しました。
 - SumatraPDFが未導入の場合、新規インストール時と更新時のセットアップで自動導入します。

@@ -92,7 +92,7 @@ def verify_installer(path: Path, *, verify_authenticode: bool = False) -> None:
 def _download_to(path: Path) -> None:
     request = urllib.request.Request(
         SUMATRA_DOWNLOAD_URL,
-        headers={"User-Agent": "TksToKintone-build/1.6.0"},
+        headers={"User-Agent": "TksToKintone-build/1.6.1"},
     )
     with urllib.request.urlopen(request, timeout=120) as response:
         final_url = response.geturl()

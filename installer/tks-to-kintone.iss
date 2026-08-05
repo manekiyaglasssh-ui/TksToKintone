@@ -1,5 +1,5 @@
 #define MyAppName "TksToKintone"
-#define MyAppVersion "1.6.0"
+#define MyAppVersion "1.6.1"
 #define MyAppPublisher "Manekiya"
 #define MyAppExeName "TksToKintone.exe"
 #include "..\build\vendor\sumatra\sumatra-config.iss"
@@ -20,7 +20,7 @@
 AppId={{8C19583E-55BA-47BA-93AC-C9F2E1CF3A9F}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=1.6.0.44
+VersionInfoVersion=1.6.1.45
 SetupIconFile=..\assets\app_icon.ico
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\Manekiya\TksToKintone
