@@ -871,16 +871,17 @@ FAVORITE_FONT_BUTTON_WIDTH_PX = 24
 # ツールバーのボタン幅・余白を広げ、削除=警告色/保存=安全色を割り当てる（要件2-5・2-6・2-7・3）。
 # ライト/ダーク両モードで文字が読めるよう、警告色・安全色は白文字＋濃色背景にする。
 EDIT_TOOLBAR_STYLE = """
-QToolBar { spacing: 6px; padding: 4px; }
+QToolBar { spacing: 2px; padding: 2px; }
 QToolBar QToolButton {
     border: 1px solid #666666;
     border-radius: 5px;
-    padding-left: 12px;
-    padding-right: 12px;
-    padding-top: 4px;
-    padding-bottom: 4px;
-    min-height: 26px;
-    margin: 1px;
+    padding-left: 2px;
+    padding-right: 2px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+    min-height: 24px;
+    margin: 0px;
+    font-size: 9pt;
 }
 QToolBar QToolButton:hover {
     border: 1px solid #999999;
@@ -4465,6 +4466,7 @@ class VoucherEditWindow(QMainWindow):
             self._add_background(background_pdf_bytes)
         self._install_shortcuts()
         self.load_edit_layer()
+        self._ensure_print_safe_area_guide()
         _perf_editor("saved_objects_restored", self._perf_started,
                      count=len(self.loaded_object_ids))
         # 初期読み込み完了時点は未保存変更なしとする。
@@ -5010,6 +5012,23 @@ class VoucherEditWindow(QMainWindow):
         guide.setAcceptHoverEvents(False)
         self._scene.addItem(guide)
         self._print_guide = guide
+        _log.debug(
+            "voucher_edit_print_guide_created id=%s scene_id=%s scene=%s "
+            "visible=%s opacity=%s z=%s rect=%s page=%s safe=%s",
+            id(guide), id(self._scene), guide.scene() is self._scene,
+            guide.isVisible(), guide.opacity(), guide.zValue(), guide.rect(),
+            self._scene.sceneRect(), guide.rect(),
+        )
+
+    def _ensure_print_safe_area_guide(self) -> None:
+        """現在の編集sceneにガイドが1個だけ存在することを保証する。"""
+        guide = getattr(self, "_print_guide", None)
+        if guide is None or guide.scene() is not self._scene:
+            for item in list(self._scene.items()):
+                if getattr(item, "_PRINT_GUIDE", False):
+                    self._scene.removeItem(item)
+            self._create_print_safe_area_guide()
+        self._update_print_safe_area_guide()
 
     def _update_print_safe_area_guide(self) -> None:
         guide = getattr(self, "_print_guide", None)
@@ -5017,9 +5036,19 @@ class VoucherEditWindow(QMainWindow):
             guide.setRect(self._print_safe_area_rect())
             guide.setVisible(self._print_guide_visible)
 
-    def _toggle_print_safe_area_guide(self, checked: bool) -> None:
+    def _toggle_print_safe_area_guide(self, checked: bool = False) -> None:
+        action = getattr(self, "_print_guide_action", None)
+        if action is not None:
+            checked = action.isChecked()
         self._print_guide_visible = bool(checked)
+        self._ensure_print_safe_area_guide()
         self._update_print_safe_area_guide()
+        _log.debug(
+            "voucher_edit_print_guide_toggled id=%s scene_id=%s checked=%s visible=%s",
+            id(self._print_guide) if self._print_guide is not None else None,
+            id(self._scene), checked,
+            self._print_guide.isVisible() if self._print_guide is not None else None,
+        )
 
     # ── 背景レイヤー ─────────────────────────────────────────────────────────
     def _clear_background_items(self) -> None:
@@ -5352,9 +5381,9 @@ class VoucherEditWindow(QMainWindow):
         self._main_toolbar = bar
         # アンドゥ・リドゥ（曲がった矢印アイコン・全端末でアイコン表示: 要件4）。
         # OS/theme/フォント非依存。SVGが読めない端末では描画フォールバックを使う。
-        self._undo_action = bar.addAction("元に戻す", self.undo)
+        self._undo_action = bar.addAction("↶", self.undo)
         self._undo_action.setToolTip("元に戻す (Ctrl+Z)")
-        self._redo_action = bar.addAction("やり直し", self.redo)
+        self._redo_action = bar.addAction("↷", self.redo)
         self._redo_action.setToolTip("やり直し (Ctrl+Y)")
         # enabled/disabled で色を分けたアイコンを適用する（テーマ再適用にも使う・要件8）。
         self._apply_undo_redo_icon_theme()
@@ -5380,12 +5409,16 @@ class VoucherEditWindow(QMainWindow):
 
         self._font_family_combo = _FontFamilyComboBox(
             self._favorite_fonts, self.current_font_family)
+        self._font_family_combo.setMinimumWidth(100)
+        self._font_family_combo.setMaximumWidth(130)
         self._font_family_combo.currentFontChanged.connect(
             self._on_font_family_changed)
         bar.addWidget(self._font_family_combo)
         self._sync_favorite_font_controls()
 
         self._font_size_spin = _FontSizeComboBox()
+        self._font_size_spin.setMinimumWidth(48)
+        self._font_size_spin.setMaximumWidth(64)
         self._font_size_spin.setToolTip("文字サイズ (4～200pt)")
         self._font_size_spin.setValue(self.current_font_size)
         self._font_size_spin.valueChanged.connect(self._on_font_size_changed)
@@ -5417,7 +5450,7 @@ class VoucherEditWindow(QMainWindow):
         self._text_decoration_button.setToolTip("文字装飾")
         self._text_decoration_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._text_decoration_button.setMenu(self._text_decoration_menu)
-        self._text_decoration_button.setMaximumWidth(76)
+        self._text_decoration_button.setMaximumWidth(64)
         bar.addWidget(self._text_decoration_button)
         self._sync_text_decoration_actions()
         bar.addSeparator()
@@ -5426,6 +5459,7 @@ class VoucherEditWindow(QMainWindow):
         bar.addWidget(QLabel(" 線幅: "))
         self._line_width_spin = QDoubleSpinBox()
         self._line_width_spin.setRange(0.1, 20.0)
+        self._line_width_spin.setMaximumWidth(60)
         self._line_width_spin.setSingleStep(0.5)
         self._line_width_spin.setValue(self.current_line_width)
         self._line_width_spin.valueChanged.connect(self._on_line_width_changed)
@@ -5446,10 +5480,10 @@ class VoucherEditWindow(QMainWindow):
         save_close_action = bar.addAction("保存して閉じる", self.save_and_close)
         close_action = bar.addAction("閉じる", self.close)
         bar.addSeparator()
-        self._print_guide_action = bar.addAction("印刷範囲", self._toggle_print_safe_area_guide)
+        self._print_guide_action = bar.addAction("ガイド", self._toggle_print_safe_area_guide)
         self._print_guide_action.setCheckable(True)
         self._print_guide_action.setChecked(True)
-        self._print_guide_action.setToolTip("編集画面の印刷安全範囲ガイドを表示/非表示")
+        self._print_guide_action.setToolTip("印刷範囲ガイドを表示/非表示")
         bar.addSeparator()
         # 背景透過中にロックする編集アクション（保存/保存して閉じる/閉じる/画像挿入/
         # 貼り付け/削除/ツール選択）をまとめて保持する（要件2）。
@@ -5460,7 +5494,7 @@ class VoucherEditWindow(QMainWindow):
         # 全画面/最大化表示の切り替え（要件2-2）。
         self._fullscreen_action = bar.addAction("全画面", self.toggle_fullscreen)
         # タブレット編集モード（表示先ディスプレイを選んでから大きいUIへ切替）。
-        self._tablet_action = bar.addAction("タブレット編集",
+        self._tablet_action = bar.addAction("タブレット",
                                             self.prompt_and_enter_tablet_mode)
 
         # 削除ボタンは赤い警告色、保存系ボタンは安全色にする（要件2-6・2-7・3）。
@@ -5474,15 +5508,15 @@ class VoucherEditWindow(QMainWindow):
         container.setWidgetResizable(False)
         container.setWidget(bar)
         container.setFrameShape(QFrame.Shape.NoFrame)
-        container.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        container.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         container.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        bar.setMinimumWidth(bar.sizeHint().width() + 8)
-        bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        bar.setMinimumWidth(0)
+        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         container.setMinimumHeight(max(72, bar.sizeHint().height() + 22))
         self._main_toolbar_container = container
         # ライト/ダークテーマに合わせて上部メニューの配色を適用する（要件6）。
         self._apply_toolbar_theme()
-        bar.setMinimumWidth(max(bar.minimumWidth(), bar.sizeHint().width() + 8))
+        bar.setMinimumWidth(0)
         logging.getLogger("tks_to_kintone_app").info(
             "voucher_edit_toolbar_scroll_area_enabled"
         )
@@ -6234,6 +6268,8 @@ class VoucherEditWindow(QMainWindow):
         for it in list(self._scene.items()):
             # 背景アイテムはスキップして必ず残す（要件1）。
             if getattr(it, "_BG_MARK", False):
+                continue
+            if getattr(it, "_PRINT_GUIDE", False):
                 continue
             # 補助アイテム（ハンドル）・一時プレビューは消す。
             if getattr(it, "_IS_HELPER", False) or getattr(it, "_IS_PREVIEW", False):
@@ -9483,7 +9519,7 @@ class VoucherEditWindow(QMainWindow):
             QTimer.singleShot(0, self.showMaximized)
         if self._main_toolbar_container is not None:
             if self._main_toolbar is not None:
-                self._main_toolbar.setMinimumWidth(self._main_toolbar.sizeHint().width() + 8)
+                self._main_toolbar.setMinimumWidth(0)
             needed = max(72, self._main_toolbar.sizeHint().height() + 22 if self._main_toolbar is not None else 72)
             if self._main_toolbar_container.minimumHeight() < needed:
                 self._main_toolbar_container.setMinimumHeight(needed)

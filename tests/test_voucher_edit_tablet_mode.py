@@ -53,7 +53,7 @@ class TestVoucherEditTabletMode(unittest.TestCase):
 
         win = self._make_window()
         actions = [a.text() for tb in win.findChildren(QToolBar) for a in tb.actions()]
-        self.assertIn("タブレット編集", actions)
+        self.assertIn("タブレット", actions)
 
     def test_enter_sets_tablet_mode_true(self) -> None:
         """2. タブレット編集ボタン押下で tablet_mode が True になる。"""
