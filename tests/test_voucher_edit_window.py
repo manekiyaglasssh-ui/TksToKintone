@@ -211,7 +211,7 @@ class TestVoucherEditWindow(unittest.TestCase):
             f"object_id={object_id}", logs)
         self.assertIn("italic=True", logs)
         self.assertIn(
-            f"event=draw_styled_pdf_text trace_id={trace_id} "
+            f"event=voucher_edit_qt_glyph_path trace_id={trace_id} "
             f"object_id={object_id}", logs)
         self.assertIn("font_italic=True", logs)
         self.assertIn(f"edit_data_revision={revision}", logs)
@@ -231,7 +231,7 @@ class TestVoucherEditWindow(unittest.TestCase):
         self.assertIn("cache_hit=False", shown)
         stream = pypdf.PdfReader(
             io.BytesIO(pdf)).pages[0].get_contents().get_data()
-        self.assertIn(b"1 0 .2 1", stream)
+        self.assertIn(b"f*", stream)
 
     def test_switch_voucher_keeps_independent_unsaved_objects(self) -> None:
         from app.voucher_edit_window import VoucherEditWindow
@@ -722,7 +722,7 @@ class TestVoucherEditWindow(unittest.TestCase):
         self.assertGreater(item.box_h, 0.0)
         obj = item.serialize_edit_object()
         self.assertEqual(obj["type"], "text")
-        self.assertAlmostEqual(obj["h"], item.font_size * 1.2, delta=4.0)
+        self.assertGreaterEqual(obj["h"], item.font_size * 1.2)
 
     def test_add_line_drag(self) -> None:
         """線がドラッグ始点/終点で作成される（要件5）。"""

@@ -1477,6 +1477,9 @@ def _color_name(color: str | QColor | None, default: str = "#000000") -> str:
 def _configure_text_document(item: QGraphicsTextItem) -> None:
     item.document().setDocumentMargin(0)
     item.document().setDefaultStyleSheet("p { margin: 0; line-height: 120%; }")
+    option = item.document().defaultTextOption()
+    option.setWrapMode(QTextOption.WrapMode.NoWrap)
+    item.document().setDefaultTextOption(option)
 
 
 def _normalize_text_align(value: str | None) -> str:
@@ -1909,7 +1912,7 @@ class _EditTextItem(QGraphicsTextItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
-        self.fit_to_text_if_needed()
+        self.fit_to_text_if_needed(force=True, reason="initial_create")
 
     def apply_font_size(self, font_size: float) -> None:
         self.font_size = float(font_size)
@@ -1917,7 +1920,7 @@ class _EditTextItem(QGraphicsTextItem):
         self.setFont(make_text_font(self.font_size, self.font_family,
                                     self.font_bold, self.font_italic,
                                     self.font_underline, self.font_strikeout))
-        self.fit_to_text_if_needed()
+        self.fit_to_text_if_needed(force=True, reason="font_size_change")
         self._refresh_text_layout()
 
     def apply_text_style(self, *, family: str | None = None,
@@ -1942,17 +1945,23 @@ class _EditTextItem(QGraphicsTextItem):
         self.setFont(make_text_font(self.font_size, self.font_family,
                                     self.font_bold, self.font_italic,
                                     self.font_underline, self.font_strikeout))
-        self.fit_to_text_if_needed()
+        self.fit_to_text_if_needed(force=True, reason="style_change")
         self._refresh_text_layout()
 
-    def fit_to_text_if_needed(self, force: bool = False) -> None:
-        if not force and (not self.auto_fit or self.manual_resized):
+    def fit_to_text_if_needed(self, force: bool = False,
+                              reason: str = "content_change") -> None:
+        if reason == "manual_resize":
             return
-        if not self.toPlainText().strip():
+        if not force and not self.auto_fit and reason == "serialize":
+            return
+        if not self.toPlainText():
             return
         text_w, text_h = _text_content_size(self.toPlainText(), self.font(), self.font_size)
-        new_w = max(text_w + 1.0, MIN_TEXT_W)
-        new_h = max(text_h, self.font_size * 1.2, MIN_TEXT_H)
+        # NoWrap means this width is the logical width of the longest explicit
+        # line; never derive a smaller font size from the current frame.
+        new_w = max(text_w + TEXT_BOX_PADDING * 2.0, MIN_TEXT_W)
+        new_h = max(text_h + TEXT_BOX_PADDING * 2.0, self.font_size * 1.2,
+                    MIN_TEXT_H)
         if abs(new_w - self.box_w) > 0.1 or abs(new_h - self.box_h) > 0.1:
             self.prepareGeometryChange()
             self.box_w = float(new_w)
@@ -2037,8 +2046,10 @@ class _EditTextItem(QGraphicsTextItem):
         super().focusOutEvent(event)
         if self.auto_fit_to_box and self.toPlainText().strip():
             self.refit_font_to_box()
-        else:
-            self.fit_to_text_if_needed()
+        elif (not self.manual_resized
+              or self.toPlainText() != str(
+                  getattr(self, "_inline_edit_original_text", self.toPlainText()))):
+            self.fit_to_text_if_needed(reason="content_change")
         scene = self.scene()
         if scene is not None and hasattr(scene, "_window"):
             window = scene._window
@@ -2090,7 +2101,7 @@ class _EditTextItem(QGraphicsTextItem):
         return path
 
     def serialize_edit_object(self) -> dict[str, Any]:
-        self.fit_to_text_if_needed()
+        self.fit_to_text_if_needed(reason="serialize")
         rect = self.box_rect_scene()
         x = float(rect.x())
         scene_top = float(rect.y())
@@ -3330,19 +3341,8 @@ class _ResizeHandle(QGraphicsRectItem):
             tgt.setRect(QRectF(local_tl.x(), local_tl.y(),
                                new_rect.width(), new_rect.height()))
         elif isinstance(tgt, _EditTextItem):
-            original_font_size = (
-                self._font_size_before
-                if self._font_size_before is not None else tgt.font_size)
             tgt.setPos(new_rect.topLeft())
             tgt.set_manual_box_size(new_rect.width(), new_rect.height())
-            if self._position in {"left", "right"}:
-                scale = new_rect.width() / current.width() if current.width() else 1.0
-            elif self._position in {"top", "bottom"}:
-                scale = new_rect.height() / current.height() if current.height() else 1.0
-            else:
-                scale = new_rect.width() / current.width() if current.width() else 1.0
-            preview_size = max(4.0, min(200.0, original_font_size * scale))
-            tgt.apply_font_size(preview_size)
             scene = self.scene()
             window = getattr(scene, "_window", None) if scene is not None else None
             if window is not None:
@@ -3350,8 +3350,9 @@ class _ResizeHandle(QGraphicsRectItem):
                     "voucher_text_resize_move",
                     object_id=tgt.obj_id,
                     handle=self._position,
-                    scale=scale,
-                    font_size_preview=tgt.font_size)
+                    scale=1.0,
+                    font_size=tgt.font_size,
+                    reason="manual_resize")
         elif isinstance(tgt, _EditImageItem):
             tgt.setPos(new_rect.topLeft())
             tgt.set_box_size(new_rect.width(), new_rect.height())

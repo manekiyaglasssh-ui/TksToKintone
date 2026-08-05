@@ -3530,11 +3530,11 @@ def draw_text_in_scene_rect(
         c, text, qt_font, path_x, path_y, page_height=PAGE_H,
         line_height=line_height)
     _log.info(
-        "event=voucher_edit_qt_glyph_path object_id=%s requested_family=%r "
+        "event=voucher_edit_qt_glyph_path trace_id=%s object_id=%s requested_family=%r "
         "resolved_family=%r exact_match=%s point_size=%s weight=%s italic=%s "
         "underline=%s strikeout=%s underline_pos=%s strikeout_pos=%s "
         "line_width=%s glyph_path_bounds=%s pdf_bounds=%s",
-        object_id, (font_metadata or {}).get("requested_family", ""),
+        trace_id, object_id, (font_metadata or {}).get("requested_family", ""),
         qt_font.family(), qt_font.exactMatch(), qt_font.pointSizeF(),
         qt_font.weight(), qt_font.italic(), qt_font.underline(),
         qt_font.strikeOut(), metrics.underlinePos(), metrics.strikeOutPos(),

@@ -88,10 +88,10 @@ class TestResizeHandles(unittest.TestCase):
         obj = win.serialize_objects()[0]
         self.assertGreater(obj["width"], 80.0)
         self.assertGreater(obj["height"], 24.0)
-        self.assertGreater(obj["font_size"], 12.0)
+        self.assertEqual(obj["font_size"], item.font_size)
 
-    def test_scene_handle_press_keeps_same_handle_alive_and_resizes_font(self) -> None:
-        """実イベント経路でpress時にハンドルを再生成せず、文字サイズを変更する。"""
+    def test_scene_handle_press_keeps_same_handle_alive_and_preserves_font_size(self) -> None:
+        """実イベント経路でpress時にハンドルを再生成せず、文字サイズを維持する。"""
         from PySide6.QtWidgets import QGraphicsSceneMouseEvent
 
         win = self._make_window()
@@ -114,13 +114,13 @@ class TestResizeHandles(unittest.TestCase):
         self.assertIs(handle.source_item, item)
 
         handle.setPos(QPointF(240.0, 140.0))
-        self.assertGreater(item.font_size, before)
+        self.assertEqual(item.font_size, before)
         release = QGraphicsSceneMouseEvent(
             QGraphicsSceneMouseEvent.Type.GraphicsSceneMouseRelease)
         release.setScenePos(handle.pos())
         release.setButton(Qt.MouseButton.LeftButton)
         win._scene.mouseReleaseEvent(release)
-        self.assertGreater(item.font_size, before)
+        self.assertEqual(item.font_size, before)
 
     def test_handles_after_symbol_conversion_reference_new_text_item(self) -> None:
         """symbol_text昇格後の8ハンドルが、削除済みsymbolではなく新itemを指す。"""
