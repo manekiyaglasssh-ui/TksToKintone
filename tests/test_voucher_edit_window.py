@@ -1096,19 +1096,21 @@ class TestVoucherEditWindow(unittest.TestCase):
             win = VoucherEditWindow(order_no="drk1", background_pdf_bytes=b"")
             self.addCleanup(win.deleteLater)
             bar = win._edit_header_widget
-            # 通常状態の文字色が背景色と別に指定されている。
-            self.assertIn("color: #f0f0f0", EDIT_TOOLBAR_DARK_STYLE)
-            self.assertIn("background-color: #3a4047", EDIT_TOOLBAR_DARK_STYLE)
+            # ボタン色は共通buttonRoleへ委譲し、ヘッダー側は背景だけを指定する。
+            self.assertIn("background-color: #2b2f33", EDIT_TOOLBAR_DARK_STYLE)
+            self.assertNotIn("#voucher_edit_header QToolButton {", EDIT_TOOLBAR_DARK_STYLE)
             # ダーク用の配色がツールバーへ適用されている。
-            self.assertIn(EDIT_TOOLBAR_DARK_STYLE.replace("QToolBar", "#voucher_edit_header").strip()[:20], bar.styleSheet())
+            self.assertIn(EDIT_TOOLBAR_DARK_STYLE.strip()[:20], bar.styleSheet())
             # コンテナ背景・図形メニューもダーク配色。
             self.assertIn(
                 EDIT_TOOLBAR_CONTAINER_DARK_BG,
                 win._main_toolbar_container.styleSheet(),
             )
             self.assertEqual(win._shape_menu.styleSheet(), EDIT_SHAPE_MENU_DARK_STYLE)
-            # disabled でも背景と同化しない別色を指定している。
-            self.assertIn("color: #9aa3ac", EDIT_TOOLBAR_DARK_STYLE)
+            self.assertEqual(
+                bar.widgetForAction(win._preview_action).property("buttonRole"),
+                "primary",
+            )
 
     def test_toolbar_light_theme_keeps_default(self) -> None:
         """ライトテーマでは上部メニューを明示的なライト配色にし黒っぽくしない（要件6）。"""
@@ -1138,12 +1140,15 @@ class TestVoucherEditWindow(unittest.TestCase):
             # ツールバー本体にライト配色が適用され、ダーク配色は含まれない。
             bar = win._edit_header_widget
             bar_ss = bar.styleSheet()
-            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.replace("QToolBar", "#voucher_edit_header").strip()[:20], bar_ss)
+            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.strip()[:20], bar_ss)
             self.assertNotIn("#3a4047", bar_ss)  # ダーク用ボタン背景が残っていない
             self.assertNotIn("#2b2f33", bar_ss)  # ダーク用ツールバー背景が残っていない
-            # ライト用のボタン文字色・背景色が明示されている。
-            self.assertIn("color: #202124", EDIT_TOOLBAR_LIGHT_STYLE)
-            self.assertIn("background-color: #ffffff", EDIT_TOOLBAR_LIGHT_STYLE)
+            # ボタン色は共通buttonRoleを維持し、ライトQSSでは上書きしない。
+            self.assertNotIn("#voucher_edit_header QToolButton {", EDIT_TOOLBAR_LIGHT_STYLE)
+            self.assertEqual(
+                bar.widgetForAction(win._preview_action).property("buttonRole"),
+                "primary",
+            )
 
     def test_toolbar_theme_switches_light_after_dark(self) -> None:
         """ダーク適用後にライトへ切り替えると黒配色が残らず再適用される（要件6）。"""
@@ -1161,7 +1166,7 @@ class TestVoucherEditWindow(unittest.TestCase):
             win = VoucherEditWindow(order_no="sw1", background_pdf_bytes=b"")
             self.addCleanup(win.deleteLater)
             bar = win._edit_header_widget
-            self.assertIn("#3a4047", bar.styleSheet())  # 初期はダーク
+            self.assertIn("#2b2f33", bar.styleSheet())  # 初期はダーク
 
         # テーマをライトへ切り替えて再適用する。
         with mock.patch(
@@ -1171,7 +1176,7 @@ class TestVoucherEditWindow(unittest.TestCase):
             win._apply_toolbar_theme()
             bar_ss = bar.styleSheet()
             self.assertNotIn("#3a4047", bar_ss)  # ダーク配色は消えている
-            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.replace("QToolBar", "#voucher_edit_header").strip()[:20], bar_ss)
+            self.assertIn(EDIT_TOOLBAR_LIGHT_STYLE.strip()[:20], bar_ss)
 
     def test_reflect_target_highlight_switches_exclusively(self) -> None:
         """反映先を切り替えると青背景が1ボタンだけへ移る。"""

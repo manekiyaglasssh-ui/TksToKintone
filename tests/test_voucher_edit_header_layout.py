@@ -9,9 +9,19 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QToolBar, QToolButton
+from PySide6.QtWidgets import (
+    QApplication, QDoubleSpinBox, QSizePolicy, QSpacerItem, QToolBar, QToolButton,
+)
 
-from app.voucher_edit_window import VoucherEditWindow
+from app.gui import THEME_DARK, THEME_LIGHT, apply_theme
+from app.theme_utils import SEMANTIC_BUTTON_STYLESHEET
+from app.voucher_edit_window import (
+    EDIT_TOOLBAR_DARK_STYLE,
+    EDIT_TOOLBAR_LIGHT_STYLE,
+    EDIT_TOOLBAR_STYLE,
+    FAVORITE_FONT_ICON_SIZE_PX,
+    VoucherEditWindow,
+)
 
 
 class TestVoucherEditHeaderLayout(unittest.TestCase):
@@ -87,6 +97,113 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                 self.assertTrue(button.toolTip())
                 self.assertIn("background-color: transparent", button.styleSheet())
                 self.assertNotIn("background-color: #", button.styleSheet())
+                self.assertEqual(FAVORITE_FONT_ICON_SIZE_PX, 24)
+                self.assertIn("font-size: 24px", button.styleSheet())
+            finally:
+                if previous is None:
+                    os.environ.pop("TKS_TO_KINTONE_HOME", None)
+                else:
+                    os.environ["TKS_TO_KINTONE_HOME"] = previous
+
+    def test_theme_roles_survive_density_and_light_dark_reapplication(self) -> None:
+        """密度変更は用途別の通常・削除・プレビュー・保存色を変更しない。"""
+        with tempfile.TemporaryDirectory() as home:
+            previous = os.environ.get("TKS_TO_KINTONE_HOME")
+            os.environ["TKS_TO_KINTONE_HOME"] = home
+            try:
+                win = VoucherEditWindow(order_no="header-theme", background_pdf_bytes=b"")
+                self.addCleanup(win.deleteLater)
+                header = win._main_toolbar
+                by_text = {
+                    action.text(): header.widgetForAction(action)
+                    for action in header.actions() if action.text()
+                }
+                expected_roles = {
+                    "削除": "danger",
+                    "プレビュー": "primary",
+                    "保存": "success",
+                    "保存して閉じる": "success",
+                    "全画面": "secondary",
+                    "タブレット": "secondary",
+                }
+                self.assertIn('QToolButton[buttonRole="secondary"]', SEMANTIC_BUTTON_STYLESHEET)
+                self.assertIn('QToolButton[buttonRole="primary"]', SEMANTIC_BUTTON_STYLESHEET)
+                self.assertIn('QToolButton[buttonRole="success"]', SEMANTIC_BUTTON_STYLESHEET)
+                self.assertIn('QToolButton[buttonRole="danger"]', SEMANTIC_BUTTON_STYLESHEET)
+                self.assertIn("background-color: #c62828", EDIT_TOOLBAR_STYLE)
+                self.assertIn("background-color: #0b7a3b", EDIT_TOOLBAR_STYLE)
+
+                for width in (1920, 1400, 1280):
+                    win._apply_toolbar_density(header, width)
+                    for theme in (THEME_LIGHT, THEME_DARK):
+                        apply_theme(theme)
+                        win._apply_toolbar_theme()
+                        win.show()
+                        self.app.processEvents()
+                        for text, role in expected_roles.items():
+                            self.assertEqual(by_text[text].property("buttonRole"), role)
+                        expected_colors = {
+                            "削除": "#c62828",
+                            "プレビュー": "#1565c0",
+                            "保存": "#0b7a3b",
+                            "保存して閉じる": "#0b7a3b",
+                            "全画面": "#546e7a",
+                            "タブレット": "#546e7a",
+                        }
+                        for text, color in expected_colors.items():
+                            button = by_text[text]
+                            image = button.grab().toImage()
+                            rendered = image.pixelColor(5, button.height() // 2).name()
+                            self.assertEqual(rendered, color, (theme, text, rendered))
+                # テーマQSSは背景色を通常ボタンへ直接強制せず、共通role色を遮らない。
+                self.assertNotIn("QToolButton {", EDIT_TOOLBAR_LIGHT_STYLE)
+                self.assertNotIn("QToolButton {", EDIT_TOOLBAR_DARK_STYLE)
+                self.assertIn(
+                    win._favorite_font_button.property("favorite"),
+                    (True, False, "true", "false"),
+                )
+                self.assertIn(win._favorite_font_button.text(), ("☆", "★"))
+            finally:
+                apply_theme(THEME_LIGHT)
+                if previous is None:
+                    os.environ.pop("TKS_TO_KINTONE_HOME", None)
+                else:
+                    os.environ["TKS_TO_KINTONE_HOME"] = previous
+
+    def test_header_has_only_one_trailing_expanding_spacer_and_fixed_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            previous = os.environ.get("TKS_TO_KINTONE_HOME")
+            os.environ["TKS_TO_KINTONE_HOME"] = home
+            try:
+                win = VoucherEditWindow(order_no="header-spacing", background_pdf_bytes=b"")
+                self.addCleanup(win.deleteLater)
+                win._default_maximize_applied = True
+                win.showNormal()
+                win.resize(1920, 800)
+                self.app.processEvents()
+                header = win._main_toolbar
+                layout = header.layout()
+                spacers = [
+                    index for index in range(layout.count())
+                    if layout.itemAt(index).spacerItem() is not None
+                ]
+                self.assertEqual(spacers, [layout.count() - 1])
+                self.assertIsInstance(layout.itemAt(spacers[0]).spacerItem(), QSpacerItem)
+                widgets = [header.widgetForAction(action) for action in header.actions()]
+                widgets = [widget for widget in widgets if widget is not None]
+                for widget in widgets:
+                    self.assertNotIn(
+                        widget.sizePolicy().horizontalPolicy(),
+                        (QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding),
+                    )
+                self.assertEqual(win._font_family_combo.sizePolicy().horizontalPolicy(),
+                                 QSizePolicy.Policy.Fixed)
+                self.assertEqual(win._font_size_spin.sizePolicy().horizontalPolicy(),
+                                 QSizePolicy.Policy.Fixed)
+                self.assertEqual(win._line_width_spin.sizePolicy().horizontalPolicy(),
+                                 QSizePolicy.Policy.Fixed)
+                self.assertEqual(win._line_width_group.sizePolicy().horizontalPolicy(),
+                                 QSizePolicy.Policy.Fixed)
             finally:
                 if previous is None:
                     os.environ.pop("TKS_TO_KINTONE_HOME", None)
@@ -137,6 +254,7 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                             self.assertLessEqual(bottom_right.y(), rect.bottom())
                         for previous_widget, next_widget in zip(geometries, geometries[1:]):
                             self.assertLess(previous_widget[2], next_widget[0])
+                            self.assertLessEqual(next_widget[0] - previous_widget[2] - 1, 8)
                             self.assertLessEqual(previous_widget[1], next_widget[3])
                             self.assertLessEqual(next_widget[1], previous_widget[3])
 

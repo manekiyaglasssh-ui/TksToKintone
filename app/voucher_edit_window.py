@@ -264,6 +264,8 @@ class _WrappedActionHeader(QWidget):
         for widget in self._entries:
             self._layout.addWidget(widget)
             widget.show()
+        # 余剰幅は操作群の途中へ配分せず、最後尾の後ろへだけ残す。
+        self._layout.addStretch(1)
         self._layout.activate()
         # sizeHint の合計を minimumWidth に固定すると、Windows のDPI倍率上昇時に
         # ヘッダーだけが論理画面幅を超えて右端を切り落とす。配置は一列のまま、
@@ -993,8 +995,8 @@ QToolButton#favoriteFontButton:disabled {
 # ツールバーのボタン幅・余白を広げ、削除=警告色/保存=安全色を割り当てる（要件2-5・2-6・2-7・3）。
 # ライト/ダーク両モードで文字が読めるよう、警告色・安全色は白文字＋濃色背景にする。
 EDIT_TOOLBAR_STYLE = """
-QToolBar { spacing: 2px; padding: 2px; }
-QToolBar QToolButton {
+#voucher_edit_header { spacing: 2px; padding: 2px; }
+#voucher_edit_header QToolButton {
     border: 1px solid #666666;
     border-radius: 5px;
     padding-left: 3px;
@@ -1004,21 +1006,18 @@ QToolBar QToolButton {
     min-height: 34px;
     margin: 0px;
     font-size: 10pt;
-    color: #202124;
 }
-QToolBar QToolButton:disabled { color: #707070; background: #eeeeee; }
-QToolBar QToolButton:hover {
+#voucher_edit_header QToolButton:hover {
     border: 1px solid #999999;
 }
-QToolBar QToolButton:pressed {
+#voucher_edit_header QToolButton:pressed {
     border: 1px solid #2aa8ff;
-    background-color: rgba(42, 168, 255, 60);
 }
-QToolBar QToolButton#favoriteFontButton,
-QToolBar QToolButton#favoriteFontButton:hover,
-QToolBar QToolButton#favoriteFontButton:pressed,
-QToolBar QToolButton#favoriteFontButton:checked,
-QToolBar QToolButton#favoriteFontButton:focus {
+#voucher_edit_header QToolButton#favoriteFontButton,
+#voucher_edit_header QToolButton#favoriteFontButton:hover,
+#voucher_edit_header QToolButton#favoriteFontButton:pressed,
+#voucher_edit_header QToolButton#favoriteFontButton:checked,
+#voucher_edit_header QToolButton#favoriteFontButton:focus {
     background: transparent;
     border: none;
     padding: 0px;
@@ -1028,24 +1027,24 @@ QToolBar QToolButton#favoriteFontButton:focus {
     font-size: 24px;
     color: #F2B705;
 }
-QToolBar QToolButton[editToolButton="true"]:checked {
+#voucher_edit_header QToolButton[editToolButton="true"]:checked {
     background-color: #0d6efd;
     color: #ffffff;
     border: 2px solid #66b2ff;
     font-weight: bold;
 }
-QToolBar QToolButton[editToolButton="true"]:checked:disabled {
+#voucher_edit_header QToolButton[editToolButton="true"]:checked:disabled {
     background-color: #52606d;
     color: #e1e6eb;
     border: 1px solid #697580;
 }
-QToolBar QToolButton#shapeToolButton[shapeActive="true"] {
+#voucher_edit_header QToolButton#shapeToolButton[shapeActive="true"] {
     background-color: #0d6efd;
     color: #ffffff;
     border: 2px solid #66b2ff;
     font-weight: bold;
 }
-QToolBar QToolButton#shapeToolButton::menu-indicator {
+#voucher_edit_header QToolButton#shapeToolButton::menu-indicator {
     subcontrol-position: right center;
     subcontrol-origin: padding;
 }
@@ -1075,21 +1074,7 @@ QToolButton#successButton:disabled { background-color: #9e9e9e; color: #eeeeee; 
 # EDIT_TOOLBAR_STYLE の後段に追記して、通常/hover/disabled の文字色・背景色を
 # 明示的に上書きする。checked（青）/danger/success はベース側の配色をそのまま活かす。
 EDIT_TOOLBAR_DARK_STYLE = """
-QToolBar#mainEditToolBar { background-color: #2b2f33; }
-QToolBar QToolButton {
-    color: #f0f0f0;
-    background-color: #3a4047;
-    border: 1px solid #8a939c;
-}
-QToolBar QToolButton:hover {
-    background-color: #4a525a;
-    border: 1px solid #b0b9c2;
-}
-QToolBar QToolButton:disabled {
-    color: #9aa3ac;
-    background-color: #33383d;
-    border: 1px solid #4a525a;
-}
+#voucher_edit_header { background-color: #2b2f33; }
 QToolButton#favoriteFontButton[favorite="false"],
 QToolButton#favoriteFontButton[favorite="false"]:hover,
 QToolButton#favoriteFontButton[favorite="false"]:pressed,
@@ -1116,7 +1101,7 @@ QToolButton#favoriteFontButton[favorite="true"]:disabled {
     background: transparent;
     border: none;
 }
-QToolBar QLabel { color: #f0f0f0; }
+#voucher_edit_header QLabel { color: #f0f0f0; }
 """
 
 # ライトテーマ用の上部メニュー配色。以前のダークテーマ配色修正がライトモードでも
@@ -1124,25 +1109,7 @@ QToolBar QLabel { color: #f0f0f0; }
 # 上書きする（stylesheetを空に戻すだけだと直前のダーク配色が残る場合がある）（要件6）。
 # checked（青）/danger/success はベース側の配色をそのまま活かす。
 EDIT_TOOLBAR_LIGHT_STYLE = """
-QToolBar#mainEditToolBar { background-color: #f5f5f5; }
-QToolBar QToolButton {
-    color: #202124;
-    background-color: #ffffff;
-    border: 1px solid #c8c8c8;
-}
-QToolBar QToolButton:hover {
-    background-color: #eef3ff;
-    border: 1px solid #9db8e6;
-}
-QToolBar QToolButton:pressed {
-    background-color: #d8e8ff;
-    border: 1px solid #2aa8ff;
-}
-QToolBar QToolButton:disabled {
-    color: #9aa0a6;
-    background-color: #f0f0f0;
-    border: 1px solid #d5d5d5;
-}
+#voucher_edit_header { background-color: #f5f5f5; }
 QToolButton#favoriteFontButton[favorite="false"],
 QToolButton#favoriteFontButton[favorite="false"]:hover,
 QToolButton#favoriteFontButton[favorite="false"]:pressed,
@@ -1169,7 +1136,7 @@ QToolButton#favoriteFontButton[favorite="true"]:disabled {
     background: transparent;
     border: none;
 }
-QToolBar QLabel { color: #202124; }
+#voucher_edit_header QLabel { color: #202124; }
 """
 
 # 図形メニュー（QMenu）はトップレベルのポップアップのため、ツールバーの
@@ -5350,9 +5317,9 @@ class VoucherEditWindow(QMainWindow):
         bar = getattr(self, "_main_toolbar", None)
         if bar is not None:
             if dark:
-                bar.setStyleSheet((EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_DARK_STYLE).replace("QToolBar", "#voucher_edit_header"))
+                bar.setStyleSheet(EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_DARK_STYLE)
             else:
-                bar.setStyleSheet((EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_LIGHT_STYLE).replace("QToolBar", "#voucher_edit_header"))
+                bar.setStyleSheet(EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_LIGHT_STYLE)
                 _log.info("voucher_edit_toolbar_dark_style_cleared_for_light")
             # 全体テーマの後に dynamic property を再設定して再 polish し、
             # favorite 専用のテーマ色を確実に反映する。
@@ -5545,12 +5512,22 @@ class VoucherEditWindow(QMainWindow):
         self._tablet_action = bar.addAction("タブレット",
                                             self.prompt_and_enter_tablet_mode)
 
+        # 配色は密度処理と分離し、アプリ共通テーマの用途別表現へ委譲する。
+        for action in bar.actions():
+            button = bar.widgetForAction(action)
+            if isinstance(button, QToolButton):
+                button.setProperty("buttonRole", "secondary")
+        bar.widgetForAction(preview_action).setProperty("buttonRole", "primary")
+        bar.widgetForAction(delete_action).setProperty("buttonRole", "danger")
+        bar.widgetForAction(save_action).setProperty("buttonRole", "success")
+        bar.widgetForAction(save_close_action).setProperty("buttonRole", "success")
+
         # 削除ボタンは赤い警告色、保存系ボタンは安全色にする（要件2-6・2-7・3）。
         self._style_action_widget(bar, delete_action, "dangerButton")
         self._style_action_widget(bar, save_action, "successButton")
         self._style_action_widget(bar, save_close_action, "successButton")
         # ツールバー全体のボタン幅・余白を広げ、警告色/安全色を割り当てる（要件2-5）。
-        bar.setStyleSheet(EDIT_TOOLBAR_STYLE.replace("QToolBar", "#voucher_edit_header"))
+        bar.setStyleSheet(EDIT_TOOLBAR_STYLE)
         bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         bar.setMinimumHeight(42)
         self._main_toolbar_container = bar
@@ -9622,6 +9599,8 @@ class VoucherEditWindow(QMainWindow):
         self._font_size_spin.setFixedWidth(size)
         self._line_width_spin.setFixedWidth(line)
         self._line_width_group.layout().setSpacing(3)
+        self._line_width_group.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         metrics = bar.fontMetrics()
         for action in bar.actions():
