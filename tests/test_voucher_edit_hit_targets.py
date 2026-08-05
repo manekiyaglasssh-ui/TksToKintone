@@ -56,49 +56,16 @@ class TestVoucherEditHitTargets(unittest.TestCase):
             edge = item.mapToScene(hit.center() + QPointF(hit.width() * 0.45, 0.0))
             self.assertIs(win._scene._resolve_edit_object(edge), item)
 
-    def test_print_safe_area_guide_is_visible_and_non_interactive(self) -> None:
+    def test_toolbar_buttons_keep_readable_size(self) -> None:
         win = self._window()
-        from app.voucher_edit_window import (
-            SAFE_MARGIN_BOTTOM, SAFE_MARGIN_LEFT, SAFE_MARGIN_RIGHT,
-            SAFE_MARGIN_TOP,
-        )
-        guides = [item for item in win._scene.items()
-                  if getattr(item, "_PRINT_GUIDE", False)]
-        self.assertEqual(len(guides), 1)
-        guide = guides[0]
-        self.assertIs(guide, win._print_guide)
-        self.assertIs(guide.scene(), win._scene)
-        self.assertTrue(guide.isVisible())
-        page = win._scene.sceneRect()
-        self.assertEqual(guide.rect().left(), page.left() + SAFE_MARGIN_LEFT)
-        self.assertEqual(guide.rect().top(), page.top() + SAFE_MARGIN_TOP)
-        self.assertEqual(guide.rect().right(), page.right() - SAFE_MARGIN_RIGHT)
-        self.assertEqual(guide.rect().bottom(), page.bottom() - SAFE_MARGIN_BOTTOM)
-        self.assertFalse(guide.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-        self.assertFalse(guide.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
-        self.assertEqual(guide.acceptedMouseButtons(), Qt.MouseButton.NoButton)
-
-    def test_print_safe_area_toggle_does_not_duplicate_guide(self) -> None:
-        win = self._window()
-        action = win._print_guide_action
-        initial_count = len(win._scene.items())
-        action.trigger()
-        self.assertFalse(win._print_guide.isVisible())
-        action.trigger()
-        self.assertTrue(win._print_guide.isVisible())
-        self.assertEqual(len(win._scene.items()), initial_count)
-        self.assertEqual(
-            len([item for item in win._scene.items()
-                 if getattr(item, "_PRINT_GUIDE", False)]), 1)
-
-    def test_toolbar_is_compact_enough_for_125_percent_width(self) -> None:
-        win = self._window()
-        self.assertLessEqual(win._main_toolbar.sizeHint().width(), 1319)
+        for action in win._main_toolbar.actions():
+            widget = win._main_toolbar.widgetForAction(action)
+            if widget is not None and widget.objectName() != "favoriteFontButton":
+                self.assertGreaterEqual(widget.minimumWidth(), widget.sizeHint().width())
         self.assertEqual(
             win._main_toolbar_container.horizontalScrollBarPolicy(),
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
-        self.assertEqual(win._print_guide_action.text(), "ガイド")
         self.assertEqual(win._tablet_action.text(), "タブレット")
 
     def test_begin_small_text_edit_focus_cursor_and_temporary_area(self) -> None:
