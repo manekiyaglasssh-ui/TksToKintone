@@ -3564,6 +3564,60 @@ class _PrintSafeAreaGuideItem(QGraphicsRectItem):
         return QPainterPath()
 
 
+class _PrintGuideOverlay(QGraphicsItem):
+    """編集専用のページ境界・安全範囲・範囲外警告を描画する。"""
+
+    def __init__(self, window: "VoucherEditWindow") -> None:
+        super().__init__()
+        self._window = window
+        self._page = QRectF()
+        self._safe = QRectF()
+        self._warnings: list[tuple[QRectF, str]] = []
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setZValue(1000.0)
+
+    def boundingRect(self) -> QRectF:
+        return self._page.adjusted(-8, -8, 8, 8)
+
+    def update_geometry(self, page: QRectF, safe: QRectF,
+                        warnings: list[tuple[QRectF, str]]) -> None:
+        self.prepareGeometryChange()
+        self._page, self._safe, self._warnings = page, safe, warnings
+        self.setToolTip("\n".join(text for _, text in warnings))
+        self.update()
+
+    def rect(self) -> QRectF:
+        """旧テスト/API互換: 推奨安全範囲を返す。"""
+        page = self._window._scene.sceneRect()
+        return page.adjusted(SAFE_MARGIN_LEFT, SAFE_MARGIN_TOP,
+                             -SAFE_MARGIN_RIGHT, -SAFE_MARGIN_BOTTOM)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        if self._page.isNull():
+            return
+        painter.setBrush(QColor(150, 150, 150, 38))
+        painter.setPen(Qt.PenStyle.NoPen)
+        # scene rect 全体を覆い、ページ部分を描き戻すことでページ外を明示する。
+        scene = self.scene().sceneRect() if self.scene() else self._page
+        painter.drawRect(scene)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(150, 40, 40, 220), 1.6, Qt.PenStyle.SolidLine))
+        painter.drawRect(self._page)
+        painter.setPen(QPen(QColor(210, 55, 65, 170), 1.0, Qt.PenStyle.DashLine))
+        painter.drawRect(self._safe)
+        for rect, _ in self._warnings:
+            painter.setPen(QPen(QColor(220, 35, 35, 230), 1.8, Qt.PenStyle.SolidLine))
+            painter.drawRect(rect)
+            painter.setBrush(QColor(210, 35, 35, 235))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(rect.topLeft() - QPointF(5, 5), 5, 5)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def shape(self) -> QPainterPath:
+        return QPainterPath()
+
+
 class _EditScene(QGraphicsScene):
     """ツールモードに応じてオブジェクトを描画する編集シーン。"""
 
@@ -4348,10 +4402,12 @@ class VoucherEditWindow(QMainWindow):
 
         self._scene = _EditScene(self)
         self._print_guide: QGraphicsRectItem | None = None
+        self._print_guide_overlay: _PrintGuideOverlay | None = None
         self._print_guide_visible = True
         self._create_print_safe_area_guide()
         _perf_editor("scene_created", self._perf_started)
         self._scene.selectionChanged.connect(self._on_selection_changed)
+        self._scene.changed.connect(lambda _regions: self._schedule_print_guide_update())
         self._view = _EditGraphicsView(self._scene)
         self._view.setAcceptDrops(True)
         self._view.setRenderHints(self._view.renderHints())
@@ -4989,7 +5045,7 @@ class VoucherEditWindow(QMainWindow):
 
     def _print_safe_area_rect(self) -> QRectF:
         """現在のページ矩形から編集用の印刷安全範囲を算出する。"""
-        page = self._scene.sceneRect()
+        page = self._page_scene_rect()
         return QRectF(
             page.left() + SAFE_MARGIN_LEFT,
             page.top() + SAFE_MARGIN_TOP,
@@ -4997,27 +5053,63 @@ class VoucherEditWindow(QMainWindow):
             max(0.0, page.height() - SAFE_MARGIN_TOP - SAFE_MARGIN_BOTTOM),
         )
 
+    def _page_scene_rect(self) -> QRectF:
+        """現在表示中の背景ページをscene座標へ変換した実矩形。"""
+        for item in self.background_items():
+            rect = item.mapRectToScene(item.boundingRect())
+            if not rect.isNull() and rect.width() > 0 and rect.height() > 0:
+                return rect
+        return QRectF(self._scene.sceneRect())
+
+    def _out_of_print_objects(self) -> list[tuple[QRectF, str]]:
+        page = self._page_scene_rect()
+        result: list[tuple[QRectF, str]] = []
+        for item in self._scene.items():
+            if (not hasattr(item, "serialize_edit_object")
+                    or getattr(item, "_IS_HELPER", False)):
+                continue
+            rect = item.sceneBoundingRect()
+            sides: list[str] = []
+            if rect.left() < page.left():
+                sides.append(f"左へ{page.left() - rect.left():.0f}pt")
+            if rect.right() > page.right():
+                sides.append(f"右へ{rect.right() - page.right():.0f}pt")
+            if rect.top() < page.top():
+                sides.append(f"上へ{page.top() - rect.top():.0f}pt")
+            if rect.bottom() > page.bottom():
+                sides.append(f"下へ{rect.bottom() - page.bottom():.0f}pt")
+            if sides:
+                result.append((rect, "印刷範囲外（" + "、".join(sides) + "）"))
+        return result
+
+    def _schedule_print_guide_update(self) -> None:
+        if (getattr(self, "_closing", False)
+                or getattr(self, "_updating_print_guide", False)):
+            return
+        if not getattr(self, "_print_guide_update_pending", False):
+            self._print_guide_update_pending = True
+            QTimer.singleShot(0, self._update_print_safe_area_guide)
+
     def _create_print_safe_area_guide(self) -> None:
         """編集ビュー専用の非選択・非インタラクティブなガイドを作る。"""
-        guide = _PrintSafeAreaGuideItem(self._print_safe_area_rect())
+        guide = _PrintGuideOverlay(self)
         guide._IS_HELPER = True  # type: ignore[attr-defined]
         guide._PRINT_GUIDE = True  # type: ignore[attr-defined]
         guide.setData(_DATA_TYPE, _GUIDE_MARK)
-        guide.setPen(QPen(QColor(210, 55, 65, 175), 1.2, Qt.PenStyle.DashLine))
-        guide.setBrush(Qt.BrushStyle.NoBrush)
-        guide.setZValue(-50.0)  # 背景より前、編集オブジェクトと操作部品より後ろ
+        guide.update_geometry(self._page_scene_rect(), self._print_safe_area_rect(), [])
         guide.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         guide.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         guide.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         guide.setAcceptHoverEvents(False)
         self._scene.addItem(guide)
-        self._print_guide = guide
+        self._print_guide = guide  # type: ignore[assignment]
+        self._print_guide_overlay = guide
         _log.debug(
             "voucher_edit_print_guide_created id=%s scene_id=%s scene=%s "
             "visible=%s opacity=%s z=%s rect=%s page=%s safe=%s",
             id(guide), id(self._scene), guide.scene() is self._scene,
-            guide.isVisible(), guide.opacity(), guide.zValue(), guide.rect(),
-            self._scene.sceneRect(), guide.rect(),
+            guide.isVisible(), guide.opacity(), guide.zValue(), guide.boundingRect(),
+            self._scene.sceneRect(), guide.boundingRect(),
         )
 
     def _ensure_print_safe_area_guide(self) -> None:
@@ -5031,10 +5123,30 @@ class VoucherEditWindow(QMainWindow):
         self._update_print_safe_area_guide()
 
     def _update_print_safe_area_guide(self) -> None:
+        self._print_guide_update_pending = False
+        if getattr(self, "_closing", False):
+            return
         guide = getattr(self, "_print_guide", None)
         if guide is not None and guide.scene() is self._scene:
-            guide.setRect(self._print_safe_area_rect())
-            guide.setVisible(self._print_guide_visible)
+            overlay = self._print_guide_overlay
+            self._updating_print_guide = True
+            try:
+                warnings = self._out_of_print_objects()
+                if overlay is not None:
+                    overlay.update_geometry(self._page_scene_rect(),
+                                            self._print_safe_area_rect(), warnings)
+                guide.setVisible(self._print_guide_visible)
+            finally:
+                self._updating_print_guide = False
+            try:
+                if self._print_guide_visible:
+                    self.statusBar().showMessage(
+                        f"印刷範囲外: {len(warnings)}件" if warnings else "印刷範囲内")
+                else:
+                    self.statusBar().clearMessage()
+            except RuntimeError:
+                # close/deleteLater 後にキューへ残ったscene.changedを無視する。
+                return
 
     def _toggle_print_safe_area_guide(self, checked: bool = False) -> None:
         action = getattr(self, "_print_guide_action", None)
@@ -9507,6 +9619,10 @@ class VoucherEditWindow(QMainWindow):
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt命名)
         super().showEvent(event)
+        handle = self.windowHandle()
+        if handle is not None and not getattr(self, "_screen_change_connected", False):
+            handle.screenChanged.connect(lambda _screen: self._reevaluate_toolbar_mode())
+            self._screen_change_connected = True
         _perf_editor("show", self._perf_started)
         apply_windows_title_bar_theme(self, current_title_bar_is_dark())
         if (
@@ -9528,6 +9644,7 @@ class VoucherEditWindow(QMainWindow):
                     {"height": needed},
                 )
             QTimer.singleShot(0, self._log_toolbar_scroll_metrics)
+        self._reevaluate_toolbar_mode()
         QTimer.singleShot(0, self._log_left_pane_scroll_range)
         # 画面表示後にページ全体を編集領域いっぱいへフィット（要件2）。
         self.fit_page_to_view()
@@ -9538,8 +9655,48 @@ class VoucherEditWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt命名)
         super().resizeEvent(event)
+        self._reevaluate_toolbar_mode()
         # ウィンドウ／全画面切替・最大化などのリサイズ時に再フィットする（要件2）。
         self.fit_page_to_view()
+
+    def _reevaluate_toolbar_mode(self) -> None:
+        """論理DPIと利用可能幅からツールバー密度を決める。"""
+        bar = getattr(self, "_main_toolbar", None)
+        container = getattr(self, "_main_toolbar_container", None)
+        if bar is None or container is None:
+            return
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        dpi = float(screen.logicalDotsPerInch()) if screen else 96.0
+        available = int(screen.availableGeometry().width()) if screen else self.width()
+        standard = QFont(self.font())
+        standard.setPointSize(max(9, self.font().pointSize()))
+        compact = QFont(standard)
+        compact.setPointSize(max(9, standard.pointSize() - 1))
+        bar.setFont(standard)
+        need_standard = bar.sizeHint().width()
+        bar.setFont(compact)
+        need_compact = bar.sizeHint().width()
+        if need_standard <= available - 40 and dpi < 120:
+            mode = "STANDARD"
+            bar.setFont(standard)
+            padding = 6
+        elif need_compact <= available - 40:
+            mode = "COMPACT"
+            bar.setFont(compact)
+            padding = 4
+        else:
+            mode = "TWO_ROW"
+            bar.setFont(compact)
+            padding = 3
+        # QToolBarは同じウィジェットを再利用し、幅超過時は折返し可能にする。
+        bar.setProperty("headerMode", mode)
+        bar.setStyleSheet(EDIT_TOOLBAR_STYLE +
+                          f" QToolButton, QComboBox, QSpinBox, QDoubleSpinBox {{"
+                          f" padding: {padding}px; }}")
+        container.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        container.setMinimumHeight(max(48, bar.sizeHint().height() + 12))
+        self._toolbar_mode = mode
+        _log.debug("voucher_edit_toolbar_mode mode=%s dpi=%.1f width=%s", mode, dpi, available)
 
     # ── 終了処理 ──────────────────────────────────────────────────────────────
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt命名)
