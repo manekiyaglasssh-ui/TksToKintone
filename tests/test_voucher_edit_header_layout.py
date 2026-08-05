@@ -1,0 +1,53 @@
+"""指図書編集ヘッダーの直接配置・折り返し回帰テスト。"""
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication, QToolBar, QToolButton
+
+from app.voucher_edit_window import VoucherEditWindow
+
+
+class TestVoucherEditHeaderLayout(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_header_is_wrapped_widget_and_all_operations_are_direct(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            previous = os.environ.get("TKS_TO_KINTONE_HOME")
+            os.environ["TKS_TO_KINTONE_HOME"] = home
+            try:
+                win = VoucherEditWindow(order_no="header", background_pdf_bytes=b"")
+                self.addCleanup(win.deleteLater)
+                header = win._main_toolbar
+                self.assertIsNotNone(header)
+                self.assertNotIsInstance(header, QToolBar)
+                labels = [action.text() for action in header.actions() if action.text()]
+                labels += [button.text() for button in header.findChildren(QToolButton)]
+                labels.append(win._shape_tool_button.text())
+                expected = [
+                    "↶", "↷", "選択", "テキスト", "図形", "画像挿入", "貼り付け",
+                    "削除", "プレビュー", "保存", "保存して閉じる", "閉じる", "全画面", "タブレット",
+                ]
+                for label in expected:
+                    self.assertIn(label, labels)
+                for action in header.actions():
+                    widget = header.widgetForAction(action)
+                    if action.text() in expected:
+                        self.assertIsInstance(widget, QToolButton)
+                        self.assertNotEqual(widget.objectName(), "qt_toolbar_ext_button")
+                self.assertEqual(header.horizontalScrollBarPolicy().name, "ScrollBarAlwaysOff")
+            finally:
+                if previous is None:
+                    os.environ.pop("TKS_TO_KINTONE_HOME", None)
+                else:
+                    os.environ["TKS_TO_KINTONE_HOME"] = previous
+
+
+if __name__ == "__main__":
+    unittest.main()

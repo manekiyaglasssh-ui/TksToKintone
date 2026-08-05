@@ -106,6 +106,7 @@ from PySide6.QtWidgets import (
     QGraphicsTextItem,
     QGraphicsView,
     QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -125,6 +126,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 from app.text_style_resolver import TextStyle, line_height_pt
 
@@ -166,6 +168,107 @@ from app.voucher_templates import VOUCHER_TYPES
 from app.theme_utils import apply_windows_title_bar_theme, current_title_bar_is_dark
 from app.window_geometry import get_display_scale, left_pane_width_for_scale
 from app.voucher_templates import PAGE_H, PAGE_W
+
+
+class _WrappedActionHeader(QWidget):
+    """編集ヘッダー用の直接配置コンテナ。
+
+    QToolBar は幅不足時に QAction を extension button へ退避するため、編集画面
+    では使わない。actions/widgetForAction は既存コード・テストとの互換用に残し、
+    実体はすべて通常の QToolButton/QWidget として GridLayout に配置する。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("mainEditHeader")
+        self._layout = QGridLayout(self)
+        self._layout.setContentsMargins(8, 4, 8, 4)
+        self._layout.setHorizontalSpacing(4)
+        self._layout.setVerticalSpacing(4)
+        self._entries: list[QWidget] = []
+        self._actions: list[QAction] = []
+        self._action_widgets: dict[QAction, QWidget] = {}
+        self._relayout_pending = False
+
+    def addAction(self, text: str, slot=None):  # noqa: N802
+        action = QAction(text, self)
+        if slot is not None:
+            action.triggered.connect(slot)
+        button = QToolButton(self)
+        button.setDefaultAction(action)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        button.setMinimumHeight(34)
+        self._actions.append(action)
+        self._action_widgets[action] = button
+        self._entries.append(button)
+        self._relayout()
+        return action
+
+    def addWidget(self, widget: QWidget):  # noqa: N802
+        widget.setParent(self)
+        action = QWidgetAction(self)
+        action.setDefaultWidget(widget)
+        self._actions.append(action)
+        self._action_widgets[action] = widget
+        self._entries.append(widget)
+        self._relayout()
+        return action
+
+    def addSeparator(self):  # noqa: N802
+        # 区切りは幅を消費しない通常のレイアウト要素として扱う。
+        return None
+
+    def actions(self):
+        return list(self._actions)
+
+    def widgetForAction(self, action):  # noqa: N802
+        return self._action_widgets.get(action)
+
+    # 旧コンテナAPIとの互換。実際にはスクロールを行わず、常に折り返す。
+    def horizontalScrollBarPolicy(self):  # noqa: N802
+        return Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+    def verticalScrollBarPolicy(self):  # noqa: N802
+        return Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+    def widgetResizable(self):  # noqa: N802
+        return True
+
+    def widget(self):  # noqa: N802
+        return self
+
+    def _relayout(self) -> None:
+        if self._relayout_pending:
+            return
+        self._relayout_pending = True
+        QTimer.singleShot(0, self._do_relayout)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _do_relayout(self) -> None:
+        self._relayout_pending = False
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().hide()
+        width = max(1, self.width() - self._layout.contentsMargins().left()
+                    - self._layout.contentsMargins().right())
+        row = col = used = 0
+        for widget in self._entries:
+            hint = widget.sizeHint()
+            needed = max(hint.width(), widget.minimumWidth())
+            if col and used + self._layout.horizontalSpacing() + needed > width:
+                row += 1
+                col = 0
+                used = 0
+            self._layout.addWidget(widget, row, col)
+            widget.show()
+            used += needed + (self._layout.horizontalSpacing() if col else 0)
+            col += 1
+        self._layout.setRowMinimumHeight(row, max(34, self._layout.rowMinimumHeight(row)))
+        self.setMinimumHeight(max(42, self._layout.sizeHint().height()))
 
 # 左ペインの基準幅（100%表示時。125%以上はDPIに応じて広げる・要件9）。
 # 左ペイン基準幅。反映先ボタン・お気に入りが窮屈だったため、さらに約1.5cm（+60px）広げた
@@ -4311,8 +4414,8 @@ class VoucherEditWindow(QMainWindow):
         # tablet_mode 中は通常ペイン/ツールバーを隠し、大きいボタンの専用ツールバーを
         # 表示して全画面化する。編集データ（scene のオブジェクト）は通常モードと共有する。
         self.tablet_mode = False
-        self._main_toolbar: "QToolBar | None" = None
-        self._main_toolbar_container: "QScrollArea | None" = None
+        self._main_toolbar: "_WrappedActionHeader | None" = None
+        self._main_toolbar_container: "_WrappedActionHeader | None" = None
         self._template_panel_scroll: "QScrollArea | None" = None
         self._tablet_toolbar: "QToolBar | None" = None
         self._tablet_toolbar_container: "QScrollArea | None" = None
@@ -5222,9 +5325,9 @@ class VoucherEditWindow(QMainWindow):
         bar = getattr(self, "_main_toolbar", None)
         if bar is not None:
             if dark:
-                bar.setStyleSheet(EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_DARK_STYLE)
+                bar.setStyleSheet((EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_DARK_STYLE).replace("QToolBar", "#mainEditHeader"))
             else:
-                bar.setStyleSheet(EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_LIGHT_STYLE)
+                bar.setStyleSheet((EDIT_TOOLBAR_STYLE + EDIT_TOOLBAR_LIGHT_STYLE).replace("QToolBar", "#mainEditHeader"))
                 _log.info("voucher_edit_toolbar_dark_style_cleared_for_light")
             # 全体テーマの後に dynamic property を再設定して再 polish し、
             # favorite 専用のテーマ色を確実に反映する。
@@ -5232,15 +5335,7 @@ class VoucherEditWindow(QMainWindow):
         container = getattr(self, "_main_toolbar_container", None)
         if container is not None:
             bg = EDIT_TOOLBAR_CONTAINER_DARK_BG if dark else EDIT_TOOLBAR_CONTAINER_LIGHT_BG
-            # QScrollArea 本体とビューポートの両方へ背景を指定する。ビューポートを
-            # 指定しないとライト切替後もダーク背景が残ることがある（要件6）。
-            container.setStyleSheet(
-                f"QScrollArea#mainEditToolBarContainer {{ background-color: {bg}; border: none; }}"
-                f"QScrollArea#mainEditToolBarContainer > QWidget > QWidget {{ background-color: {bg}; }}"
-            )
-            viewport = container.viewport()
-            if viewport is not None:
-                viewport.setStyleSheet(f"background-color: {bg};")
+            container.setStyleSheet(f"#mainEditHeader {{ background-color: {bg}; }}")
         menu = getattr(self, "_shape_menu", None)
         if menu is not None:
             menu.setStyleSheet(
@@ -5286,10 +5381,7 @@ class VoucherEditWindow(QMainWindow):
         )
 
     def _build_toolbar(self) -> None:
-        bar = QToolBar("編集ツール")
-        bar.setObjectName("mainEditToolBar")
-        bar.setMovable(False)
-        bar.setFloatable(False)
+        bar = _WrappedActionHeader(self)
         self._main_toolbar = bar
         # アンドゥ・リドゥ（曲がった矢印アイコン・全端末でアイコン表示: 要件4）。
         # OS/theme/フォント非依存。SVGが読めない端末では描画フォールバックを使う。
@@ -5408,24 +5500,13 @@ class VoucherEditWindow(QMainWindow):
         self._style_action_widget(bar, save_action, "successButton")
         self._style_action_widget(bar, save_close_action, "successButton")
         # ツールバー全体のボタン幅・余白を広げ、警告色/安全色を割り当てる（要件2-5）。
-        bar.setStyleSheet(EDIT_TOOLBAR_STYLE)
-        container = QScrollArea()
-        container.setObjectName("mainEditToolBarContainer")
-        container.setWidgetResizable(False)
-        container.setWidget(bar)
-        container.setFrameShape(QFrame.Shape.NoFrame)
-        container.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        container.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        bar.setMinimumWidth(0)
+        bar.setStyleSheet(EDIT_TOOLBAR_STYLE.replace("QToolBar", "#mainEditHeader"))
         bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        container.setMinimumHeight(max(72, bar.sizeHint().height() + 22))
-        self._main_toolbar_container = container
+        bar.setMinimumHeight(42)
+        self._main_toolbar_container = bar
         # ライト/ダークテーマに合わせて上部メニューの配色を適用する（要件6）。
         self._apply_toolbar_theme()
         bar.setMinimumWidth(0)
-        logging.getLogger("tks_to_kintone_app").info(
-            "voucher_edit_toolbar_scroll_area_enabled"
-        )
         logging.getLogger("tks_to_kintone_app").info(
             "voucher_edit_toolbar_content_width %s",
             {"width": bar.sizeHint().width()},
@@ -5511,24 +5592,22 @@ class VoucherEditWindow(QMainWindow):
         toolbar = getattr(self, "_main_toolbar", None)
         if scroll is None or toolbar is None:
             return
-        bar = scroll.horizontalScrollBar()
+        viewport_width = scroll.width()
         logging.getLogger("tks_to_kintone_app").info(
-            "voucher_edit_toolbar_viewport_width %s",
-            {"width": scroll.viewport().width()},
-        )
+            "voucher_edit_toolbar_viewport_width %s", {"width": viewport_width})
         logging.getLogger("tks_to_kintone_app").info(
             "voucher_edit_toolbar_scrollbar_range %s",
             {
-                "minimum": bar.minimum(),
-                "maximum": bar.maximum(),
+                "minimum": 0,
+                "maximum": 0,
                 "content_width": toolbar.width(),
-                "viewport_width": scroll.viewport().width(),
+                "viewport_width": viewport_width,
             },
         )
 
     @staticmethod
     def _style_action_widget(
-        bar: QToolBar,
+        bar: _WrappedActionHeader,
         action,
         style_name: str,
         *,
@@ -9478,7 +9557,6 @@ class VoucherEditWindow(QMainWindow):
         self._ensure_toolbar_button_sizes(bar)
         bar.setProperty("headerMode", mode)
         bar.setStyleSheet(EDIT_TOOLBAR_STYLE)
-        container.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         container.setMinimumHeight(max(48, bar.sizeHint().height() + 12))
         self._toolbar_mode = mode
         _log.debug("voucher_edit_toolbar_mode mode=%s dpi=%.1f width=%s", mode, dpi, available)
