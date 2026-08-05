@@ -6,11 +6,25 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
 
+# This file may be evaluated from PyInstaller's --specpath directory.  Resolve
+# repository inputs from an explicit override or by locating the repository
+# marker above the spec, never from the process current directory by accident.
+def _project_root() -> Path:
+    override = os.environ.get('TKS_PROJECT_ROOT')
+    if override:
+        return Path(override).resolve()
+    for candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+        if (candidate / 'app').is_dir() and (candidate / 'templates').is_dir():
+            return candidate
+    raise RuntimeError('Unable to locate TksToKintone project root')
+
+
+PROJECT_ROOT = _project_root()
 build_variant = os.environ.get('TKS_BUILD_VARIANT', 'normal').strip().lower()
 if build_variant not in {'normal', 'no-update', 'no-helper', 'with-helper'}:
     build_variant = 'normal'
 
-variant_dir = Path('build') / 'variant'
+variant_dir = PROJECT_ROOT / 'build' / 'variant'
 variant_dir.mkdir(parents=True, exist_ok=True)
 variant_file = variant_dir / 'build_variant.txt'
 variant_file.write_text(build_variant + '\n', encoding='utf-8')
@@ -42,13 +56,18 @@ else:
     extra_hiddenimports.append('app.update_client')
 
 extra_binaries = []
-extra_datas = [('templates', 'templates'), ('docs', 'docs'), ('assets', 'assets'), (str(variant_file), '.')]
+extra_datas = [
+    (str(PROJECT_ROOT / 'templates'), 'templates'),
+    (str(PROJECT_ROOT / 'docs'), 'docs'),
+    (str(PROJECT_ROOT / 'assets'), 'assets'),
+    (str(variant_file), '.'),
+]
 
 # SumatraPDF本体はPyInstallerへ同梱しない。固定版の公式installerは
 # build_exe.batで検証し、Inno SetupがセットアップEXE内へ直接同梱する。
 a = Analysis(
-    ['app/main.py'],
-    pathex=[],
+    [str(PROJECT_ROOT / 'app' / 'main.py')],
+    pathex=[str(PROJECT_ROOT)],
     binaries=extra_binaries,
     datas=extra_datas,
     hiddenimports=extra_hiddenimports,
@@ -77,8 +96,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['assets/app_icon.ico'],
-    version='installer/version_info.txt',
+    icon=[str(PROJECT_ROOT / 'assets' / 'app_icon.ico')],
+    version=str(PROJECT_ROOT / 'installer' / 'version_info.txt'),
 )
 
 collect_items = [exe, a.binaries, a.datas]
@@ -86,8 +105,8 @@ if build_variant == 'with-helper':
     # 更新補助プロセス（PowerShell を使わずに更新するための EXE）。
     # 本体と同じフォルダ（dist/TksToKintone/tks_update_helper.exe）へ同梱する。
     helper_a = Analysis(
-        ['app/update_helper.py'],
-        pathex=[],
+        [str(PROJECT_ROOT / 'app' / 'update_helper.py')],
+        pathex=[str(PROJECT_ROOT)],
         binaries=[],
         datas=[],
         hiddenimports=[],
