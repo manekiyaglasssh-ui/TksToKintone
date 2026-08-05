@@ -281,6 +281,14 @@ _DATA_TYPE = 0
 # 背景レイヤーの目印
 _BG_MARK = "_background"
 
+# 編集画面だけに表示する印刷安全範囲（scene座標=pt）の固定余白。
+# プリンター固有の非印字領域ではなく、レイアウト確認用の実用的な目安。
+SAFE_MARGIN_LEFT = 24.0
+SAFE_MARGIN_TOP = 24.0
+SAFE_MARGIN_RIGHT = 24.0
+SAFE_MARGIN_BOTTOM = 24.0
+_GUIDE_MARK = "_print_safe_area_guide"
+
 # テンプレートバッヂ（編集画面だけの補助表示）の目印。
 # _BG_MARK / _IS_HELPER / _IS_PREVIEW と同じく PDF反映・保存・Undo/Redo対象外（要件6）。
 _IS_BADGE = "_is_badge"
@@ -3548,6 +3556,13 @@ def resolve_edit_object_from_graphics_item(
     return None
 
 
+class _PrintSafeAreaGuideItem(QGraphicsRectItem):
+    """見た目だけ描画し、scene のヒットテストには参加しないガイド。"""
+
+    def shape(self) -> QPainterPath:
+        return QPainterPath()
+
+
 class _EditScene(QGraphicsScene):
     """ツールモードに応じてオブジェクトを描画する編集シーン。"""
 
@@ -4314,6 +4329,9 @@ class VoucherEditWindow(QMainWindow):
         self.setWindowTitle(f"指図書編集 — 受注No {order_no} — 伝票No {self._voucher_label(self.current_voucher_no)}")
 
         self._scene = _EditScene(self)
+        self._print_guide: QGraphicsRectItem | None = None
+        self._print_guide_visible = True
+        self._create_print_safe_area_guide()
         _perf_editor("scene_created", self._perf_started)
         self._scene.selectionChanged.connect(self._on_selection_changed)
         self._view = _EditGraphicsView(self._scene)
@@ -4950,6 +4968,42 @@ class VoucherEditWindow(QMainWindow):
     def is_dirty(self) -> bool:
         return bool(self._dirty or self._dirty_voucher_keys)
 
+    def _print_safe_area_rect(self) -> QRectF:
+        """現在のページ矩形から編集用の印刷安全範囲を算出する。"""
+        page = self._scene.sceneRect()
+        return QRectF(
+            page.left() + SAFE_MARGIN_LEFT,
+            page.top() + SAFE_MARGIN_TOP,
+            max(0.0, page.width() - SAFE_MARGIN_LEFT - SAFE_MARGIN_RIGHT),
+            max(0.0, page.height() - SAFE_MARGIN_TOP - SAFE_MARGIN_BOTTOM),
+        )
+
+    def _create_print_safe_area_guide(self) -> None:
+        """編集ビュー専用の非選択・非インタラクティブなガイドを作る。"""
+        guide = _PrintSafeAreaGuideItem(self._print_safe_area_rect())
+        guide._IS_HELPER = True  # type: ignore[attr-defined]
+        guide._PRINT_GUIDE = True  # type: ignore[attr-defined]
+        guide.setData(_DATA_TYPE, _GUIDE_MARK)
+        guide.setPen(QPen(QColor(210, 55, 65, 175), 1.2, Qt.PenStyle.DashLine))
+        guide.setBrush(Qt.BrushStyle.NoBrush)
+        guide.setZValue(-50.0)  # 背景より前、編集オブジェクトと操作部品より後ろ
+        guide.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        guide.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        guide.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        guide.setAcceptHoverEvents(False)
+        self._scene.addItem(guide)
+        self._print_guide = guide
+
+    def _update_print_safe_area_guide(self) -> None:
+        guide = getattr(self, "_print_guide", None)
+        if guide is not None and guide.scene() is self._scene:
+            guide.setRect(self._print_safe_area_rect())
+            guide.setVisible(self._print_guide_visible)
+
+    def _toggle_print_safe_area_guide(self, checked: bool) -> None:
+        self._print_guide_visible = bool(checked)
+        self._update_print_safe_area_guide()
+
     # ── 背景レイヤー ─────────────────────────────────────────────────────────
     def _clear_background_items(self) -> None:
         for item in list(self.background_items()):
@@ -4980,6 +5034,7 @@ class VoucherEditWindow(QMainWindow):
         self._scene.addItem(label)
         self._background_items.append(label)
         self._scene.setSceneRect(0, 0, PAGE_W, PAGE_H)
+        self._update_print_safe_area_guide()
         self._background_ready = False
 
     def set_background_pdf_async(self, voucher_no_or_key: object, pdf_bytes: bytes) -> None:
@@ -5099,6 +5154,7 @@ class VoucherEditWindow(QMainWindow):
         # PDFレンダリングは縦横同倍率。setScaleを使い既存の座標・テスト仕様も維持する。
         item.setScale(scale_x)
         self._scene.setSceneRect(0, 0, page_w, page_h)
+        self._update_print_safe_area_guide()
         self._mark_background(item)
         item.setData(1, self._current_voucher_key)
         self._scene.addItem(item)
@@ -5107,6 +5163,7 @@ class VoucherEditWindow(QMainWindow):
     def _add_preview_error_background(self, message: str) -> None:
         """別伝票の背景を残さず、明確なエラー背景を表示する。"""
         self._scene.setSceneRect(0, 0, PAGE_W, PAGE_H)
+        self._update_print_safe_area_guide()
         item = QGraphicsRectItem(0, 0, PAGE_W, PAGE_H)
         item.setBrush(QBrush(QColor(250, 250, 250)))
         item.setPen(QPen(QColor(190, 190, 190)))
@@ -5371,6 +5428,11 @@ class VoucherEditWindow(QMainWindow):
         # 「座標マーカー」ボタンは通常UIから削除（add_debug_markers は内部・テスト用に残す）。
         save_close_action = bar.addAction("保存して閉じる", self.save_and_close)
         close_action = bar.addAction("閉じる", self.close)
+        bar.addSeparator()
+        self._print_guide_action = bar.addAction("印刷範囲", self._toggle_print_safe_area_guide)
+        self._print_guide_action.setCheckable(True)
+        self._print_guide_action.setChecked(True)
+        self._print_guide_action.setToolTip("編集画面の印刷安全範囲ガイドを表示/非表示")
         bar.addSeparator()
         # 背景透過中にロックする編集アクション（保存/保存して閉じる/閉じる/画像挿入/
         # 貼り付け/削除/ツール選択）をまとめて保持する（要件2）。
