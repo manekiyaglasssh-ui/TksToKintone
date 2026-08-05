@@ -874,9 +874,9 @@ QToolBar QToolButton {
     padding-right: 7px;
     padding-top: 5px;
     padding-bottom: 5px;
-    min-height: 32px;
+    min-height: 34px;
     margin: 0px;
-    font-size: 10pt;
+    font-size: 11pt;
     color: #202124;
 }
 QToolBar QToolButton:disabled { color: #707070; background: #eeeeee; }
@@ -9461,22 +9461,19 @@ class VoucherEditWindow(QMainWindow):
         dpi = float(screen.logicalDotsPerInch()) if screen else 96.0
         available = int(screen.availableGeometry().width()) if screen else self.width()
         standard = QFont(self.font())
-        standard.setPointSize(max(10, self.font().pointSize()))
-        compact = QFont(standard)
-        compact.setPointSize(max(10, standard.pointSize()))
+        standard.setPointSize(max(11, self.font().pointSize()))
         bar.setFont(standard)
         need_standard = bar.sizeHint().width()
-        bar.setFont(compact)
-        need_compact = bar.sizeHint().width()
+        need_compact = need_standard
         if need_standard <= available - 40:
             mode = "STANDARD"
             bar.setFont(standard)
         elif need_compact <= available - 40:
             mode = "COMPACT"
-            bar.setFont(compact)
+            bar.setFont(standard)
         else:
             mode = "TWO_ROW"
-            bar.setFont(compact)
+            bar.setFont(standard)
         # 文字を縮めず、各QToolButtonがsizeHint以上になることを保証する。
         self._ensure_toolbar_button_sizes(bar)
         bar.setProperty("headerMode", mode)
