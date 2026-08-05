@@ -191,7 +191,6 @@ class _WrappedActionHeader(QWidget):
         self._entries: list[QWidget] = []
         self._actions: list[QAction] = []
         self._action_widgets: dict[QAction, QWidget] = {}
-        self._relayout_pending = False
 
     def addAction(self, text: str, slot=None):  # noqa: N802
         action = QAction(text, self)
@@ -246,24 +245,19 @@ class _WrappedActionHeader(QWidget):
         return QSize(0, max(42, self._layout.minimumSize().height()))
 
     def _relayout(self) -> None:
-        if self._relayout_pending:
-            return
-        self._relayout_pending = True
-        QTimer.singleShot(0, self._do_relayout)
+        # 構築途中の空レイアウトをイベントループへ露出させない。
+        self._do_relayout()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._relayout()
+        self._layout.activate()
 
     def _do_relayout(self) -> None:
-        self._relayout_pending = False
         while self._layout.count():
             item = self._layout.takeAt(0)
-            if item.widget() is not None:
-                item.widget().hide()
         for widget in self._entries:
             self._layout.addWidget(widget)
-            widget.show()
+            widget.setVisible(True)
         # 余剰幅は操作群の途中へ配分せず、最後尾の後ろへだけ残す。
         self._layout.addStretch(1)
         self._layout.activate()
@@ -1006,6 +1000,18 @@ EDIT_TOOLBAR_STYLE = """
     min-height: 34px;
     margin: 0px;
     font-size: 10pt;
+}
+#voucher_edit_header[headerMode="NORMAL"] QToolButton {
+    padding-left: 8px;
+    padding-right: 8px;
+}
+#voucher_edit_header[headerMode="MEDIUM"] QToolButton {
+    padding-left: 6px;
+    padding-right: 6px;
+}
+#voucher_edit_header[headerMode="COMPACT"] QToolButton {
+    padding-left: 4px;
+    padding-right: 4px;
 }
 #voucher_edit_header QToolButton:hover {
     border: 1px solid #999999;
@@ -4522,6 +4528,8 @@ class VoucherEditWindow(QMainWindow):
         central_layout.addWidget(self._view, 1)
         outer_layout.addWidget(body, 1)
         self.setCentralWidget(central)
+        # 未表示の段階で一度同期確定し、初回 show/resize 待ちの中間配置を作らない。
+        self._prepare_header_for_paint()
         _perf_editor("ui_parts_created", self._perf_started)
 
         initial_background = self._background_pdf_by_voucher.get(self._current_voucher_key)
@@ -9522,6 +9530,8 @@ class VoucherEditWindow(QMainWindow):
         self.showMaximized()
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt命名)
+        # 最初の paint より前に、最大化・復元済み geometry で配置を同期確定する。
+        self._prepare_header_for_paint()
         super().showEvent(event)
         handle = self.windowHandle()
         if handle is not None and not getattr(self, "_screen_change_connected", False):
@@ -9570,6 +9580,10 @@ class VoucherEditWindow(QMainWindow):
         screen = self.screen() or QGuiApplication.primaryScreen()
         dpi = float(screen.logicalDotsPerInch()) if screen else 96.0
         available = max(0, bar.contentsRect().width())
+        if available <= 0:
+            central = self.centralWidget()
+            available = max(
+                0, central.contentsRect().width() if central else self.contentsRect().width())
         standard = QFont(self.font())
         standard.setPointSize(max(11, self.font().pointSize()))
         bar.setFont(standard)
@@ -9582,17 +9596,45 @@ class VoucherEditWindow(QMainWindow):
         QTimer.singleShot(0, self._log_toolbar_geometry_metrics)
         _log.debug("voucher_edit_toolbar_mode mode=%s dpi=%.1f available_header_width=%s", mode, dpi, available)
 
+    def _prepare_header_for_paint(self) -> None:
+        """親子layout、密度、末尾stretchを初回描画前に同期確定する。"""
+        central = self.centralWidget()
+        if central is not None and central.layout() is not None:
+            central.layout().invalidate()
+            central.layout().activate()
+        bar = getattr(self, "_main_toolbar", None)
+        if bar is None:
+            return
+        bar.setUpdatesEnabled(False)
+        try:
+            bar._do_relayout()
+            self._reevaluate_toolbar_mode()
+            bar.layout().invalidate()
+            bar.layout().activate()
+        finally:
+            bar.setUpdatesEnabled(True)
+
     def _apply_toolbar_density(self, bar: _WrappedActionHeader, available: int) -> str:
-        """幅の優先順位に従い、各部品の余剰幅だけを段階的に縮める。"""
-        if available >= 1450:
-            mode, margins, spacing, family, size, line, extra = (
-                "NORMAL", (4, 4, 10, 4), 2, 110, 72, 74, 14)
-        elif available >= 1350:
-            mode, margins, spacing, family, size, line, extra = (
-                "MEDIUM", (3, 4, 10, 4), 1, 104, 68, 70, 12)
-        else:
-            mode, margins, spacing, family, size, line, extra = (
-                "COMPACT", (1, 4, 10, 4), 0, 92, 60, 64, 8)
+        """各密度の実必要幅を測り、収まる最も余裕のある密度を選ぶ。"""
+        profiles = (
+            ("NORMAL", (4, 4, 10, 4), 2, 110, 72, 74, 16),
+            ("MEDIUM", (3, 4, 10, 4), 1, 104, 68, 70, 12),
+            ("COMPACT", (1, 4, 10, 4), 0, 92, 60, 64, 8),
+        )
+        selected = profiles[-1]
+        for profile in profiles:
+            self._apply_toolbar_profile(bar, profile)
+            if self._toolbar_required_width(bar) <= available:
+                selected = profile
+                break
+        self._apply_toolbar_profile(bar, selected)
+        return selected[0]
+
+    def _apply_toolbar_profile(self, bar: _WrappedActionHeader, profile: tuple) -> None:
+        mode, margins, spacing, family, size, line, extra = profile
+        bar.setProperty("headerMode", mode)
+        bar.style().unpolish(bar)
+        bar.style().polish(bar)
         bar.layout().setContentsMargins(*margins)
         bar.layout().setSpacing(spacing)
         self._font_family_combo.setFixedWidth(family)
@@ -9612,7 +9654,8 @@ class VoucherEditWindow(QMainWindow):
             if isinstance(widget, QToolButton):
                 menu_allowance = 14 if widget.menu() is not None else 0
                 text_width = metrics.horizontalAdvance(widget.text())
-                width = max(34, text_width + extra + menu_allowance)
+                natural_minimum = 58 if mode == "NORMAL" and widget.text() not in ("↶", "↷") else 34
+                width = max(natural_minimum, text_width + extra + menu_allowance)
                 widget.setFixedWidth(width)
                 widget.setMinimumHeight(max(34, widget.minimumSizeHint().height()))
                 widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -9620,7 +9663,14 @@ class VoucherEditWindow(QMainWindow):
                 widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         bar.setMinimumWidth(0)
         bar.layout().activate()
-        return mode
+
+    @staticmethod
+    def _toolbar_required_width(bar: _WrappedActionHeader) -> int:
+        """現在profileの全操作と右端安全余裕に必要な実幅。"""
+        # QLayout自身に、子layout（線幅ラベル＋spin）・style由来の最小幅・margin・
+        # spacingをすべて集計させる。末尾stretchの最小幅は0なので含めて問題ない。
+        bar.layout().invalidate()
+        return bar.layout().minimumSize().width() + EDIT_HEADER_RIGHT_SAFETY_PX
 
     def _log_toolbar_geometry_metrics(self) -> None:
         """配置確定後の実 geometry と overflow を診断ログへ出す。"""

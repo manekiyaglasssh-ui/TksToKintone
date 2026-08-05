@@ -290,6 +290,68 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                 else:
                     os.environ["TKS_TO_KINTONE_HOME"] = previous
 
+    def test_first_show_is_synchronously_laid_out_without_resize_wait(self) -> None:
+        """showEventが返る時点で密度・順序・末尾stretchが確定している。"""
+        with tempfile.TemporaryDirectory() as home:
+            previous = os.environ.get("TKS_TO_KINTONE_HOME")
+            os.environ["TKS_TO_KINTONE_HOME"] = home
+            try:
+                win = VoucherEditWindow(order_no="first-show", background_pdf_bytes=b"")
+                self.addCleanup(win.deleteLater)
+                win._default_maximize_applied = True
+                win.resize(1536, 800)  # restoreGeometry後の通常表示に相当
+                win.showNormal()
+                header = win._main_toolbar
+                self.assertEqual(win._toolbar_mode, "NORMAL")
+                self.assertTrue(header.updatesEnabled())
+                widgets = [header.widgetForAction(action) for action in header.actions()]
+                widgets = [widget for widget in widgets if widget is not None]
+                positions = [widget.mapTo(header, QPoint(0, 0)).x() for widget in widgets]
+                self.assertEqual(positions, sorted(positions))
+                self.assertTrue(all(widget.isVisible() for widget in widgets))
+                self.assertEqual(
+                    [i for i in range(header.layout().count())
+                     if header.layout().itemAt(i).spacerItem() is not None],
+                    [header.layout().count() - 1],
+                )
+                rightmost = max(
+                    widget.mapTo(header, widget.rect().topRight()).x() for widget in widgets)
+                self.assertLessEqual(rightmost, header.contentsRect().right() - 8)
+            finally:
+                if previous is None:
+                    os.environ.pop("TKS_TO_KINTONE_HOME", None)
+                else:
+                    os.environ["TKS_TO_KINTONE_HOME"] = previous
+
+    def test_normal_buttons_have_natural_horizontal_proportions(self) -> None:
+        """100%相当のNORMAL文字ボタンは左右8px余白と横長比率を持つ。"""
+        with tempfile.TemporaryDirectory() as home:
+            previous = os.environ.get("TKS_TO_KINTONE_HOME")
+            os.environ["TKS_TO_KINTONE_HOME"] = home
+            try:
+                win = VoucherEditWindow(order_no="normal-size", background_pdf_bytes=b"")
+                self.addCleanup(win.deleteLater)
+                header = win._main_toolbar
+                self.assertEqual(win._apply_toolbar_density(header, 1920), "NORMAL")
+                self.assertEqual(header.property("headerMode"), "NORMAL")
+                by_text = {
+                    action.text(): header.widgetForAction(action)
+                    for action in header.actions() if action.text()
+                }
+                for text in ("選択", "テキスト", "画像挿入", "保存して閉じる", "タブレット"):
+                    button = by_text[text]
+                    self.assertGreaterEqual(
+                        button.width(), header.fontMetrics().horizontalAdvance(text) + 16)
+                    self.assertGreaterEqual(button.width() / button.minimumHeight(), 1.15)
+                self.assertGreaterEqual(win._shape_tool_button.width(), 58)
+                self.assertIn('padding-left: 8px', EDIT_TOOLBAR_STYLE)
+                self.assertIn('padding-right: 8px', EDIT_TOOLBAR_STYLE)
+            finally:
+                if previous is None:
+                    os.environ.pop("TKS_TO_KINTONE_HOME", None)
+                else:
+                    os.environ["TKS_TO_KINTONE_HOME"] = previous
+
 
 if __name__ == "__main__":
     unittest.main()
