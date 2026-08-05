@@ -192,7 +192,7 @@ class TestVoucherEditFontFavorites(unittest.TestCase):
         self.assertIn("favoriteFontButton:checked", edit.EDIT_TOOLBAR_STYLE)
         self.assertIn("background: transparent", edit.EDIT_TOOLBAR_STYLE)
         self.assertIn("border: none", edit.EDIT_TOOLBAR_STYLE)
-        self.assertIn("font-size: 18px", edit.EDIT_TOOLBAR_STYLE)
+        self.assertIn("font-size: 24px", edit.EDIT_TOOLBAR_STYLE)
         self.assertIn("min-width: 48px", edit.EDIT_TOOLBAR_STYLE)
         self.assertIn("max-width: 48px", edit.EDIT_TOOLBAR_STYLE)
         combined_styles = (
@@ -235,7 +235,7 @@ class TestVoucherEditFontFavorites(unittest.TestCase):
             win._favorite_font_button.width(),
             edit.FAVORITE_FONT_BUTTON_WIDTH_PX,
         )
-        self.assertEqual(edit.FAVORITE_FONT_ICON_SIZE_PX, 18)
+        self.assertEqual(edit.FAVORITE_FONT_ICON_SIZE_PX, 24)
         win._apply_toolbar_theme()
         self.assertTrue(win._favorite_font_button.toolTip())
 
@@ -315,7 +315,7 @@ class TestVoucherEditFontFavorites(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(
             button.palette().color(QPalette.ColorRole.ButtonText).name(),
-            edit.FAVORITE_FONT_REGISTERED_DISABLED_COLOR.lower(),
+            edit.FAVORITE_FONT_ICON_COLOR.lower(),
         )
 
         button.setProperty("favorite", "false")
@@ -323,7 +323,7 @@ class TestVoucherEditFontFavorites(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(
             button.palette().color(QPalette.ColorRole.ButtonText).name(),
-            edit.FAVORITE_FONT_DISABLED_COLOR.lower(),
+            edit.FAVORITE_FONT_ICON_COLOR.lower(),
         )
 
     def test_integrated_list_has_disabled_headers_separator_and_all_fonts(self) -> None:

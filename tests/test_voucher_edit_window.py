@@ -2217,7 +2217,7 @@ class TestVoucherEditWindow(unittest.TestCase):
         self.assertTrue(scroll.widgetResizable())
         self.assertEqual(scroll.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.assertEqual(scroll.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.assertEqual(win._main_toolbar.minimumWidth(), 0)
+        self.assertGreaterEqual(win._main_toolbar.minimumWidth(), win._main_toolbar.sizeHint().width())
 
     def test_left_pane_is_vertical_scroll_area(self) -> None:
         from PySide6.QtWidgets import QScrollArea

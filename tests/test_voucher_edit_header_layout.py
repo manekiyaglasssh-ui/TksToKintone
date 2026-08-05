@@ -54,6 +54,34 @@ class TestVoucherEditHeaderLayout(unittest.TestCase):
                         self.assertIsInstance(widget, QToolButton)
                         self.assertNotEqual(widget.objectName(), "qt_toolbar_ext_button")
                 self.assertEqual(header.horizontalScrollBarPolicy().name, "ScrollBarAlwaysOff")
+                widgets = [header.widgetForAction(action) for action in header.actions()]
+                widgets = [widget for widget in widgets if widget is not None and widget.isVisible()]
+                self.assertGreater(len(widgets), 10)
+                self.assertTrue(all(widget.geometry().top() >= 0 for widget in widgets))
+                self.assertTrue(all(widget.geometry().bottom() <= header.height() for widget in widgets))
+                self.assertEqual(
+                    [widget.geometry().x() for widget in widgets],
+                    sorted(widget.geometry().x() for widget in widgets),
+                )
+                self.assertGreaterEqual(header.minimumWidth(), header.sizeHint().width())
+            finally:
+                if previous is None:
+                    os.environ.pop("TKS_TO_KINTONE_HOME", None)
+                else:
+                    os.environ["TKS_TO_KINTONE_HOME"] = previous
+
+    def test_favorite_font_is_yellow_star_without_button_background(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            previous = os.environ.get("TKS_TO_KINTONE_HOME")
+            os.environ["TKS_TO_KINTONE_HOME"] = home
+            try:
+                win = VoucherEditWindow(order_no="favorite-header", background_pdf_bytes=b"")
+                self.addCleanup(win.deleteLater)
+                button = win._favorite_font_button
+                self.assertIn(button.text(), ("☆", "★"))
+                self.assertIn("background: transparent", win._main_toolbar.styleSheet())
+                self.assertIn("color: #F2B705", win._main_toolbar.styleSheet())
+                self.assertTrue(button.toolTip())
             finally:
                 if previous is None:
                     os.environ.pop("TKS_TO_KINTONE_HOME", None)

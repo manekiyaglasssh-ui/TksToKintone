@@ -181,10 +181,9 @@ class _WrappedActionHeader(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("mainEditHeader")
-        self._layout = QGridLayout(self)
+        self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(8, 4, 8, 4)
-        self._layout.setHorizontalSpacing(4)
-        self._layout.setVerticalSpacing(4)
+        self._layout.setSpacing(4)
         self._entries: list[QWidget] = []
         self._actions: list[QAction] = []
         self._action_widgets: dict[QAction, QWidget] = {}
@@ -224,7 +223,7 @@ class _WrappedActionHeader(QWidget):
     def widgetForAction(self, action):  # noqa: N802
         return self._action_widgets.get(action)
 
-    # 旧コンテナAPIとの互換。実際にはスクロールを行わず、常に折り返す。
+    # 旧コンテナAPIとの互換。一列固定のため折り返しは行わない。
     def horizontalScrollBarPolicy(self):  # noqa: N802
         return Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
@@ -253,21 +252,11 @@ class _WrappedActionHeader(QWidget):
             item = self._layout.takeAt(0)
             if item.widget() is not None:
                 item.widget().hide()
-        width = max(1, self.width() - self._layout.contentsMargins().left()
-                    - self._layout.contentsMargins().right())
-        row = col = used = 0
         for widget in self._entries:
-            hint = widget.sizeHint()
-            needed = max(hint.width(), widget.minimumWidth())
-            if col and used + self._layout.horizontalSpacing() + needed > width:
-                row += 1
-                col = 0
-                used = 0
-            self._layout.addWidget(widget, row, col)
+            self._layout.addWidget(widget)
             widget.show()
-            used += needed + (self._layout.horizontalSpacing() if col else 0)
-            col += 1
-        self._layout.setRowMinimumHeight(row, max(34, self._layout.rowMinimumHeight(row)))
+        self._layout.activate()
+        self.setMinimumWidth(self._layout.sizeHint().width())
         self.setMinimumHeight(max(42, self._layout.sizeHint().height()))
 
 # 左ペインの基準幅（100%表示時。125%以上はDPIに応じて広げる・要件9）。
@@ -959,11 +948,11 @@ TEXT_FONT_CANDIDATES = [
 ]
 
 FAVORITE_FONT_ICON_COLOR = "#F2B705"
-FAVORITE_FONT_UNREGISTERED_LIGHT_COLOR = "#333333"
-FAVORITE_FONT_UNREGISTERED_DARK_COLOR = "#E6E6E6"
+FAVORITE_FONT_UNREGISTERED_LIGHT_COLOR = FAVORITE_FONT_ICON_COLOR
+FAVORITE_FONT_UNREGISTERED_DARK_COLOR = FAVORITE_FONT_ICON_COLOR
 FAVORITE_FONT_DISABLED_COLOR = "#999999"
 FAVORITE_FONT_REGISTERED_DISABLED_COLOR = "#B88A00"
-FAVORITE_FONT_ICON_SIZE_PX = 18
+FAVORITE_FONT_ICON_SIZE_PX = 24
 FAVORITE_FONT_BUTTON_WIDTH_PX = 48
 
 # ツールバーのボタン幅・余白を広げ、削除=警告色/保存=安全色を割り当てる（要件2-5・2-6・2-7・3）。
@@ -1001,7 +990,8 @@ QToolBar QToolButton#favoriteFontButton:focus {
     margin: 0px;
     min-width: 48px;
     max-width: 48px;
-    font-size: 18px;
+    font-size: 24px;
+    color: #F2B705;
 }
 QToolBar QToolButton[editToolButton="true"]:checked {
     background-color: #0d6efd;
@@ -1069,7 +1059,7 @@ QToolButton#favoriteFontButton[favorite="false"],
 QToolButton#favoriteFontButton[favorite="false"]:hover,
 QToolButton#favoriteFontButton[favorite="false"]:pressed,
 QToolButton#favoriteFontButton[favorite="false"]:focus {
-    color: #E6E6E6;
+    color: #F2B705;
     background: transparent;
     border: none;
 }
@@ -1122,7 +1112,7 @@ QToolButton#favoriteFontButton[favorite="false"],
 QToolButton#favoriteFontButton[favorite="false"]:hover,
 QToolButton#favoriteFontButton[favorite="false"]:pressed,
 QToolButton#favoriteFontButton[favorite="false"]:focus {
-    color: #333333;
+    color: #F2B705;
     background: transparent;
     border: none;
 }
@@ -5530,7 +5520,7 @@ class VoucherEditWindow(QMainWindow):
         self._main_toolbar_container = bar
         # ライト/ダークテーマに合わせて上部メニューの配色を適用する（要件6）。
         self._apply_toolbar_theme()
-        bar.setMinimumWidth(0)
+        bar.setMinimumWidth(bar.sizeHint().width())
         logging.getLogger("tks_to_kintone_app").info(
             "voucher_edit_toolbar_content_width %s",
             {"width": bar.sizeHint().width()},
@@ -9531,7 +9521,7 @@ class VoucherEditWindow(QMainWindow):
             QTimer.singleShot(0, self.showMaximized)
         if self._main_toolbar_container is not None:
             if self._main_toolbar is not None:
-                self._main_toolbar.setMinimumWidth(0)
+                self._main_toolbar.setMinimumWidth(self._main_toolbar.sizeHint().width())
             needed = max(72, self._main_toolbar.sizeHint().height() + 22 if self._main_toolbar is not None else 72)
             if self._main_toolbar_container.minimumHeight() < needed:
                 self._main_toolbar_container.setMinimumHeight(needed)
@@ -9567,17 +9557,9 @@ class VoucherEditWindow(QMainWindow):
         standard = QFont(self.font())
         standard.setPointSize(max(11, self.font().pointSize()))
         bar.setFont(standard)
-        need_standard = bar.sizeHint().width()
-        need_compact = need_standard
-        if need_standard <= available - 40:
-            mode = "STANDARD"
-            bar.setFont(standard)
-        elif need_compact <= available - 40:
-            mode = "COMPACT"
-            bar.setFont(standard)
-        else:
-            mode = "TWO_ROW"
-            bar.setFont(standard)
+        # DPI変更時も操作順と表示段数を変えず、必要幅を持つ一列を維持する。
+        bar.setFont(standard)
+        mode = "ONE_ROW"
         # 文字を縮めず、各QToolButtonがsizeHint以上になることを保証する。
         self._ensure_toolbar_button_sizes(bar)
         bar.setProperty("headerMode", mode)
