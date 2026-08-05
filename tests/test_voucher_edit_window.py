@@ -3165,6 +3165,45 @@ class TestVoucherEditShapeMenu(unittest.TestCase):
             win._tool_actions[tool].trigger()
             self.assertEqual(win.current_tool, tool)
 
+    def test_mouse_click_switches_from_shape_to_select_and_text(self) -> None:
+        """図形popup後も実ボタンのクリックがモード切替まで届く。"""
+        from PySide6.QtTest import QSignalSpy, QTest
+        from PySide6.QtWidgets import QWidget
+        from app.voucher_edit_window import TOOL_RECT, TOOL_SELECT, TOOL_TEXT
+
+        win = self._make()
+        win.resize(1400, 900)
+        win.show()
+        self.app.processEvents()
+        shape = win._shape_tool_button
+        select = win._edit_header_widget.widgetForAction(
+            win._tool_actions[TOOL_SELECT])
+        text = win._edit_header_widget.widgetForAction(
+            win._tool_actions[TOOL_TEXT])
+        for button in (select, text, shape):
+            self.assertTrue(button.isEnabled())
+            self.assertIsNotNone(button)
+
+        # 図形メニュー項目の選択結果を適用した直後の状態を作る。
+        win._on_shape_selected(TOOL_RECT)
+        self.app.processEvents()
+        self.assertEqual(win.current_tool, TOOL_RECT)
+
+        select_spy = QSignalSpy(select.clicked)
+        QTest.mouseClick(select, Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+        self.assertEqual(select_spy.count(), 1)
+        self.assertEqual(win.current_tool, TOOL_SELECT)
+
+        text_spy = QSignalSpy(text.clicked)
+        QTest.mouseClick(text, Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+        self.assertEqual(text_spy.count(), 1)
+        self.assertEqual(win.current_tool, TOOL_TEXT)
+        for button in (select, text, shape):
+            self.assertTrue(button.isEnabled())
+        self.assertIsNone(QWidget.mouseGrabber())
+
     def test_shape_actions_are_exclusive_group(self) -> None:
         from app.voucher_edit_window import TOOL_LINE, TOOL_RECT
 

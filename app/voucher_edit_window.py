@@ -5431,7 +5431,10 @@ class VoucherEditWindow(QMainWindow):
         # ツール選択（チェック可能にしてハイライト表示する: 要件11）。
         # 選択/テキストは個別ボタン、図形6種は「図形」ボタン1つへまとめる（要件5/7）。
         for label, tool in (("選択", TOOL_SELECT), ("テキスト", TOOL_TEXT)):
-            act = bar.addAction(label, lambda t=tool: self.set_tool(t))
+            # QAction.triggered(bool) のchecked引数で tool の既定値を上書き
+            # しない。ここを誤ると実クリック時だけ current_tool が True になる。
+            act = bar.addAction(
+                label, lambda _checked=False, t=tool: self.set_tool(t))
             act.setCheckable(True)
             self._tool_actions[tool] = act
             self._style_action_widget(bar, act, "editToolButton", as_property=True)
@@ -5628,7 +5631,23 @@ class VoucherEditWindow(QMainWindow):
     def _on_shape_selected(self, tool: str) -> None:
         """図形メニューから図形を選んだときにツールを切り替える（要件6）。"""
         _log.info("voucher_edit_shape_selected %s", {"tool": tool})
+        # WindowsではQMenuがaction.triggered後も短時間popup/grabを保持する
+        # ことがある。次のヘッダーボタンへの実クリックを奪わないよう、選択
+        # 処理の入口で必ずポップアップを閉じる。
+        self._close_tool_popup()
         self.set_tool(tool)
+
+    def _close_tool_popup(self) -> None:
+        """編集ツールのpopupと一時的なmouse grabを確実に解放する。"""
+        menu = getattr(self, "_shape_menu", None)
+        if menu is not None and menu.isVisible():
+            menu.close()
+        popup = QApplication.activePopupWidget()
+        if popup is not None and popup is not menu:
+            popup.close()
+        grabber = QWidget.mouseGrabber()
+        if grabber is not None and (grabber is menu or grabber is popup):
+            grabber.releaseMouse()
 
     def _update_shape_button_display(self) -> None:
         """図形ボタンの表示/チェック状態を現在ツールに合わせる（要件6）。"""
@@ -5726,6 +5745,7 @@ class VoucherEditWindow(QMainWindow):
         選択/テキストは通常ヘッダーの defaultAction、図形はメニュー内の
         QActionGroup と別実体のボタンなので、ここを唯一の同期点にする。
         """
+        self._close_tool_popup()
         previous = getattr(self, "current_tool", None)
         if previous != tool:
             # 図形・テキストのプレビューを次のツールへ持ち越すと、次のクリックで
