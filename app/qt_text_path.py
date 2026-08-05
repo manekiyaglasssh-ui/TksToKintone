@@ -20,7 +20,10 @@ def ensure_qt_application() -> QGuiApplication:
     # for CLI/tests that generate a PDF without opening the editor.
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    _HEADLESS_QT_APP = QGuiApplication([])
+    # QApplication is required because the editor tests and some PDF preview
+    # paths construct widgets after generating a path.
+    from PySide6.QtWidgets import QApplication
+    _HEADLESS_QT_APP = QApplication([])
     return _HEADLESS_QT_APP
 
 

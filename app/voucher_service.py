@@ -3528,25 +3528,31 @@ def draw_text_in_scene_rect(
     _log.info(
         "event=voucher_edit_qt_glyph_path object_id=%s requested_family=%r "
         "resolved_family=%r exact_match=%s point_size=%s weight=%s italic=%s "
-        "underline=%s strikeout=%s glyph_path_bounds=%s pdf_bounds=%s",
+        "underline=%s strikeout=%s underline_pos=%s strikeout_pos=%s "
+        "line_width=%s glyph_path_bounds=%s pdf_bounds=%s",
         object_id, (font_metadata or {}).get("requested_family", ""),
         qt_font.family(), qt_font.exactMatch(), qt_font.pointSizeF(),
         qt_font.weight(), qt_font.italic(), qt_font.underline(),
-        qt_font.strikeOut(), glyph_bounds, glyph_bounds)
+        qt_font.strikeOut(), metrics.underlinePos(), metrics.strikeOutPos(),
+        decoration_geometry(font_size)[0], glyph_bounds, glyph_bounds)
     # QFont underline/strikeOutの実装はQt/PDFで差が出るため、同じ論理pt
     # 位置で明示線を引く。ここでは装飾線の回転も既存のオブジェクト状態へ
     # 同じく委譲される。
     if underline or strikeout:
-        line_width, underline_offset, strikeout_offset = decoration_geometry(font_size)
+        line_width, _underline_offset, _strikeout_offset = decoration_geometry(font_size)
         c.setLineWidth(line_width)
         c.setStrokeColorRGB(*(_coerce_rgb(color) or (0.0, 0.0, 0.0)))
         line_x1, line_x2 = path_x, path_x + raw_width
+        # QPainterPath.addText() uses the same Qt baseline as the editor. Qt's
+        # metrics are in the path's logical coordinates, so using these values
+        # avoids confusing the below-baseline underline with the strikeout.
+        first_baseline = path_y + float(metrics.ascent())
         if underline:
-            sx = line_x1; sy = path_y + raw_height + underline_offset
+            sx = line_x1; sy = first_baseline + float(metrics.underlinePos())
             ex = line_x2; ey = sy
             c.line(sx, PAGE_H - sy, ex, PAGE_H - ey)
         if strikeout:
-            sx = line_x1; sy = path_y + raw_height + strikeout_offset
+            sx = line_x1; sy = first_baseline + float(metrics.strikeOutPos())
             ex = line_x2; ey = sy
             c.line(sx, PAGE_H - sy, ex, PAGE_H - ey)
     return
