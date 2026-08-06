@@ -684,7 +684,8 @@ class TestVoucherEditWindow(unittest.TestCase):
         self.assertEqual(len(items), 1)
         flags = items[0].flags()
         self.assertTrue(flags & QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-        self.assertTrue(flags & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+        # 移動は scene の共通 drag state で処理し、Qt item 標準移動は競合防止で無効。
+        self.assertFalse(flags & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
 
     def test_reload_does_not_duplicate(self) -> None:
         """load_edit_layer を2回呼んでも編集レイヤーがクリアされ重複しない（要件2）。"""

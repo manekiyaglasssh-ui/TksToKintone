@@ -291,7 +291,8 @@ class TestResizeHandles(unittest.TestCase):
         item = win.add_image(_png_bytes(), rect=QRectF(20.0, 20.0, 50.0, 40.0))
         handle = self._select_resize_handle(win, item)
         movable = QGraphicsItem.GraphicsItemFlag.ItemIsMovable
-        self.assertTrue(bool(item.flags() & movable))
+        # 通常移動も scene 共通 drag が担うため、item 標準移動は常時無効。
+        self.assertFalse(bool(item.flags() & movable))
         ev = QGraphicsSceneMouseEvent(
             QGraphicsSceneMouseEvent.Type.GraphicsSceneMousePress)
         ev.setScenePos(handle.sceneBoundingRect().center())

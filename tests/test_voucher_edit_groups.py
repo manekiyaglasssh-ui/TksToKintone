@@ -49,6 +49,111 @@ class TestVoucherEditGroups(unittest.TestCase):
         win._select_items([a, b])
         return a, b
 
+    def viewport_drag(self, win, scene_start, delta):
+        win.show()
+        win.set_tool("select")
+        QApplication.processEvents()
+        start = win._view.mapFromScene(scene_start)
+        end = win._view.mapFromScene(scene_start + delta)
+        QTest.mousePress(win._view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, start)
+        QTest.mouseMove(win._view.viewport(), end, 20)
+        QTest.mouseRelease(win._view.viewport(), Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier, end)
+        QApplication.processEvents()
+        return win._scene._last_drag_result
+
+    def assert_common_drag(self, result, kind, items, group_id=None):
+        self.assertIsNotNone(result)
+        self.assertEqual(result["kind"], kind)
+        self.assertEqual(set(result["object_ids"]), {item.obj_id for item in items})
+        self.assertEqual(result["group_id"], group_id)
+        self.assertGreaterEqual(result["move_event_count"], 1)
+
+    def test_viewport_formal_group_member_and_gap_drag_uses_all_members(self):
+        win = self.window("viewport-group")
+        a = win.add_text_rect(QRectF(80, 80, 100, 30), text="上",
+                              font_size=10, auto_edit=False, auto_fit=False)
+        b = win.add_text_rect(QRectF(80, 180, 100, 30), text="下",
+                              font_size=10, auto_edit=False, auto_fit=False)
+        win._select_items([a, b])
+        self.assertTrue(win.group_selected())
+        gid = a.group_id
+        before = {item.obj_id: QPointF(item.pos()) for item in (a, b)}
+        result = self.viewport_drag(win, a.box_rect_scene().center(), QPointF(30, 0))
+        self.assert_common_drag(result, "group", (a, b), gid)
+        for item in (a, b):
+            self.assertAlmostEqual((item.pos() - before[item.obj_id]).x(), 30, delta=1.5)
+        # メンバー間の空白も visual group selection rect から全件移動する。
+        before = {item.obj_id: QPointF(item.pos()) for item in (a, b)}
+        gap = QPointF(win._scene._visual_selection_rect().center().x(),
+                      (a.box_rect_scene().bottom() + b.box_rect_scene().top()) / 2)
+        result = self.viewport_drag(win, gap, QPointF(30, 0))
+        self.assert_common_drag(result, "group", (a, b), gid)
+        self.assertEqual(result["hit_source"], "group_selection_rect")
+        for item in (a, b):
+            self.assertAlmostEqual((item.pos() - before[item.obj_id]).x(), 30, delta=1.5)
+
+    def test_viewport_selection_rect_five_points_and_three_pixels(self):
+        for index, (rx, ry) in enumerate(((.25, .25), (.5, .5), (.75, .75),
+                                          (.9, .5), (.5, .9))):
+            with self.subTest(point=(rx, ry)):
+                win = self.window(f"viewport-single-{index}")
+                item = win.add_text_rect(QRectF(120, 100, 140, 140), text="x",
+                                         font_size=10, auto_edit=False, auto_fit=False)
+                item.set_manual_box_size(140, 140)
+                win._select_items([item])
+                QApplication.processEvents()
+                rect = win._scene._visual_selection_rect()
+                point = QPointF(rect.left() + rect.width() * rx,
+                                rect.top() + rect.height() * ry)
+                before = QPointF(item.pos())
+                distance = 30 if index == 0 else 3
+                result = self.viewport_drag(win, point, QPointF(distance, 0))
+                self.assert_common_drag(result, "single", (item,))
+                self.assertEqual(result["hit_source"], "single_selection_rect")
+                self.assertAlmostEqual((item.pos() - before).x(), distance, delta=1.5)
+                self.assertIsNone(win._scene._drag_state)
+
+    def test_viewport_selected_group_rect_precedes_overlapping_single(self):
+        win = self.window("viewport-overlap")
+        a, b = self.two_items(win)
+        self.assertTrue(win.group_selected())
+        gid = a.group_id
+        overlap = win.add_rect(QRectF(a.sceneBoundingRect()), text="前面単体")
+        overlap.setZValue(500)
+        win._select_items([a, b])
+        before_group = {item.obj_id: QPointF(item.pos()) for item in (a, b)}
+        before_overlap = QPointF(overlap.pos())
+        result = self.viewport_drag(win, a.sceneBoundingRect().center(), QPointF(30, 0))
+        self.assert_common_drag(result, "group", (a, b), gid)
+        self.assertEqual(result["hit_source"], "group_selection_rect")
+        for item in (a, b):
+            self.assertAlmostEqual((item.pos() - before_group[item.obj_id]).x(), 30,
+                                   delta=1.5)
+        self.assertEqual(overlap.pos(), before_overlap)
+
+    def test_viewport_group_undo_redo_is_one_snapshot(self):
+        win = self.window("viewport-undo")
+        a, b = self.two_items(win)
+        self.assertTrue(win.group_selected())
+        gid = a.group_id
+        before = {obj["id"]: (obj["x"], obj["y"]) for obj in win.serialize_objects()}
+        result = self.viewport_drag(win, a.sceneBoundingRect().center(), QPointF(30, 0))
+        self.assert_common_drag(result, "group", (a, b), gid)
+        moved = {obj["id"]: (obj["x"], obj["y"]) for obj in win.serialize_objects()}
+        win.undo()
+        restored = {obj["id"]: obj for obj in win.serialize_objects()}
+        for oid, pos in before.items():
+            self.assertAlmostEqual(restored[oid]["x"], pos[0], delta=.1)
+            self.assertAlmostEqual(restored[oid]["y"], pos[1], delta=.1)
+        win.redo()
+        restored = {obj["id"]: obj for obj in win.serialize_objects()}
+        for oid, pos in moved.items():
+            self.assertAlmostEqual(restored[oid]["x"], pos[0], delta=.1)
+            self.assertAlmostEqual(restored[oid]["y"], pos[1], delta=.1)
+            self.assertEqual(restored[oid]["group_id"], gid)
+
     def test_group_assigns_id_name_members_and_rejects_nesting(self):
         win = self.window()
         a, b = self.two_items(win)

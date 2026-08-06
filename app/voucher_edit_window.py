@@ -32,10 +32,12 @@ import hashlib
 import io
 import json
 import logging
+import os
 import threading
 import time
 import unicodedata
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -2043,7 +2045,7 @@ class _EditTextItem(QGraphicsTextItem):
         self.document().contentsChanged.connect(self._refresh_text_layout)
         self.setData(_DATA_TYPE, "text")
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self.fit_to_text_if_needed(force=True, reason="initial_create")
 
@@ -2326,7 +2328,7 @@ class _EditSymbolTextItem(QGraphicsSimpleTextItem):
         self.setBrush(QBrush(QColor(self.text_color)))
         self.setData(_DATA_TYPE, "symbol_text")
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
 
     def shape(self) -> QPainterPath:  # noqa: N802
@@ -2518,7 +2520,7 @@ class _EditRectItem(_ShapeTextMixin, QGraphicsRectItem):
         self.apply_line_width(self.line_width)
         self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self._init_shape_text(text, font_size, font_family, font_bold,
                               font_italic, font_underline, font_strikeout,
@@ -2594,7 +2596,7 @@ class _EditEllipseItem(_ShapeTextMixin, QGraphicsEllipseItem):
         self.apply_line_width(self.line_width)
         self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self._init_shape_text(text, font_size, font_family, font_bold,
                               font_italic, font_underline, font_strikeout,
@@ -2669,7 +2671,7 @@ class _EditLineItem(QGraphicsLineItem):
         self.setData(_DATA_TYPE, "line")
         self.apply_line_width(self.line_width)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
 
     def apply_line_width(self, line_width: float) -> None:
@@ -2774,7 +2776,7 @@ class _EditFreehandItem(QGraphicsPathItem):
         self.setData(_DATA_TYPE, "freehand")
         self.apply_line_width(self.pen_width)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self._rebuild_path()
 
@@ -3316,7 +3318,7 @@ class _EditImageItem(QGraphicsPixmapItem):
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.setData(_DATA_TYPE, "image")
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self._apply_scale()
 
@@ -3664,65 +3666,28 @@ class _GroupBoundsItem(QGraphicsRectItem):
         return path
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() != Qt.MouseButton.LeftButton:
-            event.ignore()
-            return
-        # 修飾キー付きクリックは通常の複数選択トグルへ渡す。グループの
-        # 移動用hit areaがCtrl/Shift選択を横取りしないようにする。
-        if event.modifiers() & (Qt.KeyboardModifier.ControlModifier
-                                 | Qt.KeyboardModifier.ShiftModifier):
-            event.ignore()
-            return
+        # target 解決と移動は scene に一本化し、helper は mouse capture のみ担う。
         scene = self.scene()
-        window = getattr(scene, "_window", None) if scene is not None else None
-        if window is None:
+        if isinstance(scene, _EditScene) and scene._drag_state is not None:
+            event.accept()
+        else:
             event.ignore()
-            return
-        self._move_start = event.scenePos()
-        self._member_start_positions = {
-            item.obj_id: QPointF(item.pos())
-            for item in window._selected_edit_items()
-        }
-        self._moved = False
-        self.setCursor(Qt.CursorShape.ClosedHandCursor)
-        event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if not (event.buttons() & Qt.MouseButton.LeftButton):
-            return
         scene = self.scene()
-        window = getattr(scene, "_window", None) if scene is not None else None
-        if window is None or getattr(self, "_move_start", None) is None:
-            return
-        delta = event.scenePos() - self._move_start
-        self._moved = self._moved or abs(delta.x()) >= 0.01 or abs(delta.y()) >= 0.01
-        for item in window._selected_edit_items():
-            start = self._member_start_positions.get(item.obj_id)
-            if start is not None:
-                item.setPos(start + delta)
-        self.setRect(window._selected_bounds())
-        for handle in window._handles:
-            if isinstance(handle, _GroupResizeHandle):
-                handle.reposition()
-        window.mark_dirty()
-        event.accept()
+        if isinstance(scene, _EditScene) and scene._drag_state is not None:
+            scene._move_scene_drag(event.scenePos())
+            event.accept()
+        else:
+            event.ignore()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         scene = self.scene()
-        window = getattr(scene, "_window", None) if scene is not None else None
-        try:
-            if window is not None and getattr(self, "_moved", False):
-                window.commit_history()
+        if isinstance(scene, _EditScene) and scene._drag_state is not None:
+            scene._finish_scene_drag()
             event.accept()
-        finally:
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
-            self._move_start = None
-            self._member_start_positions = {}
-            self._moved = False
-            # press/release 間は同じ補助枠を保持する。Qt が mouse grab を
-            # 解放した後でのみハンドルを再配置・再生成する。
-            if window is not None:
-                window.refresh_handles()
+        else:
+            event.ignore()
 
 
 class _GroupResizeHandle(QGraphicsRectItem):
@@ -3895,6 +3860,30 @@ def resolve_edit_object_from_graphics_item(
     return None
 
 
+@dataclass(frozen=True)
+class DragTarget:
+    kind: str
+    object_ids: tuple[str, ...]
+    group_id: str | None
+    hit_source: str
+    bounds_scene_rect: QRectF
+    anchor_item_id: str
+
+
+@dataclass
+class DragState:
+    kind: str
+    object_ids: tuple[str, ...]
+    group_id: str | None
+    press_scene_pos: QPointF
+    object_start_positions: dict[str, QPointF]
+    initial_bounds: QRectF
+    undo_before_snapshot: list[dict[str, Any]]
+    hit_source: str
+    moved: bool = False
+    move_event_count: int = 0
+
+
 class _EditScene(QGraphicsScene):
     """ツールモードに応じてオブジェクトを描画する編集シーン。"""
 
@@ -3918,11 +3907,12 @@ class _EditScene(QGraphicsScene):
         self._erasing: bool = False
         # 選択枠内の透明領域を含む移動は、実体itemのmouse grabberに依存せず
         # scene自身で押下から解放まで保持する（Windows native event対策）。
-        self._drag_target_type: str | None = None
-        self._drag_items: list[QGraphicsItem] = []
-        self._drag_start_scene_pos: QPointF | None = None
-        self._drag_start_positions: dict[str, QPointF] = {}
-        self._drag_moved = False
+        self._drag_state: DragState | None = None
+        self._last_drag_target: DragTarget | None = None
+        self._last_drag_result: dict[str, Any] | None = None
+        self._drag_debug = os.environ.get("TKS_VOUCHER_DRAG_DEBUG", "").lower() in {
+            "1", "true", "yes", "on",
+        }
 
     @staticmethod
     def _manhattan_distance(a: QPointF, b: QPointF) -> float:
@@ -4039,38 +4029,122 @@ class _EditScene(QGraphicsScene):
 
         return min(candidates, key=priority)
 
-    def _selection_rect_for(self, item: QGraphicsItem) -> QRectF:
-        if isinstance(item, (_EditTextItem, _EditImageItem)):
-            return item.box_rect_scene()
-        if isinstance(item, (_EditRectItem, _EditEllipseItem)):
-            return _scene_rect_from_item_rect(item, item.rect())
-        return item.sceneBoundingRect()
+    def _visual_selection_rect(self) -> QRectF:
+        """画面に描いている選択 helper の scene 矩形を唯一の hit 矩形にする。"""
+        for helper in self._window._handles:
+            if isinstance(helper, _GroupBoundsItem) and helper.scene() is self:
+                mapped = helper.mapRectToScene(helper.rect())
+                return mapped.boundingRect() if hasattr(mapped, "boundingRect") else QRectF(mapped)
+        selected = self._window._selected_edit_items()
+        return self._window._selected_bounds() if len(selected) == 1 else QRectF()
 
-    def _begin_scene_drag(self, kind: str, items: list[QGraphicsItem], pos: QPointF) -> None:
-        self._drag_target_type = kind
-        self._drag_items = list(items)
-        self._drag_start_scene_pos = QPointF(pos)
-        self._drag_start_positions = {
-            str(getattr(item, "obj_id", id(item))): QPointF(item.pos())
-            for item in items
-        }
-        self._drag_moved = False
-        self._window._log_edit_event("voucher_drag_start", target_type=kind,
-                                     object_ids=[getattr(i, "obj_id", "") for i in items])
+    def _items_for_group(self, group_id: str) -> list[QGraphicsItem]:
+        return [item for item in self._window.edit_items()
+                if str(getattr(item, "group_id", "") or "") == group_id]
+
+    def _resolve_drag_target(self, scene_pos: QPointF, modifiers) -> DragTarget | None:
+        """press 時の移動対象を一度だけ解決する（resize handle は呼出元で優先）。"""
+        if modifiers & (Qt.KeyboardModifier.ControlModifier
+                        | Qt.KeyboardModifier.ShiftModifier):
+            return None
+        selected = self._window._selected_edit_items()
+        selected_ids = {str(item.obj_id) for item in selected}
+        selected_groups = {str(getattr(item, "group_id", "") or "") for item in selected}
+        selected_groups.discard("")
+        visual_rect = self._visual_selection_rect()
+
+        # 2: 選択中の正式グループ外接矩形。
+        if len(selected_groups) == 1 and visual_rect.contains(scene_pos):
+            group_id = next(iter(selected_groups))
+            members = self._items_for_group(group_id)
+            if members:
+                return self._make_drag_target("group", members, group_id,
+                                              "group_selection_rect", visual_rect)
+
+        hit = self._resolve_edit_object(scene_pos)
+        # 3: 正式グループメンバー。選択状態より先に group_id を展開する。
+        hit_group = str(getattr(hit, "group_id", "") or "") if hit is not None else ""
+        if hit_group:
+            members = self._items_for_group(hit_group)
+            return self._make_drag_target("group", members, hit_group,
+                                          "painted_shape", self._bounds_for(members), hit)
+
+        # 4: グループ化前の複数選択外接矩形。
+        if len(selected) > 1 and not selected_groups and visual_rect.contains(scene_pos):
+            return self._make_drag_target("multi", selected, None,
+                                          "multi_selection_rect", visual_rect)
+        # 5: 選択済み単体の visual selection rect。
+        if len(selected) == 1 and str(selected[0].obj_id) in selected_ids \
+                and visual_rect.contains(scene_pos):
+            return self._make_drag_target("single", selected, None,
+                                          "single_selection_rect", visual_rect)
+        # 6/7: 未選択 object。resolver は shape 優先、bounding rect fallback の順。
+        if hit is not None:
+            local = hit.mapFromScene(scene_pos)
+            source = "painted_shape" if hit.shape().contains(local) else "bounding_rect"
+            return self._make_drag_target("single", [hit], None, source,
+                                          self._bounds_for([hit]), hit)
+        return None
+
+    def _bounds_for(self, items: list[QGraphicsItem]) -> QRectF:
+        rect = QRectF()
+        for item in items:
+            current = (item.box_rect_scene()
+                       if isinstance(item, (_EditTextItem, _EditImageItem))
+                       else item.sceneBoundingRect())
+            rect = QRectF(current) if rect.isNull() else rect.united(current)
+        return rect
+
+    def _make_drag_target(self, kind: str, items: list[QGraphicsItem],
+                          group_id: str | None, source: str, bounds: QRectF,
+                          anchor: QGraphicsItem | None = None) -> DragTarget:
+        ordered = sorted(items, key=lambda item: (item.zValue(), str(item.obj_id)))
+        return DragTarget(kind, tuple(str(item.obj_id) for item in ordered), group_id,
+                          source, QRectF(bounds), str((anchor or ordered[0]).obj_id))
+
+    def _begin_scene_drag(self, target: DragTarget, pos: QPointF) -> None:
+        by_id = {str(item.obj_id): item for item in self._window.edit_items()}
+        self._drag_state = DragState(
+            kind=target.kind, object_ids=target.object_ids, group_id=target.group_id,
+            press_scene_pos=QPointF(pos),
+            object_start_positions={oid: QPointF(by_id[oid].pos())
+                                    for oid in target.object_ids if oid in by_id},
+            initial_bounds=QRectF(target.bounds_scene_rect),
+            undo_before_snapshot=self._window.serialize_objects(),
+            hit_source=target.hit_source,
+        )
+        self._last_drag_target = target
+        self._window._log_edit_event("voucher_drag_start", target_type=target.kind,
+                                     object_ids=list(target.object_ids),
+                                     group_id=target.group_id, hit_source=target.hit_source)
+        self._debug_drag("press", pos, target=target)
         self._window._view.setCursor(Qt.CursorShape.ClosedHandCursor)
+        # viewport 由来の native move を空白領域からも受け続けるため、表示中の
+        # selection helper を capture 専用 grabber にする。delta 適用は scene のみ。
+        for helper in self._window._handles:
+            if (isinstance(helper, _GroupBoundsItem) and helper.scene() is self
+                    and helper.mapRectToScene(helper.rect()).contains(pos)):
+                helper.grabMouse()
+                break
 
     def _move_scene_drag(self, pos: QPointF) -> bool:
-        if self._drag_start_scene_pos is None or not self._drag_items:
+        state = self._drag_state
+        if state is None:
             return False
-        delta = pos - self._drag_start_scene_pos
-        self._drag_moved = self._drag_moved or abs(delta.x()) > 0.01 or abs(delta.y()) > 0.01
-        for item in self._drag_items:
-            key = str(getattr(item, "obj_id", id(item)))
-            start = self._drag_start_positions.get(key)
-            if start is not None and item.scene() is self:
+        delta = pos - state.press_scene_pos
+        state.move_event_count += 1
+        state.moved = state.moved or abs(delta.x()) > 0.01 or abs(delta.y()) > 0.01
+        by_id = {str(item.obj_id): item for item in self._window.edit_items()}
+        applied = []
+        for key in state.object_ids:
+            item = by_id.get(key)
+            start = state.object_start_positions.get(key)
+            if item is not None and start is not None and item.scene() is self:
                 item.setPos(start + delta)
+                applied.append(key)
         self._window.mark_dirty()
         self._sync_drag_handles()
+        self._debug_drag("move", pos, delta=delta, applied=applied)
         return True
 
     def _sync_drag_handles(self) -> None:
@@ -4083,21 +4157,51 @@ class _EditScene(QGraphicsScene):
                 helper.reposition()
 
     def _finish_scene_drag(self) -> bool:
-        active = self._drag_target_type is not None
-        if active and self._drag_moved:
+        state = self._drag_state
+        active = state is not None
+        if state is not None and state.moved:
             self._window.commit_history()
-        if active:
+        if state is not None:
             self._window._log_edit_event("voucher_drag_release",
-                                         target_type=self._drag_target_type,
-                                         moved=self._drag_moved)
-        self._drag_target_type = None
-        self._drag_items = []
-        self._drag_start_scene_pos = None
-        self._drag_start_positions = {}
-        self._drag_moved = False
+                                         target_type=state.kind, moved=state.moved,
+                                         object_ids=list(state.object_ids),
+                                         move_count=state.move_event_count)
+            self._last_drag_result = {
+                "kind": state.kind, "object_ids": state.object_ids,
+                "group_id": state.group_id, "hit_source": state.hit_source,
+                "moved": state.moved, "move_event_count": state.move_event_count,
+            }
+            self._debug_drag("release", state.press_scene_pos)
+        self._drag_state = None
+        grabber = self.mouseGrabberItem()
+        if isinstance(grabber, _GroupBoundsItem):
+            grabber.ungrabMouse()
         self._window._view.setCursor(Qt.CursorShape.OpenHandCursor)
         self._sync_drag_handles()
         return active
+
+    def _debug_drag(self, phase: str, scene_pos: QPointF, **extra: Any) -> None:
+        if not self._drag_debug:
+            return
+        selected = self._window._selected_edit_items()
+        rect = self._visual_selection_rect()
+        view_pos = self._window._view.mapFromScene(scene_pos)
+        hits = [str(getattr(resolve_edit_object_from_graphics_item(item, self), "obj_id", ""))
+                for item in self.items(scene_pos) if not getattr(item, "_BG_MARK", False)]
+        state = self._drag_state
+        _log.debug("voucher_drag_debug %s", {
+            "phase": phase, "scenePos": (scene_pos.x(), scene_pos.y()),
+            "viewPos": (view_pos.x(), view_pos.y()),
+            "selected_ids": [str(item.obj_id) for item in selected],
+            "selected_group_ids": sorted({str(getattr(item, "group_id", "") or "")
+                                          for item in selected} - {""}),
+            "visual_selection_rect": (rect.x(), rect.y(), rect.width(), rect.height()),
+            "visual_rect_contains_press": rect.contains(scene_pos), "hit_items": hits,
+            "resolved_kind": state.kind if state else None,
+            "resolved_object_ids": list(state.object_ids) if state else [],
+            "hit_source": state.hit_source if state else None,
+            "move_count": state.move_event_count if state else 0, **extra,
+        })
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         target = self._resolve_edit_object(event.scenePos())
@@ -4184,49 +4288,19 @@ class _EditScene(QGraphicsScene):
         # リサイズ/端点ハンドル上での押下か。ハンドル操作時は選択を維持する。
         self._press_handle = self._press_on_handle(pos)
         target = self._resolve_edit_object(pos)
-        group_hit = False
-        if target is None and not self._press_handle:
-            # グループ補助枠の内部は実オブジェクトではないため通常の
-            # resolveではNoneになる。選択メンバーを論理的な押下対象にして、
-            # scene側のクリック解除処理で補助枠を撤去しないようにする。
-            for helper in self._window._handles:
-                if (isinstance(helper, _GroupBoundsItem)
-                        and helper.shape().contains(helper.mapFromScene(pos))):
-                    selected = self._window._selected_edit_items()
-                    target = selected[0] if selected else None
-                    group_hit = target is not None
-                    break
         multi = bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier
                                           | Qt.KeyboardModifier.ShiftModifier))
-        # 選択済みの枠はhelperの有無や実体shapeに関係なくsceneで掴む。
-        # ハンドルと修飾キーはこの経路より常に優先する。
+        # resize handle の次に、全種類の移動対象を唯一の resolver で決める。
         if (event.button() == Qt.MouseButton.LeftButton and not multi
                 and not self._press_handle):
-            selected = self._window._selected_edit_items()
-            if len(selected) > 1:
-                bounds = self._window._selected_bounds()
-                if bounds.contains(pos):
-                    target = selected[0]
-                    group_hit = True
-            elif len(selected) == 1:
-                selected_item = selected[0]
-                if self._selection_rect_for(selected_item).contains(pos):
-                    target = selected_item
-            if group_hit:
-                self._select_snapshot = self._window.serialize_objects()
-                self._begin_scene_drag("group", selected, pos)
-                self._press_target = target
-                self._press_multi = False
-                self._press_pos = pos
-                event.accept()
-                return
-            if target is not None:
-                if target not in selected:
-                    self._window._select_items(self._window._group_items_for(target))
-                    selected = self._window._selected_edit_items()
-                self._select_snapshot = self._window.serialize_objects()
-                self._begin_scene_drag("single", selected if len(selected) == 1 else [target], pos)
-                self._press_target = target
+            drag_target = self._resolve_drag_target(pos, event.modifiers())
+            if drag_target is not None:
+                items_by_id = {str(item.obj_id): item for item in self._window.edit_items()}
+                drag_items = [items_by_id[oid] for oid in drag_target.object_ids
+                              if oid in items_by_id]
+                self._window._select_items(drag_items)
+                self._begin_scene_drag(drag_target, pos)
+                self._press_target = items_by_id.get(drag_target.anchor_item_id)
                 self._press_multi = False
                 self._press_pos = pos
                 event.accept()
@@ -4235,9 +4309,6 @@ class _EditScene(QGraphicsScene):
             target if event.button() == Qt.MouseButton.LeftButton else None)
         self._press_multi = multi
         self._press_pos = pos
-        self._group_drag_start_positions = (
-            {item.obj_id: QPointF(item.pos()) for item in self._window._selected_edit_items()}
-            if group_hit and not multi else None)
         super().mousePressEvent(event)
         # クリック対象を明示的に単一選択する。内部テキスト子で選択が外れる・
         # 複数オブジェクトが選択されたままになる問題を防ぐ（要件6・7・10）。
@@ -4276,7 +4347,7 @@ class _EditScene(QGraphicsScene):
         if self._window.current_tool == TOOL_GRAB:
             super().mouseMoveEvent(event)
             return
-        if self._drag_target_type is not None:
+        if self._drag_state is not None:
             self._move_scene_drag(event.scenePos())
             event.accept()
             return
@@ -4299,15 +4370,6 @@ class _EditScene(QGraphicsScene):
                 self._temp_item.setRect(QRectF(self._start, pos).normalized())
             # ドラッグ中も背景を維持する（要件1・2・4）。
             self._window.ensure_background_visible()
-            event.accept()
-            return
-        if self._group_drag_start_positions is not None and self._press_pos is not None:
-            delta = event.scenePos() - self._press_pos
-            for item in self._window._selected_edit_items():
-                start = self._group_drag_start_positions.get(item.obj_id)
-                if start is not None:
-                    item.setPos(start + delta)
-            self._window.mark_dirty()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -4362,7 +4424,7 @@ class _EditScene(QGraphicsScene):
         if self._window.current_tool == TOOL_GRAB:
             super().mouseReleaseEvent(event)
             return
-        if self._drag_target_type is not None:
+        if self._drag_state is not None:
             self._finish_scene_drag()
             self._press_target = None
             self._press_pos = None
@@ -4449,7 +4511,6 @@ class _EditScene(QGraphicsScene):
         self._press_multi = False
         self._press_pos = None
         self._press_handle = False
-        self._group_drag_start_positions = None
         if self._select_snapshot is not None:
             after = self._window.serialize_objects()
             if after != self._select_snapshot:
@@ -4523,6 +4584,23 @@ class _EditGraphicsView(QGraphicsView):
                 event.accept()
                 return
         super().keyPressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        scene = self.scene()
+        if (isinstance(scene, _EditScene) and scene._drag_state is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            scene._move_scene_drag(self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        scene = self.scene()
+        if isinstance(scene, _EditScene) and scene._drag_state is not None:
+            scene._finish_scene_drag()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         if event.mimeData() is not None and event.mimeData().hasFormat(FAVORITE_OBJECT_MIME):
@@ -9625,11 +9703,14 @@ class VoucherEditWindow(QMainWindow):
             self._update_template_highlight()
         # 画像選択状態に応じて画像編集ボタンの表示を切り替える（要件1・2・5）。
         self._update_image_action_buttons()
-        if len(selected) > 1:
+        # 単体・複数・正式グループで同じ visual selection rect helper を使う。
+        # この rect が scene の移動 hit 判定の唯一の正となる。
+        if selected:
             bounds = self._selected_bounds()
             outline = _GroupBoundsItem(bounds)
             self._scene.addItem(outline)
             self._handles.append(outline)
+        if len(selected) > 1:
             group_ids = {str(getattr(it, "group_id", "") or "") for it in selected}
             group_ids.discard("")
             if len(group_ids) == 1 and all(not getattr(it, "locked", False) for it in selected):
