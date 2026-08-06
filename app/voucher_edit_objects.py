@@ -400,10 +400,14 @@ def _log_saved_text_styles(order_no: str, payload: dict[str, Any]) -> None:
 
 
 def clone_edit_objects(objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """保存モデルをdeep copyし、コピー先用IDを全件再発行する。"""
+    """保存モデルをdeep copyし、コピー先用ID/group_idを全件再発行する。"""
     cloned = copy.deepcopy(objects)
+    group_ids: dict[str, str] = {}
     for obj in cloned:
         obj["id"] = str(uuid.uuid4())
+        old_group = str(obj.get("group_id") or "")
+        if old_group:
+            obj["group_id"] = group_ids.setdefault(old_group, str(uuid.uuid4()))
         if obj.get("type") == "freehand_layer":
             obj["layer_id"] = obj["id"]
     return cloned

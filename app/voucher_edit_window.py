@@ -3604,6 +3604,73 @@ class _ResizeHandle(QGraphicsRectItem):
         event.accept()
 
 
+class _GroupBoundsItem(QGraphicsRectItem):
+    """複数選択／グループ全体の外接矩形（保存・印刷対象外）。"""
+
+    _IS_HELPER = True
+
+    def __init__(self, rect: QRectF) -> None:
+        super().__init__(rect)
+        pen = QPen(QColor(0, 120, 215), 1.0, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(Qt.BrushStyle.NoBrush)
+        self.setZValue(9998)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+
+class _GroupResizeHandle(QGraphicsRectItem):
+    """グループ外接矩形を開始時スナップショットから拡縮するハンドル。"""
+
+    _IS_HELPER = True
+
+    def __init__(self, window: "VoucherEditWindow", position: str,
+                 rect: QRectF) -> None:
+        s = HANDLE_SIZE
+        super().__init__(-s / 2, -s / 2, s, s)
+        self._window = window
+        self._position = position
+        self._start_rect = QRectF(rect)
+        self._start_objects: list[dict[str, Any]] = []
+        self._suppress = True
+        self.setBrush(QBrush(QColor(0, 120, 215)))
+        self.setPen(QPen(QColor(255, 255, 255)))
+        self.setZValue(10000)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        point = {
+            "top_left": rect.topLeft(), "top_right": rect.topRight(),
+            "bottom_left": rect.bottomLeft(), "bottom_right": rect.bottomRight(),
+        }[position]
+        self.setPos(point)
+        self._suppress = False
+
+    def itemChange(self, change, value):  # noqa: N802
+        if (change == QGraphicsItem.GraphicsItemChange.ItemPositionChange
+                and not self._suppress and self.scene() is not None
+                and self._start_objects):
+            self._window._resize_group_from_snapshot(
+                self._start_objects, self._start_rect, self._position, value)
+        return super().itemChange(change, value)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self._start_rect = self._window._selected_bounds()
+        self._start_objects = [
+            dict(item.serialize_edit_object())
+            for item in self._window._selected_edit_items()
+        ]
+        super().mousePressEvent(event)
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        super().mouseReleaseEvent(event)
+        self._start_objects = []
+        self._window.commit_history()
+        self._window.refresh_handles()
+        event.accept()
+
+
 class _LineEndHandle(QGraphicsRectItem):
     """選択中の線の端点（始点/終点）を動かすハンドル。
 
@@ -3957,10 +4024,13 @@ class _EditScene(QGraphicsScene):
         target = self._press_target
         if target is None or target.scene() is None:
             return
+        members = self._window._group_items_for(target)
         if self._press_multi:
-            target.setSelected(True)
+            select = not all(member.isSelected() for member in members)
+            for member in members:
+                member.setSelected(select)
         else:
-            self._window._select_only(target)
+            self._window._select_items(members)
 
     def mouseMoveEvent(self, event) -> None:
         # 掴むモード: ビューの ScrollHandDrag に任せる。
@@ -4168,6 +4238,17 @@ class _EditGraphicsView(QGraphicsView):
     """
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if (event.key() == Qt.Key.Key_G
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            window = self.window()
+            handler = getattr(
+                window, "ungroup_selected"
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                else "group_selected", None)
+            if callable(handler):
+                handler()
+                event.accept()
+                return
         if event.matches(QKeySequence.StandardKey.Copy):
             window = self.window()
             handler = getattr(window, "copy_selected_objects", None)
@@ -6428,6 +6509,72 @@ class VoucherEditWindow(QMainWindow):
         self._scene.clearSelection()
         item.setSelected(True)
 
+    def _select_items(self, items: list[QGraphicsItem]) -> None:
+        self._scene.clearSelection()
+        for item in items:
+            item.setSelected(True)
+
+    def _group_items_for(self, item: QGraphicsItem) -> list[QGraphicsItem]:
+        group_id = str(getattr(item, "group_id", "") or "")
+        if not group_id:
+            return [item]
+        return [candidate for candidate in self.edit_items()
+                if str(getattr(candidate, "group_id", "") or "") == group_id]
+
+    def _selected_bounds(self) -> QRectF:
+        rect = QRectF()
+        for item in self._selected_edit_items():
+            current = (item.box_rect_scene()
+                       if isinstance(item, (_EditTextItem, _EditImageItem))
+                       else item.sceneBoundingRect())
+            rect = QRectF(current) if rect.isNull() else rect.united(current)
+        return rect
+
+    def group_selected(self) -> bool:
+        items = self._selected_edit_items()
+        if len(items) < 2:
+            return False
+        if any(str(getattr(item, "group_id", "") or "") for item in items):
+            QMessageBox.information(
+                self, "グループ化",
+                "グループを含むためグループ化できません。先にグループ解除してください。")
+            return False
+        if any(bool(getattr(item, "locked", False)) for item in items):
+            return False
+        group_id = str(uuid.uuid4())
+        existing = {str(getattr(item, "group_name", "")) for item in self.edit_items()}
+        number = 1
+        while f"グループ {number}" in existing:
+            number += 1
+        name = f"グループ {number}"
+        for order, item in enumerate(sorted(items, key=lambda candidate: candidate.zValue())):
+            item.group_id = group_id
+            item.group_name = name
+            item.group_order = order
+        self.commit_history()
+        self._select_items(items)
+        self.refresh_handles()
+        return True
+
+    def ungroup_selected(self) -> bool:
+        ids = {str(getattr(item, "group_id", "") or "")
+               for item in self._selected_edit_items()}
+        ids.discard("")
+        if len(ids) != 1:
+            return False
+        members = [item for item in self.edit_items()
+                   if str(getattr(item, "group_id", "") or "") in ids]
+        if any(bool(getattr(item, "locked", False)) for item in members):
+            return False
+        for item in members:
+            item.group_id = ""
+            item.group_name = ""
+            item.group_order = 0
+        self.commit_history()
+        self._select_items(members)
+        self.refresh_handles()
+        return True
+
     def _resolve_target_vouchers(self, target_vouchers: list[str] | None) -> list[str]:
         """指定が無ければ次回作成用の反映先を使う。"""
         if target_vouchers is None:
@@ -7578,6 +7725,20 @@ class VoucherEditWindow(QMainWindow):
         obj_id = getattr(item, "obj_id", None)
         menu = QMenu(self)
         menu._submenus = []  # type: ignore[attr-defined]
+        group_action = menu.addAction("グループ化")
+        group_action.setObjectName("group_action")
+        group_action.setEnabled(
+            len(self._selected_edit_items()) >= 2
+            and not any(str(getattr(it, "group_id", "") or "")
+                        for it in self._selected_edit_items()))
+        group_action.triggered.connect(
+            lambda checked=False: self.group_selected())
+        ungroup_action = menu.addAction("グループ解除")
+        ungroup_action.setObjectName("ungroup_action")
+        ungroup_action.setEnabled(bool(getattr(item, "group_id", "")))
+        ungroup_action.triggered.connect(
+            lambda checked=False: self.ungroup_selected())
+        menu.addSeparator()
         copy_action = menu.addAction("コピー")
         copy_action.setObjectName("copy_action")
         copy_action.triggered.connect(
@@ -7604,7 +7765,9 @@ class VoucherEditWindow(QMainWindow):
                 lambda checked=False, oid=obj_id: self._run_object_action(
                     oid, self.begin_text_edit, name="edit_text")
             )
-        favorite_action = menu.addAction("オブジェクトをお気に入り登録")
+        favorite_action = menu.addAction(
+            "グループをお気に入り登録" if getattr(item, "group_id", "")
+            else "オブジェクトをお気に入り登録")
         favorite_action.setObjectName("favorite_add_action")
         favorite_action.triggered.connect(
             lambda checked=False, oid=obj_id: self._run_object_action(
@@ -7974,6 +8137,25 @@ class VoucherEditWindow(QMainWindow):
                 self, "お気に入り",
                 f"お気に入りは最大{MAX_FAVORITE_OBJECTS}個まで登録できます。")
             return False
+        members = self._group_items_for(item)
+        if len(members) > 1:
+            objects = [self._serialize_item(member) for member in members]
+            bounds = self._objects_bounds(objects)
+            for obj in objects:
+                self._shift_object(obj, -bounds.x(), -bounds.y())
+            name = str(getattr(item, "group_name", "") or "グループ")
+            fav = {
+                "id": str(uuid.uuid4()), "type": "group",
+                "name": f"グループ: {name}", "group_name": name,
+                "width": bounds.width(), "height": bounds.height(),
+                "objects": objects,
+                "reference_page_width": float(PAGE_W),
+                "reference_page_height": float(PAGE_H),
+                "registration_order": len(self._favorites),
+            }
+            self._favorites.append(fav)
+            self._save_favorites()
+            return True
         obj = dict(item.serialize_edit_object())
         fav = {
             "id": str(uuid.uuid4()),
@@ -8064,6 +8246,27 @@ class VoucherEditWindow(QMainWindow):
         if fav is None:
             self._log_favorite_event("favorite_object_drop_failed", favorite_id=favorite_id)
             return False
+        if str(fav.get("type") or "") == "group":
+            objects = self._clone_object_list(list(fav.get("objects") or []))
+            if not objects:
+                return False
+            group_id = str(uuid.uuid4())
+            new_ids: set[str] = set()
+            for order, obj in enumerate(objects):
+                self._shift_object(obj, scene_pos.x(), scene_pos.y())
+                obj["id"] = str(uuid.uuid4())
+                obj["group_id"] = group_id
+                obj["group_name"] = str(fav.get("group_name") or "グループ")
+                obj["group_order"] = order
+                new_ids.add(obj["id"])
+                self._add_loaded_object(obj)
+            created = [item for item in self.edit_items()
+                       if getattr(item, "obj_id", "") in new_ids]
+            self._select_items(created)
+            self.set_tool(TOOL_SELECT)
+            self.commit_history()
+            self.refresh_handles()
+            return bool(created)
         obj = self._clone_object_list([dict(fav.get("object") or {})])[0]
         try:
             favorite_position = fav.get("favorite_position")
@@ -8700,8 +8903,9 @@ class VoucherEditWindow(QMainWindow):
         """右クリック対象の単一編集オブジェクトをコピーする。"""
         if self._is_text_editing() or not hasattr(item, "serialize_edit_object"):
             return False
-        self._select_only(item)
-        return self._copy_items([item])
+        members = self._group_items_for(item)
+        self._select_items(members)
+        return self._copy_items(members)
 
     def duplicate_object(self, item: QGraphicsItem) -> bool:
         """右クリック対象の編集オブジェクトを複製する（要件1）。
@@ -8715,12 +8919,23 @@ class VoucherEditWindow(QMainWindow):
         return self.paste_copied_objects()
 
     def _copy_items(self, items: list[QGraphicsItem]) -> bool:
-        objects = [dict(item.serialize_edit_object()) for item in items
+        objects = [self._serialize_item(item) for item in items
                    if hasattr(item, "serialize_edit_object")]
         if not objects:
             return False
         self._write_object_clipboard(objects)
         return True
+
+    @staticmethod
+    def _serialize_item(item: QGraphicsItem) -> dict[str, Any]:
+        obj = dict(item.serialize_edit_object())
+        group_id = str(getattr(item, "group_id", "") or "")
+        if group_id:
+            obj["group_id"] = group_id
+            obj["group_name"] = str(getattr(item, "group_name", "") or "グループ")
+            obj["group_order"] = int(getattr(item, "group_order", 0))
+        obj["z_order"] = float(item.zValue())
+        return obj
 
     def _write_object_clipboard(self, objects: list[dict[str, Any]]) -> None:
         self._object_clipboard = self._clone_object_list(objects)
@@ -8769,6 +8984,7 @@ class VoucherEditWindow(QMainWindow):
         if not sources:
             return False
         new_ids: list[str] = []
+        group_ids: dict[str, str] = {}
         objects = self._clone_object_list(sources)
         if scene_pos is not None:
             self._move_copied_objects_to(objects, scene_pos)
@@ -8776,6 +8992,9 @@ class VoucherEditWindow(QMainWindow):
             if scene_pos is None:
                 self._offset_copied_object(obj)
             obj["id"] = str(uuid.uuid4())
+            old_group = str(obj.get("group_id") or "")
+            if old_group:
+                obj["group_id"] = group_ids.setdefault(old_group, str(uuid.uuid4()))
             if obj.get("type") == "freehand_layer":
                 obj["layer_id"] = obj["id"]
             new_ids.append(obj["id"])
@@ -8847,6 +9066,97 @@ class VoucherEditWindow(QMainWindow):
                 xs.append(float(obj.get("x", 0.0)))
                 ys.append(float(obj.get("y", 0.0)))
         return (min(xs) if xs else 0.0, min(ys) if ys else 0.0)
+
+    @classmethod
+    def _objects_bounds(cls, objects: list[dict[str, Any]]) -> QRectF:
+        rect = QRectF()
+        for obj in objects:
+            kind = obj.get("type")
+            if kind == "line":
+                current = QRectF(QPointF(float(obj.get("x1", 0)), float(obj.get("y1", 0))),
+                                 QPointF(float(obj.get("x2", 0)), float(obj.get("y2", 0)))).normalized()
+            elif kind in {"freehand", "freehand_layer"}:
+                points = (obj.get("points") or []) if kind == "freehand" else [p for s in obj.get("strokes") or [] for p in s.get("points") or []]
+                xs = [float(p[0]) for p in points if len(p) >= 2]
+                ys = [float(p[1]) for p in points if len(p) >= 2]
+                current = QRectF(min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)) if xs else QRectF()
+            else:
+                current = QRectF(float(obj.get("x", 0)), float(obj.get("y", 0)),
+                                 float(obj.get("width", obj.get("w", 0))),
+                                 float(obj.get("height", obj.get("h", 0))))
+            rect = QRectF(current) if rect.isNull() else rect.united(current)
+        return rect
+
+    @staticmethod
+    def _scaled_point(x: float, y: float, source: QRectF,
+                      target: QRectF) -> tuple[float, float]:
+        sx = target.width() / max(source.width(), 0.1)
+        sy = target.height() / max(source.height(), 0.1)
+        return (target.left() + (x - source.left()) * sx,
+                target.top() + (y - source.top()) * sy)
+
+    def _resize_group_from_snapshot(
+            self, objects: list[dict[str, Any]], source: QRectF,
+            position: str, handle_pos: QPointF) -> None:
+        anchor = {
+            "top_left": source.bottomRight(), "top_right": source.bottomLeft(),
+            "bottom_left": source.topRight(), "bottom_right": source.topLeft(),
+        }[position]
+        target = QRectF(anchor, handle_pos).normalized()
+        if target.width() < MIN_OBJECT_WIDTH or target.height() < MIN_OBJECT_HEIGHT:
+            return
+        sx = target.width() / max(source.width(), 0.1)
+        sy = target.height() / max(source.height(), 0.1)
+        by_id = {str(getattr(item, "obj_id", "")): item for item in self.edit_items()}
+        for obj in objects:
+            item = by_id.get(str(obj.get("id") or ""))
+            if item is None:
+                continue
+            kind = str(obj.get("type") or "")
+            if kind == "line" and isinstance(item, _EditLineItem):
+                x1, y1 = self._scaled_point(float(obj["x1"]), float(obj["y1"]), source, target)
+                x2, y2 = self._scaled_point(float(obj["x2"]), float(obj["y2"]), source, target)
+                item.setPos(0, 0)
+                item.setLine(x1, y1, x2, y2)
+            elif kind == "freehand" and isinstance(item, _EditFreehandItem):
+                item.setPos(0, 0)
+                item._points = [QPointF(*self._scaled_point(float(p[0]), float(p[1]), source, target))
+                                for p in obj.get("points") or []]
+                item._rebuild_path()
+            elif kind == "freehand_layer" and isinstance(item, _EditFreehandLayerItem):
+                item.prepareGeometryChange()
+                for live_stroke, saved_stroke in zip(item._strokes, obj.get("strokes") or []):
+                    live_stroke["points"] = [
+                        QPointF(*self._scaled_point(float(p[0]), float(p[1]), source, target))
+                        for p in saved_stroke.get("points") or []]
+                item._recompute_bounds()
+                item.update()
+            else:
+                x, y = self._scaled_point(float(obj.get("x", 0)), float(obj.get("y", 0)), source, target)
+                width = max(float(obj.get("width", obj.get("w", 0))) * sx, MIN_RESIZE)
+                height = max(float(obj.get("height", obj.get("h", 0))) * sy, MIN_RESIZE)
+                if isinstance(item, _EditTextItem):
+                    item.setPos(x, y)
+                    item.set_manual_box_size(
+                        width, height,
+                        original_width=float(obj.get("width", obj.get("w", 1))),
+                        original_height=float(obj.get("height", obj.get("h", 1))),
+                        original_font_size=float(obj.get("font_size", item.font_size)),
+                        scale=min(sx, sy))
+                elif isinstance(item, _EditImageItem):
+                    item.setPos(x, y)
+                    item.set_box_size(width, height)
+                elif isinstance(item, (_EditRectItem, _EditEllipseItem)):
+                    item.setPos(0, 0)
+                    item.setRect(QRectF(x, y, width, height))
+                    if hasattr(item, "apply_font_size"):
+                        item.apply_font_size(max(4.0, min(200.0,
+                            float(obj.get("font_size", item.font_size)) * min(sx, sy))))
+                elif isinstance(item, _EditSymbolTextItem):
+                    item.set_anchor_scene_pos(QPointF(x, y))
+                    item.apply_font_size(max(4.0, min(200.0,
+                        float(obj.get("font_size", item.font_size)) * min(sx, sy))))
+        self.mark_dirty()
 
     @staticmethod
     def _shift_object(obj: dict[str, Any], dx: float, dy: float) -> None:
@@ -8925,6 +9235,14 @@ class VoucherEditWindow(QMainWindow):
                 self.delete_selected()
                 event.accept()
                 return
+        if (event.key() == Qt.Key.Key_G
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.ungroup_selected()
+            else:
+                self.group_selected()
+            event.accept()
+            return
         if event.matches(QKeySequence.StandardKey.Copy):
             if self.copy_selected_objects():
                 event.accept()
@@ -9000,6 +9318,16 @@ class VoucherEditWindow(QMainWindow):
         except RuntimeError:
             # 破棄処理中に selectionChanged が発火した場合は無視する。
             return
+        expanded: list[QGraphicsItem] = []
+        for item in selected:
+            for member in self._group_items_for(item):
+                if member not in expanded:
+                    expanded.append(member)
+        if len(expanded) != len(selected):
+            with QSignalBlocker(self._scene):
+                for member in expanded:
+                    member.setSelected(True)
+            selected = expanded
         # 選択変更でも背景は消さない（要件4）。
         self.ensure_background_visible()
         self._sync_property_ui_from_selection(selected)
@@ -9021,7 +9349,19 @@ class VoucherEditWindow(QMainWindow):
             self._update_template_highlight()
         # 画像選択状態に応じて画像編集ボタンの表示を切り替える（要件1・2・5）。
         self._update_image_action_buttons()
-        # 単一選択時のみハンドル表示。複数選択や未選択では選択枠を出さない（要件10）。
+        if len(selected) > 1:
+            bounds = self._selected_bounds()
+            outline = _GroupBoundsItem(bounds)
+            self._scene.addItem(outline)
+            self._handles.append(outline)
+            group_ids = {str(getattr(it, "group_id", "") or "") for it in selected}
+            group_ids.discard("")
+            if len(group_ids) == 1 and all(not getattr(it, "locked", False) for it in selected):
+                for position in ("top_left", "top_right", "bottom_left", "bottom_right"):
+                    handle = _GroupResizeHandle(self, position, bounds)
+                    self._scene.addItem(handle)
+                    self._handles.append(handle)
+            return
         if len(selected) != 1:
             return
         target = selected[0]
@@ -9213,6 +9553,12 @@ class VoucherEditWindow(QMainWindow):
         seen: set[str] = set()
         for item in self.edit_items():
             obj = item.serialize_edit_object()
+            group_id = str(getattr(item, "group_id", "") or "")
+            if group_id:
+                obj["group_id"] = group_id
+                obj["group_name"] = str(getattr(item, "group_name", "") or "グループ")
+                obj["group_order"] = int(getattr(item, "group_order", 0))
+            obj["z_order"] = float(item.zValue())
             # 空文字（空白のみ）の単独テキストは保存・履歴対象に含めない（要件3）。
             # 図形（四角・丸）は内部テキストが空でも図形として残す。
             if obj.get("type") in ("text", "symbol_text") and not str(obj.get("text", "")).strip():
@@ -9274,6 +9620,7 @@ class VoucherEditWindow(QMainWindow):
 
     def _add_loaded_object(self, obj: dict[str, Any]) -> None:
         kind = obj.get("type")
+        before_ids = {getattr(item, "obj_id", "") for item in self.edit_items()}
         is_scene_origin = obj.get("coordinate_origin") == COORDINATE_ORIGIN
         obj_id = str(obj.get("id") or "") or None
         font_family = resolve_text_font_family(str(obj.get("font_family") or ""))
@@ -9434,6 +9781,14 @@ class VoucherEditWindow(QMainWindow):
                   text_align=str(obj.get("text_align") or "center"),
                   vertical_align=str(obj.get("vertical_align") or "middle"),
                   target_vouchers=target_vouchers)
+        if obj_id:
+            for item in self.edit_items():
+                if getattr(item, "obj_id", "") == obj_id and obj_id not in before_ids:
+                    item.group_id = str(obj.get("group_id") or "")
+                    item.group_name = str(obj.get("group_name") or "")
+                    item.group_order = int(obj.get("group_order") or 0)
+                    item.setZValue(float(obj.get("z_order") or 0.0))
+                    break
 
     # ── 保存 ─────────────────────────────────────────────────────────────────
     def _persist(self) -> bool:
