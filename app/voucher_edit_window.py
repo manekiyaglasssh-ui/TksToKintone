@@ -2329,6 +2329,11 @@ class _EditSymbolTextItem(QGraphicsSimpleTextItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
 
+    def shape(self) -> QPainterPath:  # noqa: N802
+        path = QPainterPath()
+        path.addRect(self.boundingRect())
+        return path
+
     def apply_font_size(self, font_size: float) -> None:
         center = self.anchor_scene_pos()
         self.font_size = float(font_size)
@@ -2524,6 +2529,11 @@ class _EditRectItem(_ShapeTextMixin, QGraphicsRectItem):
         super().setRect(*args)
         self._reposition_text()
 
+    def shape(self) -> QPainterPath:  # noqa: N802
+        path = QPainterPath()
+        path.addRect(self.rect().normalized())
+        return path
+
     def serialize_edit_object(self) -> dict[str, Any]:
         rect = _scene_rect_from_item_rect(self, self.rect())
         return {
@@ -2594,6 +2604,11 @@ class _EditEllipseItem(_ShapeTextMixin, QGraphicsEllipseItem):
     def setRect(self, *args) -> None:  # noqa: N802
         super().setRect(*args)
         self._reposition_text()
+
+    def shape(self) -> QPainterPath:  # noqa: N802
+        path = QPainterPath()
+        path.addRect(self.rect().normalized())
+        return path
 
     def serialize_edit_object(self) -> dict[str, Any]:
         rect = _scene_rect_from_item_rect(self, self.rect())
@@ -2684,14 +2699,20 @@ class _EditLineItem(QGraphicsLineItem):
         return path
 
     def shape(self) -> QPainterPath:  # noqa: N802
-        """描画penとは独立した、view上16pxの透明な操作領域。"""
-        hit_width = scene_units_for_view_pixels(
-            self.scene(), LINE_HIT_WIDTH_PX)
-        stroker = QPainterPathStroker()
-        stroker.setWidth(max(float(self.line_width), hit_width))
-        stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
-        stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        return stroker.createStroke(self.actual_line_path())
+        """線の選択枠（boundingRect）全体を透明な操作領域にする。"""
+        path = QPainterPath()
+        ln = self.line()
+        margin = max(float(self.line_width) / 2.0, 0.5)
+        rect = QRectF(QPointF(min(ln.x1(), ln.x2()), min(ln.y1(), ln.y2())),
+                      QPointF(max(ln.x1(), ln.x2()), max(ln.y1(), ln.y2())))
+        rect = rect.adjusted(-margin, -margin, margin, margin)
+        minimum = scene_units_for_view_pixels(self.scene(), LINE_HIT_WIDTH_PX)
+        if rect.width() < minimum:
+            rect.setWidth(minimum)
+        if rect.height() < minimum:
+            rect.setHeight(minimum)
+        path.addRect(rect)
+        return path
 
     def paint(self, painter, option, widget=None) -> None:  # noqa: N802
         ln = self.line()
@@ -2756,6 +2777,12 @@ class _EditFreehandItem(QGraphicsPathItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self._rebuild_path()
+
+    def shape(self) -> QPainterPath:  # noqa: N802
+        path = QPainterPath()
+        path.addRect(self.path().boundingRect().adjusted(
+            -self.pen_width, -self.pen_width, self.pen_width, self.pen_width))
+        return path
 
     @staticmethod
     def _build_smooth_path(points: list[QPointF]) -> QPainterPath:
@@ -3292,6 +3319,12 @@ class _EditImageItem(QGraphicsPixmapItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self._apply_scale()
+
+    def shape(self) -> QPainterPath:  # noqa: N802
+        path = QPainterPath()
+        path.addRect(QRectF(0.0, 0.0, float(self._pixmap.width()),
+                            float(self._pixmap.height())))
+        return path
 
     def _apply_scale(self) -> None:
         pw = max(float(self._pixmap.width()), 1.0)
@@ -3993,7 +4026,9 @@ class _EditScene(QGraphicsScene):
                 tier = 2
             else:
                 tier = 3
-            return (tier, not selected, distance, -float(item.zValue()))
+            # 同じ精度階層では常に前面(z-order)を優先する。背面の巨大な
+            # 透明枠が前面オブジェクトの操作を奪わないようにする。
+            return (tier, not selected, -float(item.zValue()), distance)
 
         return min(candidates, key=priority)
 
