@@ -3943,6 +3943,12 @@ class _EditScene(QGraphicsScene):
     def mousePressEvent(self, event) -> None:
         tool = self._window.current_tool
         pos = event.scenePos()
+        # 右クリックは選択・移動・作成を開始する通常のマウス操作から分離する。
+        # QGraphicsScene の標準 mousePressEvent は右ボタンでも選択状態を変更する
+        # ため、contextMenuEvent に到達する前に複数選択が壊れてしまう。
+        if event.button() == Qt.MouseButton.RightButton:
+            event.accept()
+            return
         # 掴むモード: ビューの ScrollHandDrag に任せてパンする（描画・選択はしない）。
         if tool == TOOL_GRAB:
             super().mousePressEvent(event)
@@ -7735,7 +7741,15 @@ class VoucherEditWindow(QMainWindow):
             lambda checked=False: self.group_selected())
         ungroup_action = menu.addAction("グループ解除")
         ungroup_action.setObjectName("ungroup_action")
-        ungroup_action.setEnabled(bool(getattr(item, "group_id", "")))
+        selected = self._selected_edit_items()
+        selected_group_ids = {str(getattr(it, "group_id", "") or "")
+                              for it in selected}
+        selected_group_ids.discard("")
+        # 右クリック対象ではなく、現在選択されているグループ全体で判定する。
+        ungroup_action.setEnabled(
+            len(selected_group_ids) == 1
+            and all(str(getattr(it, "group_id", "") or "")
+                    in selected_group_ids for it in selected))
         ungroup_action.triggered.connect(
             lambda checked=False: self.ungroup_selected())
         menu.addSeparator()

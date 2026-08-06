@@ -172,6 +172,58 @@ class TestVoucherEditGroups(unittest.TestCase):
                          Qt.KeyboardModifier.NoModifier, blank)
         self.assertFalse(win._selected_edit_items())
 
+    def test_qtest_right_click_selected_member_keeps_selection_and_groups(self):
+        """複数選択中のメンバー上の実右クリックで選択を壊さない。"""
+        win = self.window("right-click-group")
+        a, b = self.two_items(win)
+        win.show()
+        win.set_tool("select")
+        QApplication.processEvents()
+        menus = []
+
+        def capture(item, _global_pos):
+            menus.append(win._build_object_context_menu(item))
+
+        with mock.patch.object(win, "_show_object_context_menu", side_effect=capture):
+            point = win._view.mapFromScene(a.sceneBoundingRect().center())
+            QTest.mouseClick(win._view.viewport(), Qt.MouseButton.RightButton,
+                             Qt.KeyboardModifier.NoModifier, point)
+            # offscreen QtではOSのコンテキストメニュー通知が省略されるため、
+            # 実クリック後に同じsceneイベントも配送する。
+            class Event:
+                def scenePos(self): return a.sceneBoundingRect().center()
+                def screenPos(self): return QPoint(0, 0)
+                def accept(self): pass
+            win._scene.contextMenuEvent(Event())
+
+        self.assertEqual({i.obj_id for i in win._selected_edit_items()},
+                         {a.obj_id, b.obj_id})
+        self.assertEqual(len(menus), 1)
+        group_action = next(action for action in menus[0].actions()
+                            if action.objectName() == "group_action")
+        self.assertTrue(group_action.isEnabled())
+        group_action.trigger()
+        self.assertEqual(len({o.get("group_id") for o in win.serialize_objects()}), 1)
+        self.assertEqual(len(win._selected_edit_items()), 2)
+
+    def test_qtest_right_click_unselected_object_selects_only_that_object(self):
+        win = self.window("right-click-single")
+        a, b = self.two_items(win)
+        win.show()
+        win.set_tool("select")
+        QApplication.processEvents()
+        win._select_items([a])
+        with mock.patch.object(win, "_show_object_context_menu"):
+            point = win._view.mapFromScene(b.sceneBoundingRect().center())
+            QTest.mouseClick(win._view.viewport(), Qt.MouseButton.RightButton,
+                             Qt.KeyboardModifier.NoModifier, point)
+            class Event:
+                def scenePos(self): return b.sceneBoundingRect().center()
+                def screenPos(self): return QPoint(0, 0)
+                def accept(self): pass
+            win._scene.contextMenuEvent(Event())
+        self.assertEqual(win._selected_edit_items(), [b])
+
     def test_qtest_rubber_band_and_group_drag(self):
         win = self.window()
         a, b = self.two_items(win)
