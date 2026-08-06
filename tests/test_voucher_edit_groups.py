@@ -84,6 +84,11 @@ class TestVoucherEditGroups(unittest.TestCase):
         self.assert_common_drag(result, "group", (a, b), gid)
         for item in (a, b):
             self.assertAlmostEqual((item.pos() - before[item.obj_id]).x(), 30, delta=1.5)
+        before = {item.obj_id: QPointF(item.pos()) for item in (a, b)}
+        result = self.viewport_drag(win, a.box_rect_scene().center(), QPointF(3, 0))
+        self.assert_common_drag(result, "group", (a, b), gid)
+        for item in (a, b):
+            self.assertAlmostEqual((item.pos() - before[item.obj_id]).x(), 3, delta=1.5)
         # メンバー間の空白も visual group selection rect から全件移動する。
         before = {item.obj_id: QPointF(item.pos()) for item in (a, b)}
         gap = QPointF(win._scene._visual_selection_rect().center().x(),
