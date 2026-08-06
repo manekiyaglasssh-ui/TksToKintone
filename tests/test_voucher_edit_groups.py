@@ -80,12 +80,15 @@ class TestVoucherEditGroups(unittest.TestCase):
         self.assertTrue(win.group_selected())
         gid = a.group_id
         before = {item.obj_id: QPointF(item.pos()) for item in (a, b)}
-        result = self.viewport_drag(win, a.box_rect_scene().center(), QPointF(30, 0))
+        # 上辺中央リサイズハンドルから十分離れたメンバー内部は移動になる。
+        member_drag_point = a.box_rect_scene().center() + QPointF(15, 0)
+        result = self.viewport_drag(win, member_drag_point, QPointF(30, 0))
         self.assert_common_drag(result, "group", (a, b), gid)
         for item in (a, b):
             self.assertAlmostEqual((item.pos() - before[item.obj_id]).x(), 30, delta=1.5)
         before = {item.obj_id: QPointF(item.pos()) for item in (a, b)}
-        result = self.viewport_drag(win, a.box_rect_scene().center(), QPointF(3, 0))
+        member_drag_point = a.box_rect_scene().center() + QPointF(15, 0)
+        result = self.viewport_drag(win, member_drag_point, QPointF(3, 0))
         self.assert_common_drag(result, "group", (a, b), gid)
         for item in (a, b):
             self.assertAlmostEqual((item.pos() - before[item.obj_id]).x(), 3, delta=1.5)

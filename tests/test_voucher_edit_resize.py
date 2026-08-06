@@ -9,8 +9,9 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QPointF, QRectF, Qt
-    from PySide6.QtGui import QImage, QKeyEvent
+    from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
+    from PySide6.QtGui import QImage, QKeyEvent, QTransform
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
 
     PYSIDE_AVAILABLE = True
@@ -382,6 +383,126 @@ class TestResizeHandles(unittest.TestCase):
         handle._resize_target(QPointF(21.0, 45.0))
         obj = item.serialize_edit_object()
         self.assertGreaterEqual(obj["width"], MIN_OBJECT_WIDTH)
+
+    def _viewport_drag_handle(self, win, handle, delta: QPoint,
+                              offset: QPoint = QPoint()) -> None:
+        win.show()
+        win.set_tool("select")
+        QApplication.processEvents()
+        start = win._view.mapFromScene(handle.scenePos()) + offset
+        end = start + delta
+        QTest.mouseMove(win._view.viewport(), start)
+        QApplication.processEvents()
+        # offscreen plugin は viewport の native hover cursor を更新しないため、
+        # 実mouseMove位置が解決するhandleの方向cursorを確認する。
+        hovered = win._scene._resolve_handle(win._view.mapToScene(start))
+        self.assertIs(hovered, handle)
+        self.assertEqual(hovered.cursor().shape(), handle.cursor().shape())
+        QTest.mousePress(win._view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, start)
+        QTest.mouseMove(win._view.viewport(), end, 20)
+        QTest.mouseRelease(win._view.viewport(), Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier, end)
+        QApplication.processEvents()
+
+    def test_viewport_single_all_handles_resize_and_undo_redo(self) -> None:
+        """viewport実イベントで8方向が移動DragStateを作らずリサイズする。"""
+        from app.voucher_edit_window import _ResizeHandle
+
+        directions = {
+            "top_left": QPoint(-3, -3), "top": QPoint(0, -3),
+            "top_right": QPoint(3, -3), "right": QPoint(3, 0),
+            "bottom_right": QPoint(3, 3), "bottom": QPoint(0, 3),
+            "bottom_left": QPoint(-3, 3), "left": QPoint(-3, 0),
+        }
+        for position, delta in directions.items():
+            with self.subTest(position=position):
+                win = self._make_window()
+                item = win.add_rect(QRectF(80, 80, 100, 60), text="r")
+                win.commit_history()
+                self._select_resize_handle(win, item)
+                handle = next(h for h in win._handles
+                              if isinstance(h, _ResizeHandle) and h._position == position)
+                before = dict(item.serialize_edit_object())
+                self._viewport_drag_handle(win, handle, delta)
+                after = dict(item.serialize_edit_object())
+                self.assertNotEqual((before["x"], before["y"], before["width"], before["height"]),
+                                    (after["x"], after["y"], after["width"], after["height"]))
+                self.assertIsNone(win._scene._drag_state)
+                self.assertIsNone(win._scene._resize_state)
+                win.undo()
+                restored = win.serialize_objects()[0]
+                self.assertAlmostEqual(restored["width"], before["width"], delta=0.1)
+                win.redo()
+                redone = win.serialize_objects()[0]
+                self.assertAlmostEqual(redone["width"], after["width"], delta=0.1)
+
+    def test_viewport_small_symbol_handle_hit_at_dpi_scales(self) -> None:
+        """+2相当の小さい文字を中心から2px外しても各DPI相当で掴める。"""
+        from app.voucher_edit_window import _ResizeHandle
+
+        for dpi_scale in (1.0, 1.25, 1.5):
+            with self.subTest(dpi_scale=dpi_scale):
+                win = self._make_window()
+                item = win.add_text_rect(QRectF(80, 80, 24, 14), text="+2",
+                                         font_size=8, auto_edit=False, auto_fit=False)
+                self._select_resize_handle(win, item)
+                win.show()
+                QApplication.processEvents()
+                win._view.setTransform(QTransform.fromScale(dpi_scale, dpi_scale))
+                handle = next(h for h in win._handles
+                              if isinstance(h, _ResizeHandle)
+                              and h._position == "bottom_right")
+                before = item.box_rect_scene()
+                self._viewport_drag_handle(win, handle, QPoint(3, 3), QPoint(2, 0))
+                self.assertNotEqual(item.box_rect_scene(), before)
+                self.assertIsNone(win._scene._drag_state)
+
+    def test_viewport_formal_group_all_eight_handles_resize_members(self) -> None:
+        """正式グループの角・辺中央すべてが全メンバーを30pxリサイズする。"""
+        from app.voucher_edit_window import _GroupResizeHandle
+
+        directions = {
+            "top_left": QPoint(-30, -30), "top": QPoint(0, -30),
+            "top_right": QPoint(30, -30), "right": QPoint(30, 0),
+            "bottom_right": QPoint(30, 30), "bottom": QPoint(0, 30),
+            "bottom_left": QPoint(-30, 30), "left": QPoint(-30, 0),
+        }
+        for position, delta in directions.items():
+            with self.subTest(position=position):
+                win = self._make_window()
+                a = win.add_text_rect(QRectF(80, 80, 80, 25), text="上",
+                                      font_size=10, auto_edit=False, auto_fit=False)
+                b = win.add_text_rect(QRectF(100, 180, 100, 30), text="下",
+                                      font_size=12, auto_edit=False, auto_fit=False)
+                win._select_items([a, b])
+                self.assertTrue(win.group_selected())
+                gid = a.group_id
+                win.commit_history()
+                handle = next(h for h in win._handles
+                              if isinstance(h, _GroupResizeHandle)
+                              and h._position == position)
+                before = {o["id"]: o for o in win.serialize_objects()}
+                self._viewport_drag_handle(win, handle, delta)
+                after = {o["id"]: o for o in win.serialize_objects()}
+                for member in (a, b):
+                    self.assertEqual(member.group_id, gid)
+                    self.assertNotEqual(
+                        (before[member.obj_id]["x"], before[member.obj_id]["y"],
+                         before[member.obj_id]["width"], before[member.obj_id]["height"]),
+                        (after[member.obj_id]["x"], after[member.obj_id]["y"],
+                         after[member.obj_id]["width"], after[member.obj_id]["height"]))
+                if "_" in position:
+                    self.assertNotEqual(before[a.obj_id]["font_size"],
+                                        after[a.obj_id]["font_size"])
+                self.assertIsNone(win._scene._drag_state)
+                win.undo()
+                restored = {o["id"]: o for o in win.serialize_objects()}
+                self.assertEqual(restored[a.obj_id]["group_id"], gid)
+                win.redo()
+                redone = {o["id"]: o for o in win.serialize_objects()}
+                self.assertAlmostEqual(redone[a.obj_id]["font_size"],
+                                       after[a.obj_id]["font_size"], delta=0.1)
 
 
 @unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 が利用できません")

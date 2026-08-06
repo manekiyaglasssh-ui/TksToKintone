@@ -3709,19 +3709,53 @@ class _GroupResizeHandle(QGraphicsRectItem):
         self.setZValue(10000)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
-        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setCursor(self._cursor_for_position())
         point = {
             "top_left": rect.topLeft(), "top_right": rect.topRight(),
             "bottom_left": rect.bottomLeft(), "bottom_right": rect.bottomRight(),
+            "top": QPointF(rect.center().x(), rect.top()),
+            "right": QPointF(rect.right(), rect.center().y()),
+            "bottom": QPointF(rect.center().x(), rect.bottom()),
+            "left": QPointF(rect.left(), rect.center().y()),
         }[position]
         self.setPos(point)
         self._suppress = False
+
+    def _cursor_for_position(self):
+        if self._position in {"top_left", "bottom_right"}:
+            return Qt.CursorShape.SizeFDiagCursor
+        if self._position in {"top_right", "bottom_left"}:
+            return Qt.CursorShape.SizeBDiagCursor
+        if self._position in {"left", "right"}:
+            return Qt.CursorShape.SizeHorCursor
+        return Qt.CursorShape.SizeVerCursor
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        h = scene_units_for_view_pixels(self.scene(), HANDLE_HIT_SIZE_PX)
+        return QRectF(-h / 2, -h / 2, h, h)
+
+    def shape(self) -> QPainterPath:  # noqa: N802
+        path = QPainterPath()
+        h = scene_units_for_view_pixels(self.scene(), HANDLE_HIT_SIZE_PX)
+        path.addRect(QRectF(-h / 2, -h / 2, h, h))
+        return path
+
+    def paint(self, painter, option, widget=None) -> None:  # noqa: N802
+        painter.setBrush(self.brush())
+        painter.setPen(self.pen())
+        s = HANDLE_SIZE
+        painter.drawRect(QRectF(-s / 2, -s / 2, s, s))
 
     def reposition(self) -> None:
         rect = self._window._selected_bounds()
         point = {
             "top_left": rect.topLeft(), "top_right": rect.topRight(),
             "bottom_left": rect.bottomLeft(), "bottom_right": rect.bottomRight(),
+            "top": QPointF(rect.center().x(), rect.top()),
+            "right": QPointF(rect.right(), rect.center().y()),
+            "bottom": QPointF(rect.center().x(), rect.bottom()),
+            "left": QPointF(rect.left(), rect.center().y()),
         }[self._position]
         self._suppress = True
         self.setPos(point)
@@ -3884,6 +3918,19 @@ class DragState:
     move_event_count: int = 0
 
 
+@dataclass
+class ResizeState:
+    kind: str
+    handle: QGraphicsItem
+    object_ids: tuple[str, ...]
+    group_id: str | None
+    press_scene_pos: QPointF
+    initial_bounds: QRectF
+    undo_before_snapshot: list[dict[str, Any]]
+    resized: bool = False
+    move_event_count: int = 0
+
+
 class _EditScene(QGraphicsScene):
     """ツールモードに応じてオブジェクトを描画する編集シーン。"""
 
@@ -3908,6 +3955,9 @@ class _EditScene(QGraphicsScene):
         # 選択枠内の透明領域を含む移動は、実体itemのmouse grabberに依存せず
         # scene自身で押下から解放まで保持する（Windows native event対策）。
         self._drag_state: DragState | None = None
+        # resize は Qt の item movable/grabber に依存させず、press で解決した
+        # handle を release まで scene が保持する。移動 DragState とは排他的。
+        self._resize_state: ResizeState | None = None
         self._last_drag_target: DragTarget | None = None
         self._last_drag_result: dict[str, Any] | None = None
         self._drag_debug = os.environ.get("TKS_VOUCHER_DRAG_DEBUG", "").lower() in {
@@ -3930,7 +3980,7 @@ class _EditScene(QGraphicsScene):
 
         item = self.itemAt(pos, QTransform())
         while item is not None:
-            if isinstance(item, (_ResizeHandle, _LineEndHandle)):
+            if isinstance(item, (_ResizeHandle, _GroupResizeHandle, _LineEndHandle)):
                 return True
             if hasattr(item, "serialize_edit_object"):
                 return True
@@ -3939,19 +3989,104 @@ class _EditScene(QGraphicsScene):
             item = item.parentItem()
         return False
 
-    def _press_on_handle(self, pos: QPointF) -> bool:
+    def _resolve_handle(self, pos: QPointF, *, endpoints: bool = False):
         """押下位置が表示中のリサイズ/端点ハンドル上か判定する。
 
         itemAt を使わず既知のハンドル一覧で判定する。余分な itemAt 呼び出しが
         PySide のオブジェクト管理と相互作用して既存オブジェクトを巻き込み削除する
         ことがあるため、ハンドル矩形の当たり判定で安全に確認する。
         """
-        for h in self._window._handles:
-            if (isinstance(h, (_ResizeHandle, _LineEndHandle))
-                    and h.scene() is self
-                    and h.mapToScene(h.shape()).contains(pos)):
-                return True
-        return False
+        wanted = (_LineEndHandle,) if endpoints else (_ResizeHandle, _GroupResizeHandle)
+        candidates = []
+        for order, handle in enumerate(self._window._handles):
+            if (isinstance(handle, wanted) and handle.scene() is self
+                    and handle.mapToScene(handle.shape()).contains(pos)):
+                center = handle.scenePos()
+                distance2 = ((center.x() - pos.x()) ** 2
+                             + (center.y() - pos.y()) ** 2)
+                candidates.append((distance2, -float(handle.zValue()), order, handle))
+        return min(candidates, default=(0, 0, 0, None))[-1]
+
+    def _press_on_handle(self, pos: QPointF) -> bool:
+        return bool(self._resolve_handle(pos) or self._resolve_handle(pos, endpoints=True))
+
+    def _begin_resize(self, handle: QGraphicsItem, pos: QPointF) -> None:
+        selected = self._window._selected_edit_items()
+        is_group = isinstance(handle, _GroupResizeHandle)
+        if is_group:
+            handle._start_rect = self._window._selected_bounds()
+            handle._start_objects = [dict(item.serialize_edit_object()) for item in selected]
+        else:
+            handle._resizing = True
+            handle._target_was_movable = bool(
+                handle._target.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+            handle._target.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+            if isinstance(handle, _ResizeHandle):
+                handle._resize_start_rect = QRectF(handle._target_rect())
+                handle._font_size_before = (float(handle._target.font_size)
+                                            if isinstance(handle._target, _EditTextItem)
+                                            else None)
+        group_ids = {str(getattr(item, "group_id", "") or "") for item in selected} - {""}
+        self._resize_state = ResizeState(
+            kind="group" if is_group else "single", handle=handle,
+            object_ids=tuple(str(item.obj_id) for item in selected),
+            group_id=next(iter(group_ids)) if is_group and len(group_ids) == 1 else None,
+            press_scene_pos=QPointF(pos), initial_bounds=self._window._selected_bounds(),
+            undo_before_snapshot=self._window.serialize_objects())
+        self._select_snapshot = None
+        self._press_handle = True
+        self._debug_resize("press", pos)
+
+    def _move_resize(self, pos: QPointF) -> None:
+        state = self._resize_state
+        if state is None:
+            return
+        state.move_event_count += 1
+        state.handle.setPos(pos)
+        state.resized = self._window.serialize_objects() != state.undo_before_snapshot
+        self._debug_resize("move", pos, computed_bounds=self._window._selected_bounds())
+
+    def _finish_resize(self, pos: QPointF) -> None:
+        state = self._resize_state
+        if state is None:
+            return
+        handle = state.handle
+        changed = self._window.serialize_objects() != state.undo_before_snapshot
+        if isinstance(handle, _GroupResizeHandle):
+            handle._start_objects = []
+        else:
+            handle._target.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
+                                   handle._target_was_movable)
+            handle._resizing = False
+        if changed:
+            self._window.mark_dirty()
+            self._window.commit_history()
+        self._debug_resize("release", pos, undo_registered=changed)
+        self._resize_state = None
+        self._press_handle = False
+        self._window.refresh_handles()
+
+    def _debug_resize(self, phase: str, scene_pos: QPointF, **extra: Any) -> None:
+        if not self._drag_debug:
+            return
+        state = self._resize_state
+        handle = state.handle if state else None
+        visual = handle.rect() if isinstance(handle, QGraphicsRectItem) else QRectF()
+        expanded = handle.shape().boundingRect() if handle is not None else QRectF()
+        view_pos = self._window._view.mapFromScene(scene_pos)
+        _log.debug("voucher_resize_debug %s", {
+            "phase": phase, "scenePos": (scene_pos.x(), scene_pos.y()),
+            "viewPos": (view_pos.x(), view_pos.y()),
+            "items_at_press": [type(item).__name__ for item in self.items(scene_pos)],
+            "selection_helper_rect": tuple(self._visual_selection_rect().getRect()),
+            "handle_id": getattr(handle, "_position", getattr(handle, "_which", None)),
+            "handle_visual_rect": tuple(visual.getRect()),
+            "handle_expanded_hit_rect": tuple(expanded.getRect()),
+            "selected_kind": state.kind if state else None,
+            "selected_object_ids": list(state.object_ids) if state else [],
+            "selected_group_id": state.group_id if state else None,
+            "resolved_action": "resize", "ResizeState_created": state is not None,
+            "move_event_count": state.move_event_count if state else 0, **extra})
 
     def _resolve_edit_object(self, pos: QPointF):
         """位置に重なる候補から操作対象の実編集オブジェクトを解決する。"""
@@ -4286,7 +4421,20 @@ class _EditScene(QGraphicsScene):
         # 操作した」場合。移動/サイズ変更前の状態を記録し、解放時に変化があれば履歴へ。
         self._select_snapshot = self._window.serialize_objects()
         # リサイズ/端点ハンドル上での押下か。ハンドル操作時は選択を維持する。
-        self._press_handle = self._press_on_handle(pos)
+        # 必須優先順位: resize handle -> endpoint handle -> selection move。
+        # 最寄りの拡張hit領域を press 時に一度だけ解決する。
+        resize_handle = self._resolve_handle(pos)
+        endpoint_handle = None if resize_handle is not None else self._resolve_handle(
+            pos, endpoints=True)
+        handle = resize_handle or endpoint_handle
+        self._press_handle = handle is not None
+        if event.button() == Qt.MouseButton.LeftButton and handle is not None:
+            self._begin_resize(handle, pos)
+            self._press_target = getattr(handle, "_target", None)
+            self._press_multi = False
+            self._press_pos = pos
+            event.accept()
+            return
         target = self._resolve_edit_object(pos)
         multi = bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier
                                           | Qt.KeyboardModifier.ShiftModifier))
@@ -4346,6 +4494,10 @@ class _EditScene(QGraphicsScene):
         # 掴むモード: ビューの ScrollHandDrag に任せる。
         if self._window.current_tool == TOOL_GRAB:
             super().mouseMoveEvent(event)
+            return
+        if self._resize_state is not None:
+            self._move_resize(event.scenePos())
+            event.accept()
             return
         if self._drag_state is not None:
             self._move_scene_drag(event.scenePos())
@@ -4423,6 +4575,13 @@ class _EditScene(QGraphicsScene):
         # 掴むモード: ビューの ScrollHandDrag に任せる。
         if self._window.current_tool == TOOL_GRAB:
             super().mouseReleaseEvent(event)
+            return
+        if self._resize_state is not None:
+            self._finish_resize(event.scenePos())
+            self._press_target = None
+            self._press_pos = None
+            self._select_snapshot = None
+            event.accept()
             return
         if self._drag_state is not None:
             self._finish_scene_drag()
@@ -9452,11 +9611,16 @@ class VoucherEditWindow(QMainWindow):
     def _resize_group_from_snapshot(
             self, objects: list[dict[str, Any]], source: QRectF,
             position: str, handle_pos: QPointF) -> None:
-        anchor = {
-            "top_left": source.bottomRight(), "top_right": source.bottomLeft(),
-            "bottom_left": source.topRight(), "bottom_right": source.topLeft(),
-        }[position]
-        target = QRectF(anchor, handle_pos).normalized()
+        left, right, top, bottom = source.left(), source.right(), source.top(), source.bottom()
+        if position.endswith("left"):
+            left = handle_pos.x()
+        elif position.endswith("right"):
+            right = handle_pos.x()
+        if position.startswith("top"):
+            top = handle_pos.y()
+        elif position.startswith("bottom"):
+            bottom = handle_pos.y()
+        target = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
         if target.width() < MIN_OBJECT_WIDTH or target.height() < MIN_OBJECT_HEIGHT:
             return
         sx = target.width() / max(source.width(), 0.1)
@@ -9714,7 +9878,10 @@ class VoucherEditWindow(QMainWindow):
             group_ids = {str(getattr(it, "group_id", "") or "") for it in selected}
             group_ids.discard("")
             if len(group_ids) == 1 and all(not getattr(it, "locked", False) for it in selected):
-                for position in ("top_left", "top_right", "bottom_left", "bottom_right"):
+                for position in (
+                    "top_left", "top", "top_right", "right",
+                    "bottom_right", "bottom", "bottom_left", "left",
+                ):
                     handle = _GroupResizeHandle(self, position, bounds)
                     self._scene.addItem(handle)
                     self._handles.append(handle)
