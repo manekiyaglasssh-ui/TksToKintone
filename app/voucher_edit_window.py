@@ -3616,7 +3616,75 @@ class _GroupBoundsItem(QGraphicsRectItem):
         self.setPen(pen)
         self.setBrush(Qt.BrushStyle.NoBrush)
         self.setZValue(9998)
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def shape(self) -> QPainterPath:  # noqa: N802
+        # NoBrushのQGraphicsRectItem既定shape()はペンの輪郭だけになるため、
+        # 内部全体を明示的な透明hit領域として返す。
+        path = QPainterPath()
+        path.addRect(self.rect())
+        return path
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
+        # 修飾キー付きクリックは通常の複数選択トグルへ渡す。グループの
+        # 移動用hit areaがCtrl/Shift選択を横取りしないようにする。
+        if event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                 | Qt.KeyboardModifier.ShiftModifier):
+            event.ignore()
+            return
+        scene = self.scene()
+        window = getattr(scene, "_window", None) if scene is not None else None
+        if window is None:
+            event.ignore()
+            return
+        self._move_start = event.scenePos()
+        self._member_start_positions = {
+            item.obj_id: QPointF(item.pos())
+            for item in window._selected_edit_items()
+        }
+        self._moved = False
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.grabMouse()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        scene = self.scene()
+        window = getattr(scene, "_window", None) if scene is not None else None
+        if window is None or getattr(self, "_move_start", None) is None:
+            return
+        delta = event.scenePos() - self._move_start
+        self._moved = self._moved or abs(delta.x()) >= 0.01 or abs(delta.y()) >= 0.01
+        for item in window._selected_edit_items():
+            start = self._member_start_positions.get(item.obj_id)
+            if start is not None:
+                item.setPos(start + delta)
+        self.setRect(window._selected_bounds())
+        for handle in window._handles:
+            if isinstance(handle, _GroupResizeHandle):
+                handle.reposition()
+        window.mark_dirty()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        scene = self.scene()
+        window = getattr(scene, "_window", None) if scene is not None else None
+        try:
+            if window is not None and getattr(self, "_moved", False):
+                window.commit_history()
+                window.refresh_handles()
+            event.accept()
+        finally:
+            self.ungrabMouse()
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._move_start = None
+            self._member_start_positions = {}
+            self._moved = False
 
 
 class _GroupResizeHandle(QGraphicsRectItem):
@@ -3643,6 +3711,16 @@ class _GroupResizeHandle(QGraphicsRectItem):
             "top_left": rect.topLeft(), "top_right": rect.topRight(),
             "bottom_left": rect.bottomLeft(), "bottom_right": rect.bottomRight(),
         }[position]
+        self.setPos(point)
+        self._suppress = False
+
+    def reposition(self) -> None:
+        rect = self._window._selected_bounds()
+        point = {
+            "top_left": rect.topLeft(), "top_right": rect.topRight(),
+            "bottom_left": rect.bottomLeft(), "bottom_right": rect.bottomRight(),
+        }[self._position]
+        self._suppress = True
         self.setPos(point)
         self._suppress = False
 
@@ -3999,12 +4077,27 @@ class _EditScene(QGraphicsScene):
         # リサイズ/端点ハンドル上での押下か。ハンドル操作時は選択を維持する。
         self._press_handle = self._press_on_handle(pos)
         target = self._resolve_edit_object(pos)
+        group_hit = False
+        if target is None and not self._press_handle:
+            # グループ補助枠の内部は実オブジェクトではないため通常の
+            # resolveではNoneになる。選択メンバーを論理的な押下対象にして、
+            # scene側のクリック解除処理で補助枠を撤去しないようにする。
+            for helper in self._window._handles:
+                if (isinstance(helper, _GroupBoundsItem)
+                        and helper.shape().contains(helper.mapFromScene(pos))):
+                    selected = self._window._selected_edit_items()
+                    target = selected[0] if selected else None
+                    group_hit = target is not None
+                    break
         multi = bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier
                                           | Qt.KeyboardModifier.ShiftModifier))
         self._press_target = (
             target if event.button() == Qt.MouseButton.LeftButton else None)
         self._press_multi = multi
         self._press_pos = pos
+        self._group_drag_start_positions = (
+            {item.obj_id: QPointF(item.pos()) for item in self._window._selected_edit_items()}
+            if group_hit and not multi else None)
         super().mousePressEvent(event)
         # クリック対象を明示的に単一選択する。内部テキスト子で選択が外れる・
         # 複数オブジェクトが選択されたままになる問題を防ぐ（要件6・7・10）。
@@ -4062,6 +4155,15 @@ class _EditScene(QGraphicsScene):
                 self._temp_item.setRect(QRectF(self._start, pos).normalized())
             # ドラッグ中も背景を維持する（要件1・2・4）。
             self._window.ensure_background_visible()
+            event.accept()
+            return
+        if self._group_drag_start_positions is not None and self._press_pos is not None:
+            delta = event.scenePos() - self._press_pos
+            for item in self._window._selected_edit_items():
+                start = self._group_drag_start_positions.get(item.obj_id)
+                if start is not None:
+                    item.setPos(start + delta)
+            self._window.mark_dirty()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -4195,6 +4297,7 @@ class _EditScene(QGraphicsScene):
         self._press_multi = False
         self._press_pos = None
         self._press_handle = False
+        self._group_drag_start_positions = None
         if self._select_snapshot is not None:
             after = self._window.serialize_objects()
             if after != self._select_snapshot:
@@ -6768,7 +6871,7 @@ class VoucherEditWindow(QMainWindow):
         self._favorite_list.itemDoubleClicked.connect(
             lambda item: self.drop_favorite_object(
                 str(item.data(Qt.ItemDataRole.UserRole) or ""),
-                QPointF(PAGE_W / 2.0, PAGE_H / 2.0),
+                None,
             )
         )
         # お気に入り表示枠の縦幅を固定し、最大20件を常に表示する（要件4）。
@@ -8161,6 +8264,7 @@ class VoucherEditWindow(QMainWindow):
             fav = {
                 "id": str(uuid.uuid4()), "type": "group",
                 "name": f"グループ: {name}", "group_name": name,
+                "origin_x": float(bounds.x()), "origin_y": float(bounds.y()),
                 "width": bounds.width(), "height": bounds.height(),
                 "objects": objects,
                 "reference_page_width": float(PAGE_W),
@@ -8255,7 +8359,7 @@ class VoucherEditWindow(QMainWindow):
         self._log_favorite_event("favorite_object_count_changed", count=len(self._favorites))
         return True
 
-    def drop_favorite_object(self, favorite_id: str, scene_pos: QPointF) -> bool:
+    def drop_favorite_object(self, favorite_id: str, scene_pos: QPointF | None) -> bool:
         fav = self._favorite_by_id(favorite_id)
         if fav is None:
             self._log_favorite_event("favorite_object_drop_failed", favorite_id=favorite_id)
@@ -8266,6 +8370,12 @@ class VoucherEditWindow(QMainWindow):
                 return False
             group_id = str(uuid.uuid4())
             new_ids: set[str] = set()
+            if scene_pos is None:
+                # ダブルクリックは登録時の外接矩形左上へ復元する。
+                # originのない旧データは従来の既定位置へ配置する。
+                scene_pos = QPointF(
+                    float(fav.get("origin_x", PAGE_W / 2.0)),
+                    float(fav.get("origin_y", PAGE_H / 2.0)))
             for order, obj in enumerate(objects):
                 self._shift_object(obj, scene_pos.x(), scene_pos.y())
                 obj["id"] = str(uuid.uuid4())

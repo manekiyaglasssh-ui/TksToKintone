@@ -123,6 +123,61 @@ class TestVoucherEditGroups(unittest.TestCase):
         self.assertEqual(len(selected), 2)
         self.assertEqual(len({item.group_id for item in selected}), 1)
 
+    def test_group_favorite_saves_origin_and_double_click_restores_it(self):
+        win = self.window("group-favorite-origin")
+        a, b = self.two_items(win)
+        win.group_selected()
+        origin = win._selected_bounds().topLeft()
+        self.assertTrue(win.add_object_to_favorites(a))
+        favorite = win._favorites[-1]
+        self.assertAlmostEqual(favorite["origin_x"], 20.0)
+        self.assertAlmostEqual(favorite["origin_y"], 30.0)
+        before_relative = b.sceneBoundingRect().topLeft() - a.sceneBoundingRect().topLeft()
+        self.assertTrue(win.drop_favorite_object(favorite["id"], None))
+        created = win._selected_edit_items()
+        self.assertEqual(len(created), 2)
+        self.assertEqual(len({item.group_id for item in created}), 1)
+        created_bounds = win._selected_bounds()
+        self.assertAlmostEqual(created_bounds.x(), origin.x(), delta=0.01)
+        self.assertAlmostEqual(created_bounds.y(), origin.y(), delta=0.01)
+        created_by_type = sorted(created, key=lambda item: item.sceneBoundingRect().x())
+        self.assertAlmostEqual(
+            (created_by_type[1].sceneBoundingRect().topLeft()
+             - created_by_type[0].sceneBoundingRect().topLeft()).x(),
+            before_relative.x(), delta=0.01)
+
+    def test_legacy_group_favorite_without_origin_uses_default_placement(self):
+        win = self.window("legacy-group-favorite")
+        win._favorites.append({
+            "id": "legacy-group", "type": "group", "group_name": "旧",
+            "objects": [{"id": "old-a", "type": "rectangle", "x": 0,
+                         "y": 0, "width": 20, "height": 20}],
+        })
+        self.assertTrue(win.drop_favorite_object("legacy-group", None))
+        self.assertGreater(win._selected_bounds().x(), 0.0)
+
+    def test_qtest_drag_from_gap_inside_group_bounds_moves_all_members(self):
+        win = self.window("group-gap-drag")
+        a, b = self.two_items(win)
+        win.group_selected()
+        win.show()
+        win.set_tool("select")
+        QApplication.processEvents()
+        before = {item.obj_id: QPointF(item.pos()) for item in (a, b)}
+        gap = win._view.mapFromScene(QPointF(75, 45))
+        end = gap + QPoint(18, 12)
+        QTest.mousePress(win._view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, gap)
+        QTest.mouseMove(win._view.viewport(), end, 20)
+        QTest.mouseRelease(win._view.viewport(), Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier, end)
+        scene_delta = win._view.mapToScene(end) - win._view.mapToScene(gap)
+        for item in (a, b):
+            self.assertAlmostEqual(item.pos().x() - before[item.obj_id].x(),
+                                   scene_delta.x(), delta=1.0)
+            self.assertAlmostEqual(item.pos().y() - before[item.obj_id].y(),
+                                   scene_delta.y(), delta=1.0)
+
     def test_group_resize_scales_members_and_text_from_start_snapshot(self):
         from app.voucher_edit_window import _GroupResizeHandle
         win = self.window()
