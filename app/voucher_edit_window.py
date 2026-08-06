@@ -3616,7 +3616,11 @@ class _GroupBoundsItem(QGraphicsRectItem):
         self.setPen(pen)
         self.setBrush(Qt.BrushStyle.NoBrush)
         self.setZValue(9998)
-        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        # accepted press は Qt が自動的にこの item を mouse grabber にする。
+        # ここで明示的に grabMouse()/ungrabMouse() を重ねると、Windows の
+        # native mouse move 経路で grab が解除されることがある。
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton
+                                     | Qt.MouseButton.RightButton)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def shape(self) -> QPainterPath:  # noqa: N802
@@ -3648,7 +3652,6 @@ class _GroupBoundsItem(QGraphicsRectItem):
         }
         self._moved = False
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
-        self.grabMouse()
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -3677,14 +3680,16 @@ class _GroupBoundsItem(QGraphicsRectItem):
         try:
             if window is not None and getattr(self, "_moved", False):
                 window.commit_history()
-                window.refresh_handles()
             event.accept()
         finally:
-            self.ungrabMouse()
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             self._move_start = None
             self._member_start_positions = {}
             self._moved = False
+            # press/release 間は同じ補助枠を保持する。Qt が mouse grab を
+            # 解放した後でのみハンドルを再配置・再生成する。
+            if window is not None:
+                window.refresh_handles()
 
 
 class _GroupResizeHandle(QGraphicsRectItem):
