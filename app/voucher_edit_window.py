@@ -3916,6 +3916,13 @@ class _EditScene(QGraphicsScene):
         self._freehand_item: "_EditFreehandItem | None" = None
         # 消しゴムでドラッグ中か。True の間、なぞった位置の手書き線を削除する。
         self._erasing: bool = False
+        # 選択枠内の透明領域を含む移動は、実体itemのmouse grabberに依存せず
+        # scene自身で押下から解放まで保持する（Windows native event対策）。
+        self._drag_target_type: str | None = None
+        self._drag_items: list[QGraphicsItem] = []
+        self._drag_start_scene_pos: QPointF | None = None
+        self._drag_start_positions: dict[str, QPointF] = {}
+        self._drag_moved = False
 
     @staticmethod
     def _manhattan_distance(a: QPointF, b: QPointF) -> float:
@@ -4032,6 +4039,66 @@ class _EditScene(QGraphicsScene):
 
         return min(candidates, key=priority)
 
+    def _selection_rect_for(self, item: QGraphicsItem) -> QRectF:
+        if isinstance(item, (_EditTextItem, _EditImageItem)):
+            return item.box_rect_scene()
+        if isinstance(item, (_EditRectItem, _EditEllipseItem)):
+            return _scene_rect_from_item_rect(item, item.rect())
+        return item.sceneBoundingRect()
+
+    def _begin_scene_drag(self, kind: str, items: list[QGraphicsItem], pos: QPointF) -> None:
+        self._drag_target_type = kind
+        self._drag_items = list(items)
+        self._drag_start_scene_pos = QPointF(pos)
+        self._drag_start_positions = {
+            str(getattr(item, "obj_id", id(item))): QPointF(item.pos())
+            for item in items
+        }
+        self._drag_moved = False
+        self._window._log_edit_event("voucher_drag_start", target_type=kind,
+                                     object_ids=[getattr(i, "obj_id", "") for i in items])
+        self._window._view.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _move_scene_drag(self, pos: QPointF) -> bool:
+        if self._drag_start_scene_pos is None or not self._drag_items:
+            return False
+        delta = pos - self._drag_start_scene_pos
+        self._drag_moved = self._drag_moved or abs(delta.x()) > 0.01 or abs(delta.y()) > 0.01
+        for item in self._drag_items:
+            key = str(getattr(item, "obj_id", id(item)))
+            start = self._drag_start_positions.get(key)
+            if start is not None and item.scene() is self:
+                item.setPos(start + delta)
+        self._window.mark_dirty()
+        self._sync_drag_handles()
+        return True
+
+    def _sync_drag_handles(self) -> None:
+        """既存helperを維持したまま選択枠だけ追従させる。"""
+        bounds = self._window._selected_bounds()
+        for helper in self._window._handles:
+            if isinstance(helper, _GroupBoundsItem):
+                helper.setRect(bounds)
+            elif hasattr(helper, "reposition"):
+                helper.reposition()
+
+    def _finish_scene_drag(self) -> bool:
+        active = self._drag_target_type is not None
+        if active and self._drag_moved:
+            self._window.commit_history()
+        if active:
+            self._window._log_edit_event("voucher_drag_release",
+                                         target_type=self._drag_target_type,
+                                         moved=self._drag_moved)
+        self._drag_target_type = None
+        self._drag_items = []
+        self._drag_start_scene_pos = None
+        self._drag_start_positions = {}
+        self._drag_moved = False
+        self._window._view.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._sync_drag_handles()
+        return active
+
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         target = self._resolve_edit_object(event.scenePos())
         if isinstance(target, (_EditTextItem, _EditSymbolTextItem)):
@@ -4131,6 +4198,39 @@ class _EditScene(QGraphicsScene):
                     break
         multi = bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier
                                           | Qt.KeyboardModifier.ShiftModifier))
+        # 選択済みの枠はhelperの有無や実体shapeに関係なくsceneで掴む。
+        # ハンドルと修飾キーはこの経路より常に優先する。
+        if (event.button() == Qt.MouseButton.LeftButton and not multi
+                and not self._press_handle):
+            selected = self._window._selected_edit_items()
+            if len(selected) > 1:
+                bounds = self._window._selected_bounds()
+                if bounds.contains(pos):
+                    target = selected[0]
+                    group_hit = True
+            elif len(selected) == 1:
+                selected_item = selected[0]
+                if self._selection_rect_for(selected_item).contains(pos):
+                    target = selected_item
+            if group_hit:
+                self._select_snapshot = self._window.serialize_objects()
+                self._begin_scene_drag("group", selected, pos)
+                self._press_target = target
+                self._press_multi = False
+                self._press_pos = pos
+                event.accept()
+                return
+            if target is not None:
+                if target not in selected:
+                    self._window._select_items(self._window._group_items_for(target))
+                    selected = self._window._selected_edit_items()
+                self._select_snapshot = self._window.serialize_objects()
+                self._begin_scene_drag("single", selected if len(selected) == 1 else [target], pos)
+                self._press_target = target
+                self._press_multi = False
+                self._press_pos = pos
+                event.accept()
+                return
         self._press_target = (
             target if event.button() == Qt.MouseButton.LeftButton else None)
         self._press_multi = multi
@@ -4175,6 +4275,10 @@ class _EditScene(QGraphicsScene):
         # 掴むモード: ビューの ScrollHandDrag に任せる。
         if self._window.current_tool == TOOL_GRAB:
             super().mouseMoveEvent(event)
+            return
+        if self._drag_target_type is not None:
+            self._move_scene_drag(event.scenePos())
+            event.accept()
             return
         # 手書きペン描画中: 移動座標を連続追加する。
         if self._freehand_item is not None:
@@ -4257,6 +4361,14 @@ class _EditScene(QGraphicsScene):
         # 掴むモード: ビューの ScrollHandDrag に任せる。
         if self._window.current_tool == TOOL_GRAB:
             super().mouseReleaseEvent(event)
+            return
+        if self._drag_target_type is not None:
+            self._finish_scene_drag()
+            self._press_target = None
+            self._press_pos = None
+            self._press_handle = False
+            self._select_snapshot = None
+            event.accept()
             return
         # 手書きペン: ストローク確定（1ストローク=1Undo単位）。
         if self._freehand_item is not None:
