@@ -1,8 +1,12 @@
 # TksToKintone
 
- TKS OLAPから加工CSV・素板CSVを取得し、既存Excel VBA相当の加工を行って `outputTksToKintone.csv` を作成し、必要に応じてkintoneへ登録するWindows向けGUIアプリです。現在のバージョンネームは `1.6.1`、バージョンコードは `45` です。
+ TKS OLAPから加工CSV・素板CSVを取得し、既存Excel VBA相当の加工を行って `outputTksToKintone.csv` を作成し、必要に応じてkintoneへ登録するWindows向けGUIアプリです。現在のバージョンネームは `1.6.2`、バージョンコードは `46` です。
 
 ユーザー向けの操作手順は [docs/ユーザー向け簡易マニュアル.md](docs/ユーザー向け簡易マニュアル.md) を参照してください。
+
+## バージョン 1.6.2 の変更点
+
+- バージョンを1.6.2へ更新しました。
 
 ## バージョン 1.6.1 の変更点
 
