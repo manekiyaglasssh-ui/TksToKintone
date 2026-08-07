@@ -382,7 +382,7 @@ QPushButton:disabled { background-color: #2e7d32; color: #ffffff; border: 1px so
 """,
 }
 
-MISSING_VOUCHER_NO_BASE_MESSAGE = "伝票Noがありません。\nTSKで先に処理してください。"
+MISSING_VOUCHER_NO_BASE_MESSAGE = "伝票Noがありません。\nTKSで先に処理してください。"
 MISSING_VOUCHER_NO_MESSAGE = MISSING_VOUCHER_NO_BASE_MESSAGE
 
 

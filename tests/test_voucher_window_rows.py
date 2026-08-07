@@ -1476,6 +1476,10 @@ class TestVoucherWindowRows(unittest.TestCase):
         warn.assert_called_once()
         self.assertEqual(warn.call_args.args[1], "伝票作成・印刷")
         self.assertEqual(warn.call_args.args[2], format_missing_voucher_no_message({"5218869"}))
+        self.assertEqual(
+            warn.call_args.args[2],
+            "伝票Noがありません。\nTKSで先に処理してください。\n受注No：5218869",
+        )
         create.assert_not_called()
         cache.assert_not_called()
 
