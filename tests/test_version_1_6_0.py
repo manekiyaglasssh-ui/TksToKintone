@@ -12,14 +12,14 @@ STABLE_APP_ID = "AppId={{8C19583E-55BA-47BA-93AC-C9F2E1CF3A9F}"
 
 class TestVersion161(unittest.TestCase):
     def test_application_version(self) -> None:
-        self.assertEqual((VERSION_NAME, VERSION_CODE, __version__), ("1.6.2", 46, "1.6.2"))
+        self.assertEqual((VERSION_NAME, VERSION_CODE, __version__), ("1.6.3", 47, "1.6.3"))
 
     def test_packaging_version_and_stable_identity(self) -> None:
         installer = (ROOT / "installer" / "tks-to-kintone.iss").read_text(encoding="utf-8")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('#define MyAppVersion "1.6.2"', installer)
-        self.assertIn("VersionInfoVersion=1.6.2.46", installer)
-        self.assertIn('version = "1.6.2"', pyproject)
+        self.assertIn('#define MyAppVersion "1.6.3"', installer)
+        self.assertIn("VersionInfoVersion=1.6.3.47", installer)
+        self.assertIn('version = "1.6.3"', pyproject)
         self.assertEqual(installer.count(STABLE_APP_ID), 1)
         self.assertNotIn("UpgradeCode", installer)
         self.assertIn(r"DefaultDirName={autopf}\Manekiya\TksToKintone", installer)
@@ -30,10 +30,10 @@ class TestVersion161(unittest.TestCase):
     def test_pyinstaller_version_info(self) -> None:
         version_info = (ROOT / "installer" / "version_info.txt").read_text(encoding="utf-8")
         spec = (ROOT / "TksToKintone.spec").read_text(encoding="utf-8")
-        self.assertIn("filevers=(1, 6, 2, 46)", version_info)
-        self.assertIn("prodvers=(1, 6, 2, 46)", version_info)
-        self.assertIn("StringStruct('FileVersion', '1.6.2.46')", version_info)
-        self.assertIn("StringStruct('ProductVersion', '1.6.2.46')", version_info)
+        self.assertIn("filevers=(1, 6, 3, 47)", version_info)
+        self.assertIn("prodvers=(1, 6, 3, 47)", version_info)
+        self.assertIn("StringStruct('FileVersion', '1.6.3.47')", version_info)
+        self.assertIn("StringStruct('ProductVersion', '1.6.3.47')", version_info)
         self.assertIn("version='installer/version_info.txt'", spec)
 
     def test_release_history_is_preserved(self) -> None:

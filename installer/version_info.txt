@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 6, 2, 46),
-    prodvers=(1, 6, 2, 46),
+    filevers=(1, 6, 3, 47),
+    prodvers=(1, 6, 3, 47),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'Manekiya'),
           StringStruct('FileDescription', 'TksToKintone'),
-          StringStruct('FileVersion', '1.6.2.46'),
+          StringStruct('FileVersion', '1.6.3.47'),
           StringStruct('InternalName', 'TksToKintone'),
           StringStruct('OriginalFilename', 'TksToKintone.exe'),
           StringStruct('ProductName', 'TksToKintone'),
-          StringStruct('ProductVersion', '1.6.2.46'),
+          StringStruct('ProductVersion', '1.6.3.47'),
         ],
       )
     ]),
